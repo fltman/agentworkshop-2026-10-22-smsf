@@ -102,33 +102,33 @@ function totals(rows) {
     requests, errors, errorPct: pct(errors, requests) };
 }
 
-if (typeof module !== 'undefined') module.exports = { ADAPTERS, parseProm, fromCommon, fromAdapter, totals, summary };
+async function loadOne(team) {
+  try {
+    const r = await fetch(`/t/${team}/kpi`);
+    if (r.ok && team !== 'tompa') {
+      const k = await r.json();
+      if (k && 'requests' in k) return { ...fromCommon(team, k), source: 'common /kpi' };
+    }
+  } catch { /* fall through to adapter */ }
+  const a = ADAPTERS[team];
+  try {
+    const r = await fetch(`/t/${team}/${a.path}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const body = a.type === 'text' ? await r.text() : await r.json();
+    return { ...fromAdapter(team, body), source: `/${a.path}` };
+  } catch (e) {
+    return { ...summary(a.nf, team, { up: false }), source: `/${a.path}`, error: e.message };
+  }
+}
+
+if (typeof module !== 'undefined') module.exports = { ADAPTERS, parseProm, fromCommon, fromAdapter, totals, summary, loadOne };
 
 // ---- browser ----
-if (typeof document !== 'undefined') {
+if (typeof document !== 'undefined' && document.getElementById('rows')) {
   const $ = (id) => document.getElementById(id);
   const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = String(text); return e; };
   const fmt = (v, unit = '') => (v == null ? '–' : v + unit);
   const cls = (r) => (!r.up ? 'bad' : r.errorPct > 10 ? 'bad' : r.errorPct > 0 ? 'warn' : 'ok');
-
-  async function loadOne(team) {
-    try {
-      const r = await fetch(`/t/${team}/kpi`);
-      if (r.ok && team !== 'tompa') {
-        const k = await r.json();
-        if (k && 'requests' in k) return { ...fromCommon(team, k), source: 'common /kpi' };
-      }
-    } catch { /* fall through to adapter */ }
-    const a = ADAPTERS[team];
-    try {
-      const r = await fetch(`/t/${team}/${a.path}`);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const body = a.type === 'text' ? await r.text() : await r.json();
-      return { ...fromAdapter(team, body), source: `/${a.path}` };
-    } catch (e) {
-      return { ...summary(a.nf, team, { up: false }), source: `/${a.path}`, error: e.message };
-    }
-  }
 
   function card(label, value, sub, c) {
     const d = el('div', 'kpi' + (c ? ' ' + c : ''));

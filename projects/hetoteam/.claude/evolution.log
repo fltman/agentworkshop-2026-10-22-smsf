@@ -1,1 +1,5 @@
 # HIVE Evolution Log
+2026-10-22 10:10 SPAWN: udm-service (backend for Nudm_UECM, Nudm_SDM and SMSC routing per our CONTRACT.md)
+2026-10-22 10:10 SPAWN: nf-interop (NRF registration, contract alignment and cross-team tests with SMSF, SMSC, AMF, NRF)
+2026-10-22 10:25 SPAWN: udm-kpi-tile (tile + /metrics shipped in PR 7 had no owning capability)
+2026-10-22 10:25 MUTATE: nf-interop (NRF profile now fqdn+apiPrefix+apiRoot, empty-array heartbeat, test against real plugins on a local board)

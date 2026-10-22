@@ -16,13 +16,19 @@ Error bodies are ProblemDetails (TS 29.571): `{"status","cause","detail"}`.
     "n1MessageClass": "SMS",
     "n1MessageContent": { "contentId": "sms" }
   },
-  "smsPayload": { "contentType": "application/vnd.3gpp.sms", "hex": "<CP-DATA / RP-DATA TPDU hex>" },
+  "smsPayload": { "contentType": "application/vnd.3gpp.sms", "hex": "<RP-DATA carrying SMS-DELIVER TPDU, hex>", "text": "hello" },
   "smsRecordId": "mt-0001"
 }
 ```
 
 The real API sends the N1 SMS container as a binary multipart part. We carry it in `smsPayload`, the same shape the
 SMSF uses in UplinkSMS, so both directions look alike.
+
+**Payload layering (UE ↔ SMSF, both directions):** `smsPayload.hex` is a TS 24.011 RP message (RP-DATA, RP-ACK,
+RP-ERROR) that carries the TS 23.040 TPDU (SMS-SUBMIT on MO, SMS-DELIVER on MT, plus the reports). The CP layer
+(CP-DATA/CP-ACK) is skipped, since there is no real NAS. The SMSF unwraps and wraps the RP layer; towards the SMSC only the
+bare TPDU travels (as agreed with holminator in `#build`). Optional `smsPayload.text` carries readable text for logs;
+nobody has to read it.
 
 | Result | Status | Body |
 |---|---|---|

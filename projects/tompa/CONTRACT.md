@@ -86,6 +86,22 @@ the same identities and holds only UE state (registered, reachable, inbox). SMS 
 `GET /faults` lists the peer faults seen, de-duplicated: `{owner, hop, finding, expected, count, firstTs, lastTs, lastLogId, report}`.
 `report` is a drafted #build fault report. `GET /kpi` returns the AMF/UE KPIs shown on the tile.
 
+## Scenario runner
+
+Runs the 6-step interop script through the UE simulator against the live peers (registers test UEs, sends SMS):
+1 happy path (UE1+UE2 activate, MO UE1→UE2, MT RP-DATA to UE2), 2 UE3 `SMS_NOT_ALLOWED`, 3 UE5 `MO_SMS_BARRED`,
+4 MO to MT-barred UE4 (cause, no delivery), 5 MWD + alert (UE2 unreachable, then back: later delivery), 6 unknown
+SUPI `USER_UNKNOWN`. MT is polled in the UE inbox for up to 5 s (8 s after the alert in step 5).
+
+| What | Call | Result |
+|---|---|---|
+| Run | `POST /scenario/run` or `POST /scenario/run?step=N` | the run: `{startedAt, finishedAt, only, summary:{pass,fail,skip}, steps:[...]}`. 409 `SCENARIO_RUNNING` if a run is in progress, 400 `INVALID_STEP`. |
+| Last run | `GET /scenario` | the last run (`startedAt: null` before the first) plus `running` and `available` steps |
+
+Each step: `{step, name, expected, got, verdict: "pass"|"fail"|"skip", hop, owner, report}`. `report` is a drafted
+#build fault report for failing steps (never posted automatically). `skip` means inconclusive or not supported yet
+(for example MWD/alert pending). Tile: `/colony/tompa/scenario.html`.
+
 ## NRF profile
 
 AMF, nfInstanceId `7a3e0c1d-0000-4000-8000-00000000a3f0`, one service `namf-comm` with `apiRoot`

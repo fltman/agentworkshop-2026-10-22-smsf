@@ -16,13 +16,22 @@ const ok = () => ({ verdict: 'ok' });
 const expected = finding => ({ verdict: 'expected', finding });
 const fault = (hop, owner, finding, expect) => ({ verdict: 'fault', hop, owner, finding, expected: expect });
 
-// Which peer behind the SMSF caused an SMSF error, judged from its cause/detail text.
+// Which peer behind the SMSF caused an SMSF error, judged from its cause/detail text (krilju's errors carry
+// detail "<PEER> answered <status>"). A discovery failure is the SMSF's own query (fault 3: it asked for SMSC, not
+// CUSTOM_SMSC). A 400-class data error from the SMSC or UDM means the SMSF built a malformed request (fault 2: it
+// forwarded our whole RP-DATA instead of the bare TPDU), so the owner is the SMSF even though the hop is beyond it.
+const MALFORMED = /UNEXPECTED_DATA_VALUE|MISSING_AVP|MANDATORY_IE|INVALID_JSON/;
 function blame(body) {
-  const t = `${(body && body.cause) || ''} ${(body && body.detail) || ''}`;
-  if (/SMSC/i.test(t)) return ['SMSF→SMSC', OWNER.smsc];
-  if (/UDM|UECM|SDM/i.test(t)) return ['SMSF→UDM', OWNER.udm];
-  if (/NRF|DISCOVERY/i.test(t)) return ['SMSF→NRF', OWNER.smsf];
-  return ['AMF→SMSF', OWNER.smsf];
+  const cause = (body && body.cause) || '';
+  const detail = (body && body.detail) || '';
+  const t = `${cause} ${detail}`;
+  if (/NF_DISCOVERY|DISCOVERY|NRF/i.test(t)) return ['SMSF→NRF', OWNER.smsf];
+  const peer = /SMSC/i.test(t) ? 'smsc' : /UDM|UECM|SDM/i.test(t) ? 'udm' : null;
+  if (!peer) return ['AMF→SMSF', OWNER.smsf];
+  const hop = `SMSF→${peer.toUpperCase()}`;
+  const m = /answered (\d+)/.exec(detail);
+  if ((m && Number(m[1]) === 400) || MALFORMED.test(cause)) return [hop, OWNER.smsf];
+  return [hop, OWNER[peer]];
 }
 
 // RP layer check for a payload the SMSF sends to the UE (TS 24.011 7.3: RP-DATA network to MS, MTI 1).
@@ -55,18 +64,46 @@ function n1n2(body) {
   return mtPayload(body.smsPayload.hex);
 }
 
+// The RP message the SMSF returns to the UE in the UplinkSMS answer (krilju CONTRACT: RP-ACK MTI 3 on success,
+// RP-ERROR MTI 5 in the error body, same RP-MR as our RP-DATA). Optional field: absent is not a fault.
+function moAnswer(status, body, sentHex) {
+  const hex = body && body.smsPayload && body.smsPayload.hex;
+  if (hex === undefined || hex === null) return ok();
+  if (typeof hex !== 'string' || !/^([0-9a-f]{2})+$/i.test(hex) || hex.length < 4) {
+    return fault('SMSF→AMF', OWNER.smsf, 'UplinkSMS answer smsPayload.hex is not an RP message', 'RP-ACK or RP-ERROR network to MS');
+  }
+  const want = status === 200 ? { mti: 3, name: 'RP-ACK network to MS (MTI 3)' } : { mti: 5, name: 'RP-ERROR network to MS (MTI 5)' };
+  const mti = parseInt(hex.slice(0, 2), 16) & 0x07;
+  if (mti !== want.mti) {
+    // 0x01 is RP-DATA network to MS as RP, or TP-MTI 01 (SMS-SUBMIT-REPORT) as a bare TPDU; neither belongs here.
+    const what = mti === 1 ? 'RP MTI 1: a bare SUBMIT-REPORT TPDU or RP-DATA, RP-ACK/RP-ERROR header missing' : `RP MTI ${mti}`;
+    return fault('SMSF→AMF', OWNER.smsf, `UplinkSMS answer is ${what}`, `${want.name} with our RP-MR`);
+  }
+  if (typeof sentHex === 'string' && sentHex.length >= 4 && hex.slice(2, 4).toUpperCase() !== sentHex.slice(2, 4).toUpperCase()) {
+    return fault('SMSF→AMF', OWNER.smsf, `RP-MR ${parseInt(hex.slice(2, 4), 16)} in the answer, we sent ${parseInt(sentHex.slice(2, 4), 16)}`, 'the RP-MR of our RP-DATA');
+  }
+  return ok();
+}
+
 // A response from the SMSF to our Activate / UplinkSMS / Deactivate call.
-function smsfResponse(op, supi, status, body) {
+// opts.expectCause: a cause the caller forced on purpose (e.g. an SMSC ?scenario=), judged as expected.
+// opts.sentHex: our UplinkSMS RP-DATA, to check the RP layer and RP-MR of the SMSF's answer.
+function smsfResponse(op, supi, status, body, opts = {}) {
   const cause = body && body.cause;
-  const want = EXPECTED[op] && EXPECTED[op][supi];
+  const want = opts.expectCause || (EXPECTED[op] && EXPECTED[op][supi]);
   if (status === 0) return fault('AMF→SMSF', OWNER.smsf, 'no answer (timeout or connection refused)', 'an HTTP answer within 8 s');
   if (want) {
-    if (cause === want) return expected(`${want}, as the test data says`);
+    if (cause === want) return expected(`${want}, as ${opts.expectCause ? 'the test forced' : 'the test data says'}`);
     return fault(...blame(body), `got ${status} ${cause || ''}`.trim(), `${want} for ${supi}`);
   }
   const good = { activate: [200, 201], sendsms: [200], deactivate: [204] }[op] || [200];
-  if (good.includes(status)) return ok();
-  return fault(...blame(body), `${status} ${cause || ''}${body && body.detail ? `: ${body.detail}` : ''}`.trim(), `${good.join(' or ')}`);
+  if (good.includes(status)) return op === 'sendsms' ? moAnswer(status, body, opts.sentHex) : ok();
+  const f = fault(...blame(body), `${status} ${cause || ''}${body && body.detail ? `: ${body.detail}` : ''}`.trim(), `${good.join(' or ')}`);
+  if (op === 'sendsms' && f.owner !== OWNER.smsf) {
+    const rp = moAnswer(status, body, opts.sentHex);
+    if (rp.verdict === 'fault') f.also = rp;
+  }
+  return f;
 }
 
 // An NRF discovery result (TS 29.510 6.2.6.2.2). Checks that the profile can actually be called.
@@ -91,4 +128,4 @@ function report(entry) {
   return `@${d.owner} fault on ${d.hop}. Sent/seen: ${entry.method} ${entry.path}. Expected: ${d.expected}. Got: ${d.finding}. (tompa boundary decoder, log id ${entry.id})`;
 }
 
-module.exports = { OWNER, EXPECTED, n1n2, mtPayload, smsfResponse, discovery, report };
+module.exports = { OWNER, EXPECTED, blame, n1n2, mtPayload, moAnswer, smsfResponse, discovery, report };

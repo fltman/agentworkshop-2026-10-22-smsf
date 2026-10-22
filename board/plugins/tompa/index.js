@@ -3,6 +3,8 @@
 
 const sms = require('./sms');
 const diagnose = require('./diagnose');
+const scenario = require('./scenario');
+const traffic = require('./traffic');
 
 const TEAM = 'tompa';
 // Peers publish absolute apiPrefix values, so we register and call on the public origin (override for local runs).
@@ -85,15 +87,19 @@ const faults = new Map();
 function judge(entry, diag) {
   if (!entry || !diag) return diag;
   entry.diag = diag;
-  if (diag.verdict !== 'fault') return diag;
+  addFault(entry, diag);
+  if (diag.also) addFault(entry, diag.also);
+  return diag;
+}
+function addFault(entry, diag) {
+  if (diag.verdict !== 'fault') return;
   const key = `${diag.owner}|${diag.hop}|${diag.finding}`;
   const f = faults.get(key) || { owner: diag.owner, hop: diag.hop, finding: diag.finding, expected: diag.expected, count: 0, firstTs: entry.ts };
   f.count++;
   f.lastTs = entry.ts;
   f.lastLogId = entry.id;
-  f.report = diagnose.report(entry);
+  f.report = diagnose.report({ ...entry, diag });
   faults.set(key, f);
-  return diag;
 }
 
 function send(res, status, body, type = 'application/json') {
@@ -269,7 +275,7 @@ async function moSms(req, res, ue) {
   const smsRecordId = `mo-${TEAM}-${Date.now()}-${rpMr}`;
   kpis.mo.attempts++;
   const r = await uplink(ue, smsRecordId, hexPayload, b.text);
-  judge(r.entry, diagnose.smsfResponse('sendsms', ue.supi, r.status, r.body));
+  judge(r.entry, diagnose.smsfResponse('sendsms', ue.supi, r.status, r.body, { sentHex: hexPayload }));
   const ok = r.status === 200;
   if (ok) kpis.mo.ok++; else { kpis.mo.failed++; bump(kpis.mo.causes, causeOf(r)); }
   ue.outbox.unshift({ ts: new Date().toISOString(), smsRecordId, to: b.to, text: b.text, ok, status: r.status, result: r.body });
@@ -337,6 +343,35 @@ async function n1n2(req, res, supi) {
   return true;
 }
 
+// ---------- scenario runner: drives the UE simulator handlers in-process (projects/tompa/CONTRACT.md) ----------
+
+async function invoke(fn, ue, body) {
+  const out = { status: 0, body: null };
+  const res = { writeHead(s) { out.status = s; }, end(t) { out.body = t ? JSON.parse(t) : null; } };
+  const req = { async *[Symbol.asyncIterator]() { if (body !== undefined) yield Buffer.from(JSON.stringify(body)); } };
+  if (fn === moSms || fn === setReachable) await fn(req, res, ue); else await fn(res, ue);
+  return out;
+}
+const ueBy = supi => { const ue = ues.get(supi); if (!ue) throw new Error(`no simulated UE ${supi}`); return ue; };
+const runner = scenario.createRunner({
+  register: async supi => (await invoke(register, ueBy(supi))).body,
+  deregister: async supi => (await invoke(deregister, ueBy(supi))).body,
+  sendSms: (supi, to, text) => invoke(moSms, ueBy(supi), { to, text }),
+  setReachable: async (supi, reachable) => (await invoke(setReachable, ueBy(supi), { reachable })).body,
+  inbox: supi => ueBy(supi).inbox,
+  lastLogId: () => seq,
+  logSince: id => log.filter(e => e.id > id),
+});
+const load = traffic.createGenerator({
+  sendSms: (supi, to, text) => invoke(moSms, ueBy(supi), { to, text }),
+  ensureRegistered: async supi => {
+    const ue = ueBy(supi);
+    if (ue.state === 'REGISTERED' && ue.smsActive) return { supi, already: true };
+    return (await invoke(register, ue)).body;
+  },
+  setTimer: (fn, ms) => { const t = setInterval(fn, ms); if (t.unref) t.unref(); return t; },
+});
+
 // ---------- routing ----------
 
 module.exports = {
@@ -379,6 +414,27 @@ module.exports = {
       return problem(res, 405, 'METHOD_NOT_ALLOWED', 'see CONTRACT.md');
     }
 
+    if (req.method === 'GET' && path === '/scenario') return send(res, 200, { startedAt: null, steps: [], ...runner.last(), running: runner.running(), available: scenario.STEPS });
+    if (req.method === 'POST' && path === '/scenario/run') {
+      const step = new URL(req.url, 'http://x').searchParams.get('step');
+      rec('in', 'trigger', 'POST', `${path}${step ? `?step=${step}` : ''}`, null, null);
+      try { return send(res, 200, await runner.run(step || undefined)); } catch (e) {
+        if (e.code === 'BUSY') return problem(res, 409, 'SCENARIO_RUNNING', e.message);
+        if (e.code === 'NO_STEP') return problem(res, 400, 'INVALID_STEP', e.message);
+        throw e;
+      }
+    }
+    if (req.method === 'GET' && path === '/traffic') return send(res, 200, load.stats());
+    if (req.method === 'POST' && path === '/traffic/start') {
+      let b = {};
+      try { b = await readJson(req); } catch { return problem(res, 400, 'INVALID_JSON', 'body is not JSON'); }
+      rec('in', 'trigger', 'POST', `${path} rate=${b.rate}`, null, null);
+      return send(res, 200, await load.start({ rate: b.rate, durationS: b.durationS }));
+    }
+    if (req.method === 'POST' && path === '/traffic/stop') {
+      rec('in', 'trigger', 'POST', path, null, null);
+      return send(res, 200, load.stop('stopped'));
+    }
     if (req.method === 'GET' && path === '/log') return send(res, 200, log.slice(-100).reverse());
     if (req.method === 'GET' && path === '/kpi') return send(res, 200, kpi());
     if (req.method === 'GET' && path === '/faults') {

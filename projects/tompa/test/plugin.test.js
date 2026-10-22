@@ -153,3 +153,19 @@ test('reachable again re-activates SMS at the SMSF (MWD alert trigger); deregist
   assert.strictEqual(d.body.smsf.status, 204);
   assert.strictEqual(d.body.state, 'DEREGISTERED');
 });
+
+test('traffic generator: start registers senders, sends MO load at the capped rate, stop halts it', async () => {
+  const started = await api('POST', '/traffic/start', { rate: 50, durationS: 30 });
+  assert.strictEqual(started.status, 200);
+  assert.strictEqual(started.body.rate, 5);
+  assert.ok(started.body.running);
+  await sleep(1100);
+  const mid = await api('GET', '/traffic');
+  assert.ok(mid.body.totals.sent >= 3, `sent ${mid.body.totals.sent}`);
+  assert.ok(mid.body.totals.ok >= 1);
+  const stopped = await api('POST', '/traffic/stop');
+  assert.strictEqual(stopped.body.running, false);
+  const n = stopped.body.totals.sent;
+  await sleep(500);
+  assert.strictEqual((await api('GET', '/traffic')).body.totals.sent, n);
+});

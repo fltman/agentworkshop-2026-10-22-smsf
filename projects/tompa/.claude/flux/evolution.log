@@ -9,3 +9,6 @@
 2026-10-22 10:24 SELECT: b859479f-α wins (fitness 83 vs γ 68, β 62), β and γ to the graveyard
 2026-10-22 10:30 EVOLVE: no active timelines (b859479f closed, α selected); α gen-003 work done: 6 plugin tests, live in the NRF, first live e2e run
 2026-10-22 10:32 EXPLORE: 05f8eb0a "peer interop fault detection" (3 timelines: α boundary decoder, β scenario conformance runner, γ cross-peer trace correlator)
+2026-10-22 10:55 EVOLVE: 05f8eb0a-α gen-002 → gen-003 (64 → 66, self 78 discounted: in-sample, held-out scoring + own-uplink self-check, defensive 0.6, testing 0.8)
+2026-10-22 10:55 EVOLVE: 05f8eb0a-β gen-002 → gen-003 (unscored → 56, unproven: approved live run gate, step 4 vacuous pass removed, cleanup + traffic isolation)
+2026-10-22 10:55 EVOLVE: 05f8eb0a-γ gen-001 → gen-002 (61, auto-diagnose joined trace in α diag shape, holminator counter witness, analytical 0.7)

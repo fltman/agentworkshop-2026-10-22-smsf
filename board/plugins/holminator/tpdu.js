@@ -150,10 +150,20 @@ function encodeSubmit({ mr = 0, to, text, srr = false, rd = false, vp = null }) 
   return [fo, mr & 0xff, ...encTpAddr(to), 0x00, u.dcs, ...(vp === null ? [] : [vp & 0xff]), u.udl, ...u.ud];
 }
 
-// MTI=00, TP-MMS=1 (no more messages), TP-SRI if a status report is wanted.
-function encodeDeliver({ from, text, sri = false, date }) {
+// Semi-octet TP-SCTS / TP-DT back to an ISO time (TZ in quarter hours, sign in bit 3 of the 7th octet).
+function decScts(b, i) {
+  const d = k => (b[i + k] & 0x0f) * 10 + (b[i + k] >> 4);
+  const tzq = (b[i + 6] & 0x07) * 10 + (b[i + 6] >> 4);
+  const tzMin = ((b[i + 6] & 0x08) ? -1 : 1) * tzq * 15;
+  const utc = Date.UTC(2000 + d(0), d(1) - 1, d(2), d(3), d(4), d(5)) - tzMin * 60000;
+  return new Date(utc).toISOString();
+}
+
+// SMS-DELIVER, TS 23.040 9.2.2.1. TP-MMS is inverted: bit set = no more messages waiting in the SC.
+function encodeDeliver({ from, text, sri = false, date, moreToSend = false, rp = false, pid = 0 }) {
   const u = encUd(text);
-  return [0x04 | (sri ? 0x20 : 0), ...encTpAddr(from), 0x00, u.dcs, ...scts(date), u.udl, ...u.ud];
+  const fo = (moreToSend ? 0 : 0x04) | (sri ? 0x20 : 0) | (rp ? 0x80 : 0);
+  return [fo, ...encTpAddr(from), pid & 0xff, u.dcs, ...scts(date), u.udl, ...u.ud];
 }
 
 function decodeDeliver(b) {
@@ -162,9 +172,55 @@ function decodeDeliver(b) {
   const oa = decTpAddr(b, 1);
   let i = oa.next;
   const pid = b[i++], dcs = b[i++];
+  const sctsIso = decScts(b, i);
   i += 7;
   const udl = b[i++];
-  return { type: 'SMS-DELIVER', oa: oa.addr, pid, dcs, text: decUd(b, i, dcs, udl, fo & 0x40) };
+  if (udl === undefined) throw new Error('truncated SMS-DELIVER');
+  return {
+    type: 'SMS-DELIVER', oa: oa.addr, pid, dcs, scts: sctsIso,
+    moreToSend: !(fo & 0x04), sri: !!(fo & 0x20), rp: !!(fo & 0x80),
+    text: decUd(b, i, dcs, udl, fo & 0x40),
+  };
+}
+
+// SMS-STATUS-REPORT, TS 23.040 9.2.2.3: MTI=10, TP-SRQ=0 (result of an SMS-SUBMIT), MR and RA of the original
+// SUBMIT, its SC timestamp, the discharge time and TP-ST.
+function encodeStatusReport({ mr, ra, sctsDate, dtDate, st, moreToSend = false }) {
+  return [0x02 | (moreToSend ? 0 : 0x04), mr & 0xff, ...encTpAddr(ra), ...scts(sctsDate), ...scts(dtDate), st & 0xff];
+}
+
+function decodeStatusReport(b) {
+  const fo = b[0];
+  if ((fo & 3) !== 2) throw new Error('not an SMS-STATUS-REPORT');
+  const ra = decTpAddr(b, 2);
+  let i = ra.next;
+  if (b.length < i + 15) throw new Error('truncated SMS-STATUS-REPORT');
+  const out = { type: 'SMS-STATUS-REPORT', mr: b[1], ra: ra.addr, srq: !!(fo & 0x20), moreToSend: !(fo & 0x04) };
+  out.scts = decScts(b, i); i += 7;
+  out.dt = decScts(b, i); i += 7;
+  out.st = b[i];
+  return out;
+}
+
+// TP-ST values the SC uses (TS 23.040 9.2.3.15).
+const ST = {
+  RECEIVED_BY_SME: 0x00,
+  NO_RESPONSE_FROM_SME_TRYING: 0x22,
+  REMOTE_PROCEDURE_ERROR: 0x40,
+  INCOMPATIBLE_DESTINATION: 0x41,
+  NOT_OBTAINABLE: 0x43,
+  VALIDITY_PERIOD_EXPIRED: 0x46,
+  ERROR_IN_SME_STOPPED: 0x65,
+  SERVICE_REJECTED_STOPPED: 0x63,
+};
+
+// RP-ERROR (TS 24.011 7.3.4): MTI, ref, cause length, cause. Returns the RP-Cause or null for anything else.
+function rpErrorCause(hex) {
+  try {
+    const b = hexToBytes(hex);
+    if ((b[0] & 7) !== 4 && (b[0] & 7) !== 5) return null;
+    return b[2] >= 1 ? (b[3] & 0x7f) : null;
+  } catch { return null; }
 }
 
 // SMS-SUBMIT-REPORT for RP-ACK: MTI=01, TP-PI=0, TP-SCTS.
@@ -217,7 +273,8 @@ function decodeAny(hex) {
   const rp = (b[0] & 7) <= 1 ? unwrapRp(b) : null;
   const t = rp ? rp.tpdu : b;
   const rpInfo = rp ? { rpMessage: RP_MTI[rp.mti], rpRef: rp.ref, rpOa: rp.rpOa || null, rpDa: rp.rpDa || null } : null;
-  const attempts = (t[0] & 3) === 1 ? [decodeSubmit, decodeDeliver] : [decodeDeliver, decodeSubmit];
+  const mti = t[0] & 3;
+  const attempts = mti === 1 ? [decodeSubmit, decodeDeliver] : mti === 2 ? [decodeStatusReport] : [decodeDeliver, decodeSubmit];
   let lastErr;
   for (const f of attempts) {
     try { return { rp: rpInfo, tpdu: { hex: bytesToHex(t), ...f(t) } }; } catch (e) { lastErr = e; }
@@ -240,5 +297,6 @@ function decodeMo(hex) {
 module.exports = {
   hexToBytes, bytesToHex, digitsOf,
   decodeSubmit, encodeSubmit, encodeDeliver, decodeDeliver, encodeSubmitReportAck, encodeSubmitReportError, FCS,
+  encodeStatusReport, decodeStatusReport, ST, rpErrorCause,
   unwrapRp, wrapRpDataToMs, wrapRpDataToNetwork, decodeMo, decodeAny,
 };

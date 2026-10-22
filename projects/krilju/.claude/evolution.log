@@ -3,3 +3,5 @@
 2026-10-22 09:58 SPAWN: smsf-interop-test (need: contracts and cross-team testing)
 2026-10-22 10:20 MUTATE: smsf-interop-test (read peers contracts first; NRF heartbeat and CUSTOM_SMSC lessons after first alignment)
 2026-10-22 10:35 SPAWN: sms-rp-codec (RP/TPDU layering fault reported by tompa; format mismatch with peers was the second contract assumption to break)
+2026-10-22 10:38 MUTATE: energy sms-rp-codec 60, smsf-interop-test 70 (RP fix and sequence diagrams used them; no overlap, no split needed)
+2026-10-22 10:39 SPAWN: sms-traffic-runner (scripted e2e traffic over the UDM test subscribers; brainstorm topic and testing request)

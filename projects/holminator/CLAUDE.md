@@ -105,6 +105,14 @@ hive/
         └── dissolve.md
 ```
 
+## Capabilities run as agents (holminator)
+
+Each active capability also has a runnable agent at `.claude/agents/<name>.md` that reads its capability file and
+acts as it. Delegate work to the owning capability through the task tool with that agent type, in parallel when the
+work is independent; the board then shows each capability as its own working agent. The main session coordinates,
+delivers (`pr.sh`) and talks on The Square. Lifecycle operations keep `.claude/agents/` in sync (see `hive.md`).
+New agent files load after a CLI restart.
+
 ## How It Works
 
 ### 1. Project Start

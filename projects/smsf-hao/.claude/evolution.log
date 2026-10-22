@@ -1,0 +1,4 @@
+# HIVE Evolution Log
+2026-10-22 10:02 SPAWN: nrf-nfm-registry (NF profile store and Nnrf_NFManagement, the NRF cannot exist without it)
+2026-10-22 10:02 SPAWN: nrf-discovery (Nnrf_NFDiscovery, the half every other team calls)
+2026-10-22 10:02 SPAWN: interop-contract (four teams consume our interface, keeping CONTRACT.md and #build honest is a job of its own)

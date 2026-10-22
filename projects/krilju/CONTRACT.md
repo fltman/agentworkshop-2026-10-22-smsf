@@ -30,7 +30,7 @@ Response 200 `{"result":"SUCCESS","deliveryReport":{"hex"}}`, or 4xx/5xx with `{
 
 ## NRF profile
 
-nfType `SMSF`, stable nfInstanceId `6f1c2c1e-0000-4000-8000-0000006b7269`, service `nsmsf-sms` v2, apiPrefix `https://smsf.torget.bjarby.com/t/krilju`.
+nfType `SMSF`, stable nfInstanceId `6f1c2c1e-0000-4000-8000-0000006b7269`, service `nsmsf-sms` v2, fqdn `smsf.torget.bjarby.com`, apiPrefix `/t/krilju`, apiRoot `https://smsf.torget.bjarby.com/t/krilju`. We heartbeat the NRF every 20 s and re-register if the NRF forgot us. The SMSC is discovered as `CUSTOM_SMSC`.
 
 ## Triggers and logs
 

@@ -187,3 +187,11 @@ test('registered UEs survive a restart: init re-registers the UEs saved in ctx.d
   assert.ok(!JSON.parse(fs.readFileSync(p.join(dir, 'ues.json'), 'utf8')).registered.includes(UE4));
   fs.rmSync(dir, { recursive: true });
 });
+
+test('POST bodies are capped at 64 KB (413), malformed JSON is 400 (spore backend-6)', async () => {
+  const big = await api('POST', `/ue/${UE1}/sms`, { to: 'msisdn-46700000002', text: 'x'.repeat(70 * 1024) });
+  assert.strictEqual(big.status, 413);
+  assert.strictEqual(big.body.cause, 'PAYLOAD_TOO_LARGE');
+  const r = await fetch(`http://127.0.0.1:${amf.address().port}/t/tompa/ue/${UE1}/sms`, { method: 'POST', body: '{nope' });
+  assert.strictEqual(r.status, 400);
+});

@@ -137,12 +137,23 @@ function send(res, status, body, type = 'application/json') {
 }
 const problem = (res, status, cause, detail) => send(res, status, { status, cause, detail }, 'application/problem+json');
 
+// Bodies are capped (spore backend-6): past MAX_BODY we keep draining but drop the bytes, so the
+// socket stays usable for the 413 and a large POST cannot grow memory on the shared server.
+const MAX_BODY = 64 * 1024;
 async function readJson(req) {
   const chunks = [];
-  for await (const c of req) chunks.push(c);
+  let size = 0;
+  for await (const c of req) {
+    size += c.length;
+    if (size <= MAX_BODY) chunks.push(c);
+  }
+  if (size > MAX_BODY) throw Object.assign(new Error(`body is ${size} bytes, max ${MAX_BODY}`), { tooLarge: true });
   const t = Buffer.concat(chunks).toString('utf8');
   return t ? JSON.parse(t) : {};
 }
+const bodyProblem = (res, e) => (e.tooLarge
+  ? problem(res, 413, 'PAYLOAD_TOO_LARGE', e.message)
+  : problem(res, 400, 'INVALID_JSON', 'body is not JSON'));
 
 async function call(peer, method, url, body, type = 'application/json') {
   const path = url.replace(HOST, '');
@@ -296,7 +307,7 @@ async function uplink(ue, smsRecordId, hexPayload, text) {
 
 async function moSms(req, res, ue) {
   let b;
-  try { b = await readJson(req); } catch { return problem(res, 400, 'INVALID_JSON', 'body is not JSON'); }
+  try { b = await readJson(req); } catch (e) { return bodyProblem(res, e); }
   if (!b.to || typeof b.text !== 'string') return problem(res, 400, 'MANDATORY_IE_MISSING', 'to and text are required');
   if (ue.state !== 'REGISTERED') return problem(res, 409, 'UE_NOT_REGISTERED', 'register the UE first');
   if (!ue.smsActive) return problem(res, 409, 'SMS_NOT_ACTIVE', 'SMS over NAS is not active for this UE');
@@ -315,7 +326,7 @@ async function moSms(req, res, ue) {
 
 async function setReachable(req, res, ue) {
   let b;
-  try { b = await readJson(req); } catch { return problem(res, 400, 'INVALID_JSON', 'body is not JSON'); }
+  try { b = await readJson(req); } catch (e) { return bodyProblem(res, e); }
   if (typeof b.reachable !== 'boolean') return problem(res, 400, 'MANDATORY_IE_MISSING', 'reachable (boolean) is required');
   const was = ue.reachable;
   ue.reachable = b.reachable;
@@ -334,9 +345,9 @@ async function setReachable(req, res, ue) {
 async function n1n2(req, res, supi) {
   let b;
   const n1n2Path = `/namf-comm/v1/ue-contexts/${supi}/n1-n2-messages`;
-  try { b = await readJson(req); } catch {
+  try { b = await readJson(req); } catch (e) {
     judge(rec('in', 'smsf', 'POST', n1n2Path, null, null), diagnose.n1n2(null));
-    return problem(res, 400, 'INVALID_JSON', 'body is not JSON');
+    return bodyProblem(res, e);
   }
   judge(rec('in', 'smsf', 'POST', n1n2Path, null, b), diagnose.n1n2(b));
   kpis.mt.received++;
@@ -460,7 +471,7 @@ module.exports = {
     if (req.method === 'GET' && path === '/traffic') return send(res, 200, load.stats());
     if (req.method === 'POST' && path === '/traffic/start') {
       let b = {};
-      try { b = await readJson(req); } catch { return problem(res, 400, 'INVALID_JSON', 'body is not JSON'); }
+      try { b = await readJson(req); } catch (e) { return bodyProblem(res, e); }
       rec('in', 'trigger', 'POST', `${path} rate=${b.rate}`, null, null);
       return send(res, 200, await load.start({ rate: b.rate, durationS: b.durationS }));
     }

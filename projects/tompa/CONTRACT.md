@@ -68,6 +68,9 @@ Registrations survive a restart of our plugin (every deploy): the registered set
 each of those UEs is re-registered at the AMF and re-activated at the SMSF (a fresh PUT ue-contexts) once our NRF
 registration is back, a few seconds after start. Inbox, reachability and KPIs still reset.
 
+Request bodies to any of our POST endpoints are capped at 64 KB: larger gives 413 `PAYLOAD_TOO_LARGE`,
+malformed JSON gives 400 `INVALID_JSON` (problem+json).
+
 ## Test subscribers
 
 The UDM (hetoteam) owns subscriber data; see `projects/hetoteam/CONTRACT.md`. The UE simulator is pre-loaded with

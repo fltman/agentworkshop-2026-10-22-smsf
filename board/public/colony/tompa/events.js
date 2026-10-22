@@ -58,7 +58,25 @@ function normalize(feed, e) {
   const failText = /RP-ERROR|FAIL|ERROR/i.test(what) || (e.diag && e.diag.verdict === 'fault');
   const ok = status == null ? true : status < 400 && !failText;
   const label = (m ? m[2].replace(/https?:\/\/\S+/g, (u) => shortPath(u)) : `${e.method || ''} ${shortPath(e.path)}`).trim() || what;
-  return { ts: e.ts, from, to, status, ok, label };
+  return { ts: e.ts, from, to, status, ok, label: nameOf(label) };
+}
+
+// Readable names for the registration procedures; the raw call stays after the dash.
+const NAMES = [
+  [/^POST \/ue\/\{supi\}\/register$/, 'REGISTER'],
+  [/^POST \/ue\/\{supi\}\/deregister$/, 'DEREGISTER'],
+  [/^POST \/ue\/\{supi\}\/sms$/, 'MO SMS'],
+  [/^PUT \/nsmsf-sms\/v2\/ue-contexts\/\{supi\}$/, 'REGISTER'],
+  [/^DELETE \/nsmsf-sms\/v2\/ue-contexts\/\{supi\}$/, 'DEREGISTER'],
+  [/^PUT \/nudm-uecm\/.*\/registrations\//, 'UDM REG'],
+  [/^DELETE \/nudm-uecm\/.*\/registrations\//, 'UDM DEREG'],
+  [/^POST \/nudm-sdm\/.*sdm-subscriptions/, 'SDM SUBSCRIBE'],
+  [/^DELETE \/nudm-sdm\/.*sdm-subscriptions/, 'SDM UNSUBSCRIBE'],
+  [/^GET \/nudm-sdm\/.*\/sms-data/, 'SMS DATA'],
+];
+function nameOf(label) {
+  const hit = NAMES.find(([re]) => re.test(label));
+  return hit ? `${hit[1]} – ${label}` : label;
 }
 
 // Two logs can see the same call; one copy per caller, callee, status and second.
@@ -78,9 +96,11 @@ function collect(results) {
 
 // SMS travels UE → AMF → SMSF → SMSC. Calls that touch the UDM or the NRF carry subscriber data or
 // registry signalling, never the SMS itself.
-const kindOf = i => (['UDM', 'NRF'].includes(i.from) || ['UDM', 'NRF'].includes(i.to) ? 'signal' : 'sms');
+// Registration and deregistration carry no SMS either, wherever they run.
+const kindOf = i => (['UDM', 'NRF'].includes(i.from) || ['UDM', 'NRF'].includes(i.to)
+  || /^(REGISTER|DEREGISTER) –/.test(i.label || '') ? 'signal' : 'sms');
 
-if (typeof module !== 'undefined') module.exports = { NODES, FEEDS, normalize, collect, key, shortPath, kindOf };
+if (typeof module !== 'undefined') module.exports = { NODES, FEEDS, normalize, collect, key, shortPath, kindOf, nameOf };
 
 // ---- browser: poll every 3 s, hand only new interactions to the subscribers ----
 if (typeof window !== 'undefined') {

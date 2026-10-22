@@ -429,11 +429,19 @@ async function invoke(fn, ue, body) {
   if (fn === moSms || fn === setReachable) await fn(req, res, ue); else await fn(res, ue);
   return out;
 }
+// In-process UE actions (load generator, scenarios) are logged like the HTTP trigger, so UE → AMF shows in the log.
+async function ueAction(action, fn, supi, body) {
+  const ue = ueBy(supi);
+  const ts = new Date().toISOString();
+  const r = await invoke(fn, ue, body);
+  rec('in', 'ue', 'POST', `/ue/${supi}/${action}`, r.status, null).ts = ts; // logged once, with its answer
+  return r;
+}
 const ueBy = supi => { const ue = ues.get(supi); if (!ue) throw new Error(`no simulated UE ${supi}`); return ue; };
 const runner = scenario.createRunner({
-  register: async supi => (await invoke(register, ueBy(supi))).body,
-  deregister: async supi => (await invoke(deregister, ueBy(supi))).body,
-  sendSms: (supi, to, text) => invoke(moSms, ueBy(supi), { to, text }),
+  register: async supi => (await ueAction('register', register, supi)).body,
+  deregister: async supi => (await ueAction('deregister', deregister, supi)).body,
+  sendSms: (supi, to, text) => ueAction('sms', moSms, supi, { to, text }),
   setReachable: async (supi, reachable) => (await invoke(setReachable, ueBy(supi), { reachable })).body,
   inbox: supi => ueBy(supi).inbox,
   lastLogId: () => seq,
@@ -441,14 +449,14 @@ const runner = scenario.createRunner({
   originateMt: (to, text) => call('smsc', 'POST', `${HOST}/t/holminator/api/mt`, { to, text }),
 });
 const load = traffic.createGenerator({
-  sendSms: (supi, to, text) => invoke(moSms, ueBy(supi), { to, text }),
+  sendSms: (supi, to, text) => ueAction('sms', moSms, supi, { to, text }),
   ensureRegistered: async supi => {
     const ue = ueBy(supi);
     if (ue.state === 'REGISTERED' && ue.smsActive) return { supi, already: true };
-    return (await invoke(register, ue)).body;
+    return (await ueAction('register', register, supi)).body;
   },
-  register: supi => invoke(register, ueBy(supi)),
-  deregister: supi => invoke(deregister, ueBy(supi)),
+  register: supi => ueAction('register', register, supi),
+  deregister: supi => ueAction('deregister', deregister, supi),
   isRegistered: supi => ueBy(supi).state === 'REGISTERED',
   setTimer: (fn, ms) => { const t = setInterval(fn, ms); if (t.unref) t.unref(); return t; },
 });

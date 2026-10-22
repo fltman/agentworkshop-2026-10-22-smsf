@@ -169,3 +169,21 @@ test('traffic generator: start registers senders, sends MO load at the capped ra
   await sleep(500);
   assert.strictEqual((await api('GET', '/traffic')).body.totals.sent, n);
 });
+
+test('registered UEs survive a restart: init re-registers the UEs saved in ctx.dataDir', async () => {
+  const fs = require('node:fs'); const os = require('node:os'); const p = require('node:path');
+  const dir = fs.mkdtempSync(p.join(os.tmpdir(), 'tompa-'));
+  const UE4 = 'imsi-001010000000004';
+  fs.writeFileSync(p.join(dir, 'ues.json'), JSON.stringify({ registered: [UE4, 'imsi-not-ours'] }));
+  plugin.init({ dataDir: dir });
+  let ue;
+  for (let i = 0; i < 40 && !(ue && ue.state === 'REGISTERED'); i++) {
+    await new Promise(r => setTimeout(r, 200));
+    ue = (await api('GET', `/ue/${UE4}`)).body;
+  }
+  assert.strictEqual(ue.state, 'REGISTERED');
+  assert.strictEqual(ue.smsActive, true);
+  await api('POST', `/ue/${UE4}/deregister`);
+  assert.ok(!JSON.parse(fs.readFileSync(p.join(dir, 'ues.json'), 'utf8')).registered.includes(UE4));
+  fs.rmSync(dir, { recursive: true });
+});

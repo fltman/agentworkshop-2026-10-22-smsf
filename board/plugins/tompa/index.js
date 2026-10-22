@@ -5,6 +5,8 @@ const sms = require('./sms');
 const diagnose = require('./diagnose');
 const scenario = require('./scenario');
 const traffic = require('./traffic');
+const fs = require('node:fs');
+const nodePath = require('node:path');
 
 const TEAM = 'tompa';
 // Peers publish absolute apiPrefix values, so we register and call on the public origin (override for local runs).
@@ -35,6 +37,32 @@ function newUe(supi, gpsi) {
   return { supi, gpsi, state: 'DEREGISTERED', smsActive: false, reachable: true, lastSmsf: null, inbox: [], outbox: [] };
 }
 for (const [supi, gpsi] of SUBSCRIBERS) ues.set(supi, newUe(supi, gpsi));
+
+// Registered UEs survive a plugin restart (deploy): saved to ctx.dataDir, re-registered once the NRF is up,
+// so peers do not get 409 UE_NOT_REGISTERED after every release round (krilju #build 189).
+let stateFile = null;
+let toRestore = [];
+function saveUes() {
+  if (!stateFile) return;
+  const registered = [...ues.values()].filter(u => u.state === 'REGISTERED').map(u => u.supi);
+  try { fs.writeFileSync(stateFile, JSON.stringify({ registered })); } catch (e) { console.error(`[${TEAM}] save ues:`, e.message); }
+}
+function loadUes(dataDir) {
+  stateFile = nodePath.join(dataDir, 'ues.json');
+  try { toRestore = JSON.parse(fs.readFileSync(stateFile, 'utf8')).registered.filter(s => ues.has(s)); } catch { toRestore = []; }
+}
+async function restoreUes() {
+  const todo = toRestore;
+  toRestore = [];
+  for (const supi of todo) {
+    const ue = ues.get(supi);
+    if (ue.state === 'REGISTERED') continue;
+    const r = (await invoke(register, ue)).body;
+    // No SMSF reachable yet: try again on the next NRF tick.
+    if (!r.smsActive && [0, 503].includes(r.smsf && r.smsf.status)) { ue.state = 'DEREGISTERED'; toRestore.push(supi); }
+  }
+  saveUes();
+}
 
 const log = [];
 let seq = 0;
@@ -234,6 +262,7 @@ async function register(res, ue) {
   kpis.reg.attempts++;
   const r = await activateSms(ue);
   if (ue.smsActive) kpis.reg.smsActivated++; else { kpis.reg.smsRefused++; bump(kpis.reg.causes, causeOf(r)); }
+  saveUes();
   return send(res, 200, { supi: ue.supi, state: ue.state, smsActive: ue.smsActive, smsf: { status: r.status, body: r.body } });
 }
 
@@ -252,6 +281,7 @@ async function deregister(res, ue) {
   ue.state = 'DEREGISTERED';
   ue.smsActive = false;
   ue.lastSmsf = smsf && { op: 'deactivate', ...smsf };
+  saveUes();
   return send(res, 200, { supi: ue.supi, state: ue.state, smsf });
 }
 
@@ -375,8 +405,11 @@ const load = traffic.createGenerator({
 // ---------- routing ----------
 
 module.exports = {
-  init() {
-    const tick = () => heartbeat().catch(e => console.error(`[${TEAM}] nrf:`, e.message));
+  init(ctx = {}) {
+    if (ctx.dataDir) loadUes(ctx.dataDir);
+    const tick = () => heartbeat()
+      .then(() => (nrf.registered && toRestore.length ? restoreUes() : null))
+      .catch(e => console.error(`[${TEAM}] nrf:`, e.message));
     const first = setTimeout(() => { try { tick(); } catch (e) { console.error(`[${TEAM}]`, e.message); } }, 3000);
     if (first.unref) first.unref();
     // Until registered: retry every 10 s. Then heartbeat every HEARTBEAT_S. One timer, re-armed each round.

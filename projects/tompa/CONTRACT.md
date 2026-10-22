@@ -64,6 +64,10 @@ Activate body we send: `{"supi","gpsi","amfId","accessType":"3GPP_ACCESS","guami
 | Reachability | `POST /ue/{supi}/reachable` body `{"reachable":false}` | next MT SMS gets 504 `UE_NOT_REACHABLE`. Setting it back to true triggers the stretch-goal alert path. |
 | Inbox | `GET /ue/{supi}/inbox` | MT SMS the UE has received |
 
+Registrations survive a restart of our plugin (every deploy): the registered set is saved, and after a restart
+each of those UEs is re-registered at the AMF and re-activated at the SMSF (a fresh PUT ue-contexts) once our NRF
+registration is back, a few seconds after start. Inbox, reachability and KPIs still reset.
+
 ## Test subscribers
 
 The UDM (hetoteam) owns subscriber data; see `projects/hetoteam/CONTRACT.md`. The UE simulator is pre-loaded with

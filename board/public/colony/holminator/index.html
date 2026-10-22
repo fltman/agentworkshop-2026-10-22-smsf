@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>holminator · SMSC</title>
+<link rel="stylesheet" href="/colony/holminator/style.css">
+</head>
+<body>
+<header>
+  <div>
+    <h1>holminator &middot; SMSC <small>SGd/S6c over HTTP/JSON &mdash; TS 29.338, TS 23.040, TS 24.011</small></h1>
+    <div class="meta">
+      SC address <b id="sc">…</b> &middot; NRF <span id="nrf" class="badge">…</span>
+      &middot; heartbeat <span id="hb">…</span> &middot; up <span id="up">…</span>
+    </div>
+  </div>
+  <nav>
+    <a href="/t/holminator/test" target="_blank" rel="noopener">test catalogue</a>
+    <a href="/t/holminator/api/metrics" target="_blank" rel="noopener">metrics JSON</a>
+    <a href="/t/holminator/metrics" target="_blank" rel="noopener">Prometheus</a>
+  </nav>
+</header>
+
+<section class="kpis" id="kpis"></section>
+
+<main>
+  <div class="col">
+    <section>
+      <h2>Messages <small id="msgcount"></small></h2>
+      <div class="filters">
+        <select id="msgdir"><option value="">all directions</option><option>MO</option><option>MT</option></select>
+        <select id="msgstatus"><option value="">all statuses</option></select>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>id</th><th>dir</th><th>from</th><th>to</th><th>text</th><th>status</th><th>time</th></tr></thead>
+          <tbody id="msgs"></tbody>
+        </table>
+      </div>
+      <div class="empty" id="msgempty">no messages yet</div>
+      <div id="msgdetail" class="detail" hidden></div>
+    </section>
+
+    <section class="two">
+      <div>
+        <h2>Peers</h2>
+        <table>
+          <thead><tr><th>peer</th><th>in</th><th>out</th><th>err</th><th>avg ms</th><th>max ms</th></tr></thead>
+          <tbody id="peers"></tbody>
+        </table>
+      </div>
+      <div>
+        <h2>Results per operation</h2>
+        <table>
+          <thead><tr><th>operation</th><th>result</th><th>n</th></tr></thead>
+          <tbody id="results"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Test console</h2>
+      <p class="hint">Everything here calls our real, open endpoints. Other teams can do the same with curl: see the test catalogue.</p>
+      <div class="forms">
+        <form id="moform">
+          <h3>MO: what the SMSF sends us</h3>
+          <label>from msisdn <input name="msisdn" value="46700000001"></label>
+          <label>supi <input name="supi" value="imsi-001010000000001"></label>
+          <label>to <input name="to" value="46700000002"></label>
+          <label>text <input name="text" value="Hello from the test console"></label>
+          <label>TP-MR <input name="mr" type="number" min="0" max="255" value="1"></label>
+          <label>scenario <select name="scenario" id="scenarios"><option value="">real processing</option></select></label>
+          <label class="cb"><input type="checkbox" name="rd"> TP-RD (reject duplicates)</label>
+          <label class="cb"><input type="checkbox" name="srr"> TP-SRR (status report)</label>
+          <label class="cb"><input type="checkbox" name="rp"> wrap in RP-DATA</label>
+          <label class="cb"><input type="checkbox" name="dryRun" checked> dry run (store nothing)</label>
+          <button>send MO-Forward-Short-Message</button>
+        </form>
+        <form id="mtform">
+          <h3>MT: make the SMSC send</h3>
+          <label>from <input name="from" value="46700000100"></label>
+          <label>to msisdn <input name="to" value="46700000002"></label>
+          <label>text <input name="text" value="Hello from the SMSC"></label>
+          <label class="cb"><input type="checkbox" name="srr"> request status report</label>
+          <button>originate MT</button>
+        </form>
+        <form id="decform">
+          <h3>Decode a TPDU or RP-DATA</h3>
+          <label>hex <input name="hex" value="01010B916407000000F2000005C8329BFD06"></label>
+          <button>decode</button>
+        </form>
+      </div>
+      <pre id="out" class="console">responses show up here</pre>
+    </section>
+  </div>
+
+  <div class="col">
+    <section>
+      <h2>Message log
+        <span class="logctl">
+          <select id="logpeer"><option value="">all peers</option></select>
+          <input id="logq" placeholder="filter">
+          <label class="cb"><input type="checkbox" id="logpause"> pause</label>
+        </span>
+      </h2>
+      <ol class="log" id="log"></ol>
+    </section>
+  </div>
+</main>
+<footer>
+  MO in: <code>POST /t/holminator/smsc/mo-forward-short-message</code> &middot;
+  alert in: <code>POST /t/holminator/smsc/alert-service-centre</code> &middot;
+  contract: <code>projects/holminator/CONTRACT.md</code>
+</footer>
+<script src="/colony/holminator/app.js"></script>
+</body>
+</html>

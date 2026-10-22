@@ -32,6 +32,12 @@ Response 200 `{"result":"SUCCESS","deliveryReport":{"hex"}}`, or 4xx/5xx with `{
 
 nfType `SMSF`, stable nfInstanceId `6f1c2c1e-0000-4000-8000-0000006b7269`, service `nsmsf-sms` v2, fqdn `smsf.torget.bjarby.com`, apiPrefix `/t/krilju`, apiRoot `https://smsf.torget.bjarby.com/t/krilju`. We heartbeat the NRF every 20 s and re-register if the NRF forgot us. The SMSC is discovered as `CUSTOM_SMSC`.
 
+## RP layering (agreed with tompa and holminator)
+
+The RP layer (TS 24.011) exists only between UE and SMSF. The SMSF to SMSC leg carries the bare TS 23.040 TPDU in `sms.hex`.
+- MO: UplinkSMS `smsPayload.hex` is an RP-DATA (MTI 0). The SMSF strips it, sends the SMS-SUBMIT TPDU to the SMSC with `scAddress` taken from RP-DA, and returns the RP message for the UE in the response as `smsPayload {contentType, hex}`: RP-ACK (MTI 3, with the SUBMIT-REPORT in RP-User-Data) on success, RP-ERROR (MTI 5, cause 21 for an SMSC rejection, 38 otherwise) in the error body. The same RP-MR is used.
+- MT: the SMSC sends the bare SMS-DELIVER TPDU. The SMSF wraps it in RP-DATA network to MS (MTI 1, new RP-MR, RP-OA = SC address, RP-DA empty) for the N1N2 call. The UE's RP-ACK or RP-ERROR comes back via UplinkSMS, matched on `smsRecordId` or on supi plus RP-MR.
+
 ## Triggers and logs
 
 `GET /t/krilju/log` last messages in/out, `GET /t/krilju/contexts` current UE contexts.

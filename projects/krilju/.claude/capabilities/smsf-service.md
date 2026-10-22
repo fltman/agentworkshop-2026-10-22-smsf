@@ -4,7 +4,7 @@ type: capability
 domain: backend
 tools: Read, Write, Edit, Bash, Grep, Glob
 model: sonnet
-energy: 70
+energy: 80
 spawned: 2026-10-22
 can-merge-with: [smsf-interop-test]
 ---

@@ -123,19 +123,31 @@ function decodeSubmit(b) {
   const da = decTpAddr(b, 2);
   let i = da.next;
   const pid = b[i++], dcs = b[i++];
-  i += VP_LEN[(fo >> 3) & 3];
+  const vpf = (fo >> 3) & 3;
+  const validityMs = vpf === 2 ? relativeVpMs(b[i]) : null;
+  i += VP_LEN[vpf];
   const udl = b[i++];
   if (udl === undefined) throw new Error('truncated SMS-SUBMIT');
   return {
-    type: 'SMS-SUBMIT', mr, da: da.addr, pid, dcs,
-    srr: !!(fo & 0x20), udhi: !!(fo & 0x40), rd: !!(fo & 0x04),
+    type: 'SMS-SUBMIT', mr, da: da.addr, daToa: da.toa, pid, dcs, vpf, validityMs,
+    srr: !!(fo & 0x20), udhi: !!(fo & 0x40), rd: !!(fo & 0x04), rp: !!(fo & 0x80),
     text: decUd(b, i, dcs, udl, fo & 0x40),
   };
 }
 
-function encodeSubmit({ mr = 0, to, text, srr = false }) {
+// TS 23.040 9.2.3.12.1, relative TP-VP.
+function relativeVpMs(v) {
+  const MIN = 60000;
+  if (v <= 143) return (v + 1) * 5 * MIN;
+  if (v <= 167) return 12 * 60 * MIN + (v - 143) * 30 * MIN;
+  if (v <= 196) return (v - 166) * 24 * 60 * MIN;
+  return (v - 192) * 7 * 24 * 60 * MIN;
+}
+
+function encodeSubmit({ mr = 0, to, text, srr = false, rd = false, vp = null }) {
   const u = encUd(text);
-  return [0x01 | (srr ? 0x20 : 0), mr & 0xff, ...encTpAddr(to), 0x00, u.dcs, u.udl, ...u.ud];
+  const fo = 0x01 | (srr ? 0x20 : 0) | (rd ? 0x04 : 0) | (vp === null ? 0 : 0x10);
+  return [fo, mr & 0xff, ...encTpAddr(to), 0x00, u.dcs, ...(vp === null ? [] : [vp & 0xff]), u.udl, ...u.ud];
 }
 
 // MTI=00, TP-MMS=1 (no more messages), TP-SRI if a status report is wanted.
@@ -157,6 +169,26 @@ function decodeDeliver(b) {
 
 // SMS-SUBMIT-REPORT for RP-ACK: MTI=01, TP-PI=0, TP-SCTS.
 const encodeSubmitReportAck = date => [0x01, 0x00, ...scts(date)];
+// SMS-SUBMIT-REPORT for RP-ERROR: MTI=01, TP-FCS, TP-PI=0, TP-SCTS.
+const encodeSubmitReportError = (fcs, date) => [0x01, fcs & 0xff, 0x00, ...scts(date)];
+
+// TP-FCS values (TS 23.040 9.2.3.22) the SC uses towards the originating UE.
+const FCS = {
+  TELEMATIC_INTERWORKING_NOT_SUPPORTED: 0x80,
+  CANNOT_REPLACE_SM: 0x81,
+  UNSPECIFIED_TP_PID_ERROR: 0x8f,
+  DATA_CODING_SCHEME_NOT_SUPPORTED: 0x90,
+  COMMAND_CANNOT_BE_ACTIONED: 0xa0,
+  SC_BUSY: 0xc0,
+  NO_SC_SUBSCRIPTION: 0xc1,
+  SC_SYSTEM_FAILURE: 0xc2,
+  INVALID_SME_ADDRESS: 0xc3,
+  DESTINATION_SME_BARRED: 0xc4,
+  SM_REJECTED_DUPLICATE_SM: 0xc5,
+  TP_VPF_NOT_SUPPORTED: 0xc6,
+  TP_VP_NOT_SUPPORTED: 0xc7,
+  UNSPECIFIED: 0xff,
+};
 
 // TS 24.011: RP-DATA MS->N has MTI 0, RP-DATA N->MS has MTI 1.
 function unwrapRp(b) {
@@ -171,6 +203,26 @@ function unwrapRp(b) {
 }
 function wrapRpDataToMs({ ref = 0, scAddress, tpdu }) {
   return [0x01, ref & 0xff, ...encRpAddr(scAddress), 0x00, tpdu.length, ...tpdu];
+}
+// RP-DATA MS->network (TS 24.011 7.3.1.2): empty RP-OA, RP-DA = SC address.
+function wrapRpDataToNetwork({ ref = 0, scAddress, tpdu }) {
+  return [0x00, ref & 0xff, 0x00, ...encRpAddr(scAddress), tpdu.length, ...tpdu];
+}
+const RP_MTI = ['RP-DATA (MS->N)', 'RP-DATA (N->MS)', 'RP-ACK (MS->N)', 'RP-ACK (N->MS)', 'RP-ERROR (MS->N)', 'RP-ERROR (N->MS)', 'RP-SMMA (MS->N)'];
+
+// Best-effort decoder for the test endpoint: any RP-DATA, SMS-SUBMIT or SMS-DELIVER we know.
+function decodeAny(hex) {
+  const b = hexToBytes(hex);
+  if (!b.length) throw new Error('empty payload');
+  const rp = (b[0] & 7) <= 1 ? unwrapRp(b) : null;
+  const t = rp ? rp.tpdu : b;
+  const rpInfo = rp ? { rpMessage: RP_MTI[rp.mti], rpRef: rp.ref, rpOa: rp.rpOa || null, rpDa: rp.rpDa || null } : null;
+  const attempts = (t[0] & 3) === 1 ? [decodeSubmit, decodeDeliver] : [decodeDeliver, decodeSubmit];
+  let lastErr;
+  for (const f of attempts) {
+    try { return { rp: rpInfo, tpdu: { hex: bytesToHex(t), ...f(t) } }; } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('not a TPDU we know');
 }
 
 // The MO payload may be the bare SMS-SUBMIT (agreed) or a full RP-DATA (accepted).
@@ -187,6 +239,6 @@ function decodeMo(hex) {
 
 module.exports = {
   hexToBytes, bytesToHex, digitsOf,
-  decodeSubmit, encodeSubmit, encodeDeliver, decodeDeliver, encodeSubmitReportAck,
-  unwrapRp, wrapRpDataToMs, decodeMo,
+  decodeSubmit, encodeSubmit, encodeDeliver, decodeDeliver, encodeSubmitReportAck, encodeSubmitReportError, FCS,
+  unwrapRp, wrapRpDataToMs, wrapRpDataToNetwork, decodeMo, decodeAny,
 };

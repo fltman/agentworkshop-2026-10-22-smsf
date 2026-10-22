@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>smsf-hao — NRF</title>
+<style>
+  :root { --bg:#0e1116; --fg:#e6edf3; --dim:#8b949e; --line:#232a33; --ok:#3fb950; --warn:#d29922; --gone:#8b949e; --acc:#58a6ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  header { padding:18px 20px 12px; border-bottom:1px solid var(--line); }
+  h1 { margin:0; font-size:17px; letter-spacing:.5px; }
+  h1 small { color:var(--dim); font-weight:normal; letter-spacing:0; }
+  main { padding:16px 20px 40px; display:grid; gap:20px; grid-template-columns: minmax(320px,1.2fr) minmax(300px,1fr); }
+  @media (max-width:860px) { main { grid-template-columns:1fr; } }
+  section h2 { font-size:12px; text-transform:uppercase; letter-spacing:1px; color:var(--dim); margin:0 0 8px; }
+  .counters { display:flex; flex-wrap:wrap; gap:14px; margin-bottom:14px; }
+  .counters div { background:#161b22; border:1px solid var(--line); border-radius:6px; padding:6px 10px; }
+  .counters b { color:var(--acc); font-size:16px; display:block; }
+  .counters span { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  table { width:100%; border-collapse:collapse; }
+  th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--dim); font-weight:normal; padding:4px 8px 4px 0; border-bottom:1px solid var(--line); }
+  td { padding:5px 8px 5px 0; border-bottom:1px solid var(--line); vertical-align:top; word-break:break-all; }
+  .type { color:var(--acc); font-weight:bold; }
+  .REGISTERED { color:var(--ok); } .SUSPENDED { color:var(--warn); } .UNDISCOVERABLE { color:var(--gone); }
+  .empty { color:var(--dim); padding:10px 0; }
+  ol.log { list-style:none; margin:0; padding:0; max-height:62vh; overflow:auto; }
+  ol.log li { padding:3px 0; border-bottom:1px solid var(--line); }
+  .t { color:var(--dim); } .in { color:var(--ok); } .out { color:var(--acc); } .err { color:var(--warn); }
+  .d { color:var(--dim); }
+  footer { color:var(--dim); padding:0 20px 24px; font-size:12px; }
+  a { color:var(--acc); }
+</style>
+</head>
+<body>
+<header>
+  <h1>smsf-hao &middot; NRF <small>— Nnrf_NFManagement + Nnrf_NFDiscovery, TS 29.510</small></h1>
+</header>
+<main>
+  <section>
+    <h2>Registered network functions</h2>
+    <div class="counters" id="counters"></div>
+    <table>
+      <thead><tr><th>type</th><th>status</th><th>services</th><th>apiRoot</th><th>last seen</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty">loading…</div>
+  </section>
+  <section>
+    <h2>Message log</h2>
+    <ol class="log" id="log"></ol>
+  </section>
+</main>
+<footer>
+  Register: <code>PUT /t/smsf-hao/nnrf-nfm/v1/nf-instances/{nfInstanceId}</code> &middot;
+  heartbeat: <code>PATCH</code> with <code>[]</code> &middot;
+  discover: <code>GET /t/smsf-hao/nnrf-disc/v1/nf-instances?target-nf-type=UDM&amp;requester-nf-type=SMSF</code>.
+  Full contract and a smoke test in <code>projects/smsf-hao/</code>.
+</footer>
+<script>
+// Everything shown here is written by other teams' agents. Never innerHTML: textContent only.
+const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; };
+const hhmmss = ts => { const d = new Date(ts); return isNaN(d) ? String(ts) : d.toTimeString().slice(0, 8); };
+
+async function tick() {
+  let s, l;
+  try {
+    [s, l] = await Promise.all([
+      fetch('/t/smsf-hao/status').then(r => r.json()),
+      fetch('/t/smsf-hao/log?limit=80').then(r => r.json()),
+    ]);
+  } catch (e) { document.getElementById('empty').textContent = 'the NRF backend is not answering'; return; }
+
+  const c = document.getElementById('counters');
+  c.replaceChildren();
+  const counters = s.counters || {};
+  for (const [k, v] of [['registered', (s.instances || []).length], ['registrations', counters.register || 0],
+                        ['updates', counters.update || 0], ['discoveries', counters.discover || 0],
+                        ['deregistrations', counters.deregister || 0], ['rejected', counters.rejected || 0]]) {
+    const d = el('div'); d.append(el('b', null, String(v)), el('span', null, k)); c.append(d);
+  }
+
+  const tb = document.getElementById('rows');
+  tb.replaceChildren();
+  const rows = (s.instances || []).slice().sort((a, b) => String(a.nfType).localeCompare(String(b.nfType)));
+  for (const i of rows) {
+    const tr = el('tr');
+    tr.append(el('td', 'type', i.nfType || '?'));
+    tr.append(el('td', String(i.nfStatus || ''), i.nfStatus || ''));
+    tr.append(el('td', null, (i.services || []).join(', ') || '—'));
+    tr.append(el('td', 'd', i.apiRoot || '—'));
+    tr.append(el('td', 'd', hhmmss(i.lastSeen)));
+    tb.append(tr);
+  }
+  document.getElementById('empty').textContent = rows.length ? '' : 'nobody has registered yet. Be the first.';
+
+  const log = document.getElementById('log');
+  log.replaceChildren();
+  for (const e of (l.log || [])) {
+    const li = el('li');
+    li.append(el('span', 't', hhmmss(e.ts) + ' '));
+    const arrow = e.dir === 'in' ? '<-- ' : '--> ';
+    const cls = /^(4|5)\d\d/.test(e.text || '') ? 'err' : (e.dir === 'in' ? 'in' : 'out');
+    li.append(el('span', cls, arrow + (e.text || '')));
+    if (e.detail) li.append(el('span', 'd', ' ' + e.detail));
+    log.append(li);
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+tick();
+setInterval(tick, 5000);
+</script>
+</body>
+</html>

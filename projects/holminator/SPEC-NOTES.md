@@ -59,8 +59,8 @@ Carried as RP-User-Data in RP-ACK (positive) or RP-ERROR (negative).
 | C3 | Invalid SME address | x | |
 | C4 | Destination SME barred | x | |
 | C5 | SM Rejected-Duplicate SM | x | |
-| C6 | TP-VPF not supported | x | |
-| C7 | TP-VP not supported | x | |
+| C6 | TP-VPF not supported (✅ never needed: all four TP-VPF values supported) | x | |
+| C7 | TP-VP not supported (✅ sent for reserved enhanced VP, invalid absolute VP, absolute VP in the past) | x | |
 | D0 | (U)SIM SMS storage full | | x |
 | D1 | No SMS storage capability in (U)SIM | | x |
 | D2 | Error in MS | | x |
@@ -296,9 +296,14 @@ SGd equivalent: DIAMETER_ERROR_SM_DELIVERY_FAILURE (5555) + SM-Enumerated-Delive
 4. MUST include TP-FCS in SUBMIT-REPORT for RP-ERROR, values from 9.2.3.22 table (hex). [23.040 9.2.3.22]
 5. SHOULD reject a duplicate (TP-RD=1, same TP-MR + TP-DA + OA, SM still held) with RP-ERROR TP-FCS 0xC5; MAY be configured to RP-ACK. [23.040 9.2.3.6, 9.2.3.25]
 6. MUST accept a duplicate with TP-RD=0 as a new SM. [23.040 9.2.3.25]
-7. MUST decode TP-VPF and TP-VP (relative/absolute/enhanced) and compute expiry from SC receipt time. [23.040 9.2.3.3, 9.2.3.12]
-8. MAY reject unsupported TP-VPF with TP-FCS 0xC6. [23.040 9.2.3.3]
-9. MUST reject reserved/unsupported enhanced TP-VP with TP-FCS 0xC7. [23.040 9.2.3.12.3]
+7. MUST decode TP-VPF and TP-VP (relative/absolute/enhanced) and compute expiry from SC receipt time. [23.040 9.2.3.3, 9.2.3.12] ✅ expiresAt = absolute time, or receipt + relative/enhanced period; enhanced format 000 uses our default.
+8. MAY reject unsupported TP-VPF with TP-FCS 0xC6. [23.040 9.2.3.3] ✅ n/a, every TP-VPF is supported.
+9. MUST reject reserved/unsupported enhanced TP-VP with TP-FCS 0xC7. [23.040 9.2.3.12.3] ✅ formats 100-111, 0 seconds, non-zero extension octet, bad semi-octets: OFA 5555 EQUIPMENT_PROTOCOL_ERROR + SUBMIT-REPORT FCS C7 (mapped like C5).
+   Our decisions: (a) an absolute TP-VP already in the past at receipt is rejected with C7 rather than accepted and
+   expired: 23.040 has no explicit rule, but the SC cannot keep the SM for a period that is over (3.2.1), and the UE
+   learns it at once instead of from a later TP-ST 46. (b) Extension octets (b7) are walked; none are defined, so an
+   all-zero one is skipped and any set bit is C7. Reserved bits 5..3 of octet 1 are ignored. (c) Single-shot (b6):
+   one attempt, then FAILED with TP-ST 62 instead of WAITING; the UDM may still set MWD on its own on absent.
 10. MUST discard MO with TP-PID Device Triggering (0x48). [23.040 9.2.3.9]
 11. MAY reject reserved/unsupported TP-PID (TP-FCS 0x80/0x8F). [23.040 9.2.3.9]
 12. MUST be able to replace a stored SM on Replace Type n PID (0x41-0x47) from same originating address. [23.040 9.2.3.9, 6.2 (3)]

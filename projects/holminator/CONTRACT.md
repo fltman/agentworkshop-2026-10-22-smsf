@@ -53,8 +53,10 @@ Required: `sms.hex` and one of `supi` / `msisdn`.
 { "result": "SUCCESS", "diameterResultCode": 2001, "messageId": "smsc-17", "deliveryReport": { "hex": "0100..." } }
 ```
 
-The answer means the SMSC accepted the SMS (TS 29.338 OFA). Delivery to the recipient happens afterwards: if the
-recipient is in our network, the SMSC originates an MT SMS to them (section 2). `sms.hex` may be the bare SMS-SUBMIT
+The answer means the SMSC accepted the SMS (TS 29.338 OFA). The MO terminates at the SMSC: we store it with
+`direction: "MO"` and mark it `FORWARDED` (history detail `simulated onward delivery to <TP-DA>`). There is no
+SRI-for-SM and no MT-Forward for an MO. If TP-SRR is set, the originator gets an SMS-STATUS-REPORT (TP-ST 0x00) as a
+new MT record (`kind: "STATUS_REPORT"`) over the real MT path (section 2). `sms.hex` may be the bare SMS-SUBMIT
 (agreed) or the whole RP-DATA MS->N; in the latter case RP-DA must be our SC address. `deliveryReport.hex` is the
 SMS-SUBMIT-REPORT for RP-ACK (TS 23.040 9.2.2.2a).
 
@@ -74,11 +76,12 @@ for RP-ERROR that the SMSF should put in the RP-ERROR to the UE (TS 23.040 3.4.2
 | --- | --- | --- |
 | `UNKNOWN_SERVICE_CENTRE` (3) | none | `scAddress` or RP-DA is not 46700000100 |
 | `INVALID_SME_ADDRESS` (5) | C3 | TP-DA empty or longer than 15 digits |
-| `EQUIPMENT_PROTOCOL_ERROR` (1) | C5 | TP-RD=1 and an SM with the same TP-MR, TP-DA and originator is still held (TS 23.040 9.2.3.25). TP-RD=0 duplicates are accepted. |
+| `EQUIPMENT_PROTOCOL_ERROR` (1) | C5 | TP-RD=1 and an SM with the same TP-MR, TP-DA and originator is still held (TS 23.040 9.2.3.25; a `FORWARDED` MO counts as held until its validity period ends). TP-RD=0 duplicates are accepted. |
 
 ## 2. MT SMS - SMSC origination
 
-An MT starts from an accepted MO (to its TP-DA), from a status report (SRR set on the MO), or from `POST /api/mt`.
+An MT record (`direction: "MT"`) comes from exactly two sources: `POST /api/mt` (the generator, `kind: "SMS"`) and a
+status report for an MO with TP-SRR (`kind: "STATUS_REPORT"`, `reportFor` = the MO id). An MO is never relayed as MT.
 
 1. `POST {udm}/sms-routing/v1/send-routing-info-for-sm` with `{ msisdn, scAddress, smRpPri: false, smRpMti }`
    (`smRpMti` 1 for a status report, else 0). 200 gives `servingNode.smsfInstanceId`.
@@ -97,17 +100,26 @@ An MT starts from an accepted MO (to its TP-DA), from a status report (SRR set o
 
 | Outcome | Our action | Status |
 | --- | --- | --- |
-| SMSF 200 | delivered; status report to the originator if SRR was set (TP-ST 0x00) | `DELIVERED` |
+| SMSF 200 | delivered | `DELIVERED` |
 | SRI 404 `ABSENT_SUBSCRIBER_SM`, SMSF 504 `ABSENT_SUBSCRIBER` or 404 | report `ABSENT_SUBSCRIBER`, wait for the alert (fallback retry 10 min) | `WAITING` |
 | SMSF RP-ERROR cause 22 | report `MEMORY_CAPACITY_EXCEEDED`, wait for the alert | `WAITING` |
-| SRI 404 `UNKNOWN_SUBSCRIBER`, 403 `CALL_BARRED` / `TELESERVICE_NOT_PROVISIONED`, other RP-ERROR | stop; status report if SRR, TP-ST 0x43 unknown, 0x41 not provisioned, 0x63 barred, 0x65 RP-ERROR | `FAILED` |
-| UDM/SMSF 5xx, timeout, SMSF not in NRF | retry with backoff 30 s x 2^n, max 10 min | `PENDING` |
-| validity period passed | stop; status report TP-ST 0x46 if SRR | `EXPIRED` |
+| SMSF 502 RP-ERROR temporary cause 41, 42, 47 or 111 (TS 24.011 8.2.5.4) | retry with backoff 30 s x 2^n, max 10 min | `WAITING` |
+| SRI 404 `UNKNOWN_SUBSCRIBER`, 403 `CALL_BARRED` / `TELESERVICE_NOT_PROVISIONED`, any other RP-ERROR cause (e.g. 21, 95-99) | stop, reason in `failure` | `FAILED` |
+| UDM/SMSF 5xx (incl. 502 without a deliveryReport), timeout, SMSF not in NRF | retry with backoff 30 s x 2^n, max 10 min | `WAITING` |
+| backoff retries reach 8 attempts in total | stop, reason in `failure` | `FAILED` |
+| validity period passed (`validitySeconds` on `/api/mt`, default 24 h) | stop, never sent | `EXPIRED` |
+
+An MT never carries TP-SRR (it comes from `/api/mt` or is itself a status report), so MT outcomes produce no status
+report. The attempt cap applies to backoff retries only; an SM waiting for the alert (absent subscriber, memory full) is kept
+until its validity period ends. After a restart, stored MT records in `ACCEPTED` or `PENDING` are sent again (expired
+ones end `EXPIRED`), `WAITING` ones keep their fallback retry time, and an MO left `ACCEPTED` becomes `FORWARDED`
+(with its status report if TP-SRR was set; an MO whose validity has passed ends `EXPIRED` with TP-ST 0x46 if SRR).
 
 Rules: one MT in flight per recipient (TS 23.040 3.1), queued SMs set TP-MMS (`moreMessagesToSend`), and every
 SM to the same MS gets a unique TP-SCTS.
 
-Message status: `ACCEPTED` → `PENDING` → `DELIVERING` → `DELIVERED` / `WAITING` / `FAILED` / `EXPIRED`.
+Message status: MO `ACCEPTED` → `FORWARDED` (or `EXPIRED` on restart after the validity period). MT `PENDING` →
+`DELIVERING` → `DELIVERED` / `WAITING` / `FAILED` / `EXPIRED`.
 
 ## 3. Alert-Service-Centre - UDM to SMSC (S6c ALR/ALA, MAP Alert-SC)
 
@@ -118,20 +130,24 @@ Message status: `ACCEPTED` → `PENDING` → `DELIVERING` → `DELIVERED` / `WAI
 ```
 
 `200 OK` `{ "result": "SUCCESS", "diameterResultCode": 2001, "redelivering": ["smsc-17"] }`, then every `WAITING`
-SM for that MSISDN is retried in order. `400 MISSING_AVP` (5005) without `msisdn`, `400 UNEXPECTED_DATA_VALUE`
+SM for that MSISDN is retried in order. The 200 comes at once but redelivery starts after a grace delay of about 2 s
+(the UDM may alert while the SMSF's UECM registration is still storing the UE context), and if that alert-triggered
+attempt gets SMSF 404 `UNKNOWN_SUBSCRIBER` or 504 `ABSENT_SUBSCRIBER` we make exactly one fast retry about 5 s later
+before reporting `ABSENT_SUBSCRIBER` and waiting for the next alert. `400 MISSING_AVP` (5005) without `msisdn`, `400 UNEXPECTED_DATA_VALUE`
 (5004) for another SC address or a body that is not JSON.
 
 ## 4. Triggers and observability
 
 | Method and path | What |
 | --- | --- |
-| `POST /api/mt` `{ "from": "46700000009", "to": "46700000002", "text": "Hi" }` | Originate an MT SMS (`from` defaults to the SC address, text at most 160 characters). `202` `{ messageId, track }`; `?wait=1` answers `200` with the final status and history; `?dryRun=1` shows the TPDU without sending |
-| `GET /api/messages` | The message store, newest last |
+| `POST /api/mt` `{ "from": "46700000009", "to": "46700000002", "text": "Hi" }` | Originate an MT SMS (`from` defaults to the SC address, text at most 160 characters; optional `validitySeconds`, and `singleShot: true` for one attempt only). `202` `{ messageId, track }`; `?wait=1` answers `200` with the final status and history; `?dryRun=1` shows the TPDU without sending |
+| `GET /api/messages` | The message store, oldest first (no parameters: everything we hold, at most 500). `?limit=<n>` keeps the newest n. `?since=smsc-<n>` (or just `<n>`) keeps messages created after that id; `?since=<ISO time>` keeps messages whose `updatedAt` (the `ts` of their last history entry) is later. Both combine: filter first, then limit. A bad value is `400 { error }` |
 | `GET /api/messages/<id>` | One message with its history |
 | `GET /log?limit=<n>` | Shared call-flow log, newest first: `{ id, ts, dir, peer, method, path, status, body, ms? }`. Answers we give have `method: null` and the operation name as `path` |
 | `GET /api/log?since=<n>` | Incoming and outgoing messages: `{ id, ts, dir, peer, what, status, body, ms? }` |
-| `GET /api/metrics` | Counters, results per operation, per-peer in/out/errors/latency, NRF health, messages by status |
+| `GET /api/metrics` | Counters, results per operation, per-peer in/out/errors/latency, NRF health, messages by status and by direction. MO counters: `mo_received` (every MO request), `mo_accepted`, `mo_rejected`, `mo_forwarded`, `mo_expired`. MT counters: `mt_originated` (only `/api/mt` plus status reports), `mt_attempts`, `mt_delivered`, `mt_failed`, `mt_expired`, `status_reports_generated`, `status_reports_sent` |
 | `GET /metrics` | The same in Prometheus text format (`smsc_*`) |
+| `GET /kpi` | Common KPI summary (tompa, #build 142): `{ nf: "SMSC", up: true, requests, errors, latencyMs, extra: { mo_accepted, mt_delivered, mt_failed, waiting, status_reports_sent, alerts_received, registeredInNrf } }`. `requests`: inbound peer requests we answered; `errors`: our answers with status >= 400 plus outbound peer errors (no answer or 5xx); `latencyMs`: average outbound peer latency (0 before the first call); `waiting`: messages in WAITING now. Counters reset on restart |
 | `GET /status` | `{ nfInstanceId, registeredInNrf, messages }` |
 
 Tile: `https://smsf.torget.bjarby.com/colony/holminator/`: metrics, message store with history, live log and a
@@ -146,7 +162,7 @@ Every endpoint is open. `GET /test` lists them with ready-made bodies (the MO ex
 | Validate without side effects | `?dryRun=1` on MO: full validation, answer includes `decoded`, nothing stored or delivered |
 | Force an outcome | `?scenario=<NAME>` on MO: `SUCCESS`, `UNKNOWN_SERVICE_CENTRE`, `INVALID_SME_ADDRESS`, `DUPLICATE`, `SC_CONGESTION`, `USER_NOT_SC_USER`, `DESTINATION_BARRED`, `SYSTEM_FAILURE`, `FACILITY_NOT_SUPPORTED`, `SERVER_ERROR`, `SLOW` (10 s), `NO_ANSWER` (30 s) |
 | Build a TPDU | `POST /test/encode` `{ type: SUBMIT\|DELIVER, to\|from, text, mr, srr, rd, rp }` returns `tpduHex` (and `rpDataHex` with `rp: true`) |
-| Read a TPDU | `POST /test/decode` `{ hex }` decodes RP-DATA, SMS-SUBMIT or SMS-DELIVER |
+| Read a TPDU | `POST /test/decode` `{ hex }` decodes RP-DATA, SMS-SUBMIT or SMS-DELIVER (counted in `test_requests`, except calls with header `x-holminator-tile: 1`, which our own tile sends) |
 
 ## 5. NRF profile (SMSC to NRF)
 

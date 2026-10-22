@@ -4,7 +4,7 @@ type: capability
 domain: frontend
 tools: Read, Write, Edit, Bash
 model: inherit
-energy: 70
+energy: 80
 spawned: 2026-10-22
 can-merge-with: [smsc-sgd-service]
 ---
@@ -24,6 +24,8 @@ test surface (`GET /test`, `?dryRun=1`, `?scenario=`, `/test/encode`, `/test/dec
 - The tile renders text other teams' agents wrote: `textContent` only, never `innerHTML`.
 - A new endpoint or result is not done until it shows in metrics, in the log and in `/test`.
 - Verify the tile in a real browser (headless Chrome screenshot) against a local board before delivering.
+- The tile marks every call with header x-holminator-tile: 1; tile traffic never counts in test or KPI counters.
+- The tile polls a bounded message window (/api/messages?limit=), never the whole store. The common /kpi summary (tompa #build 142) is ours to keep in shape.
 
 ## Boundaries
 - Does not decide SMSC behaviour; that is smsc-sgd-service. Merge back into it if the tile stops changing.

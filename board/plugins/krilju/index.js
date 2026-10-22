@@ -157,6 +157,20 @@ async function callEach(nfType, fn, { on404 = false } = {}) {
   return last;
 }
 
+// SMSC rejection of an MO -> RP-Cause, per TS 23.040 11.3 (MAP MO-ForwardSM error to RP-Cause).
+const SM_FAILURE_TO_RP = { UNKNOWN_SERVICE_CENTRE: 1, SC_CONGESTION: 42, INVALID_SME_ADDRESS: 21, USER_NOT_SC_USER: 28, EQUIPMENT_PROTOCOL_ERROR: 21 };
+const SM_FAILURE_BY_VALUE = { 1: 'EQUIPMENT_PROTOCOL_ERROR', 3: 'UNKNOWN_SERVICE_CENTRE', 4: 'SC_CONGESTION', 5: 'INVALID_SME_ADDRESS', 6: 'USER_NOT_SC_USER' };
+function rpCauseForMoFailure(body, status) {
+  const b = body || {};
+  if (b.result === 'FACILITY_NOT_SUPPORTED' || b.diameterResultCode === 5552) return 69;
+  if (b.result === 'SM_DELIVERY_FAILURE' || b.diameterResultCode === 5555) {
+    const c = b.smDeliveryFailureCause || {};
+    const name = typeof c.smEnumeratedDeliveryFailureCause === 'string' ? c.smEnumeratedDeliveryFailureCause : SM_FAILURE_BY_VALUE[c.value];
+    return SM_FAILURE_TO_RP[name] || 21;
+  }
+  return 38; // 5004/5005/5012, timeout, transport error: network out of order
+}
+
 async function activate(req, res, supi) {
   let b;
   try { b = await readJson(req); } catch { return problem(res, 400, 'INVALID_JSON', 'body is not JSON'); }
@@ -249,9 +263,9 @@ async function uplinkSms(req, res, supi) {
   }
   const cause = (r.body && r.body.result) || 'SMSC_FAILURE';
   const status = r.status === 0 ? 504 : 502;
-  const err = { status, cause, detail: `SMSC answered ${r.status}` };
-  // Give the UE an RP-ERROR: 21 short message transfer rejected, 38 network out of order.
-  if (isRpData) err.smsPayload = payload(rpLayer.rpError(rp.rpMr, r.status === 403 ? 21 : 38, report));
+  const rpCause = rpCauseForMoFailure(r.body, r.status);
+  const err = { status, cause, rpCause, detail: `SMSC answered ${r.status}` };
+  if (isRpData) err.smsPayload = payload(rpLayer.rpError(rp.rpMr, rpCause, report));
   return send(res, status, err);
 }
 

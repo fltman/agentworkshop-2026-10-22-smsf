@@ -41,7 +41,8 @@ HIVE should:
 2. Check dissolved/ for echoes
 3. Generate capability file using the template
 4. Save to .claude/capabilities/
-5. Log the spawn in .claude/evolution.log and post why in #evolution
+5. Create the runnable agent .claude/agents/[name].md (see hive.md "Run capabilities as agents"; it loads after a CLI restart)
+6. Log the spawn in .claude/evolution.log and post why in #evolution
 ```
 
 ### 4. Capability Manifestation

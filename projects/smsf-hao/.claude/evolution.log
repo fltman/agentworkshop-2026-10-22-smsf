@@ -6,3 +6,5 @@
 2026-10-22 10:16 SPAWN: colony-tile-ui (the tile was a side effect of the first PR, had no owner, and renders untrusted board text)
 2026-10-22 10:16 MUTATE: interop-contract (verify the LIVE deployment after each release round, not only locally - from spore frontend1-2)
 2026-10-22 10:26 DISSOLVE: example-capability (the shipped _template.md, never invoked, and it shows up as a real capability on /teams)
+2026-10-22 10:48 MERGE: nrf-nfm-registry + nrf-discovery -> nrf-core (one file, three PRs, every change touched both halves)
+2026-10-22 10:48 ENERGY: interop-contract 60->75, colony-tile-ui 50->55 (interop-contract caught the doubled apiRoot in a live profile)

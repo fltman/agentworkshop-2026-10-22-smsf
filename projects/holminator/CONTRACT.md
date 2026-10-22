@@ -78,23 +78,38 @@ for RP-ERROR that the SMSF should put in the RP-ERROR to the UE (TS 23.040 3.4.2
 
 ## 2. MT SMS - SMSC origination
 
-1. `POST {udm}/sms-routing/v1/send-routing-info-for-sm` with `{ msisdn, scAddress, smRpPri: false }` (UDM contract §3.1).
-2. Discover the SMSF with `target-nf-type=SMSF` and `target-nf-instance-id=<servingNode.smsfInstanceId>`.
-3. `POST {smsf}/smsc/mt-forward-short-message` (SMSF contract, krilju):
+An MT starts from an accepted MO (to its TP-DA), from a status report (SRR set on the MO), or from `POST /api/mt`.
+
+1. `POST {udm}/sms-routing/v1/send-routing-info-for-sm` with `{ msisdn, scAddress, smRpPri: false, smRpMti }`
+   (`smRpMti` 1 for a status report, else 0). 200 gives `servingNode.smsfInstanceId`.
+2. Discover that SMSF with `target-nf-type=SMSF&target-nf-instance-id=<smsfInstanceId>`. No fallback to another
+   SMSF: if the instance is not in the NRF, we retry later.
+3. `POST {smsf}/smsc/mt-forward-short-message` (krilju's contract) with the bare SMS-DELIVER or SMS-STATUS-REPORT
+   TPDU. The SMSF wraps it in RP-DATA for the UE.
 
 ```json
 { "supi": "imsi-001010000000002", "msisdn": "46700000002", "scAddress": "46700000100",
-  "smsRecordId": "smsc-17", "sms": { "hex": "040B916407000000F2...", "text": "Hello" } }
+  "smsRecordId": "smsc-17-1", "moreMessagesToSend": false, "sms": { "hex": "040B916407000000F2..." } }
 ```
 
-4. `POST {udm}/sms-routing/v1/report-sm-delivery-status` with the outcome when it is `ABSENT_SUBSCRIBER`
-   (and `SUCCESSFUL_TRANSFER` after a stored SMS is delivered).
+4. `POST {udm}/sms-routing/v1/report-sm-delivery-status` with `{ msisdn, scAddress, deliveryOutcome }`:
+   `ABSENT_SUBSCRIBER` (the UDM sets MWD), `MEMORY_CAPACITY_EXCEEDED`, or `SUCCESSFUL_TRANSFER` after a stored SM.
 
-Message status in our store: `PENDING`, `DELIVERED`, `WAITING` (absent, kept for alert), `FAILED` with the cause from
-the UDM or SMSF (`UNKNOWN_SUBSCRIBER`, `CALL_BARRED`, `TELESERVICE_NOT_PROVISIONED`, `ABSENT_SUBSCRIBER`,
-`SMS_NOT_ALLOWED`, `FAILURE`).
+| Outcome | Our action | Status |
+| --- | --- | --- |
+| SMSF 200 | delivered; status report to the originator if SRR was set (TP-ST 0x00) | `DELIVERED` |
+| SRI 404 `ABSENT_SUBSCRIBER_SM`, SMSF 504 `ABSENT_SUBSCRIBER` or 404 | report `ABSENT_SUBSCRIBER`, wait for the alert (fallback retry 10 min) | `WAITING` |
+| SMSF RP-ERROR cause 22 | report `MEMORY_CAPACITY_EXCEEDED`, wait for the alert | `WAITING` |
+| SRI 404 `UNKNOWN_SUBSCRIBER`, 403 `CALL_BARRED` / `TELESERVICE_NOT_PROVISIONED`, other RP-ERROR | stop; status report if SRR, TP-ST 0x43 unknown, 0x41 not provisioned, 0x63 barred, 0x65 RP-ERROR | `FAILED` |
+| UDM/SMSF 5xx, timeout, SMSF not in NRF | retry with backoff 30 s x 2^n, max 10 min | `PENDING` |
+| validity period passed | stop; status report TP-ST 0x46 if SRR | `EXPIRED` |
 
-## 3. Alert-Service-Centre - UDM to SMSC (S6c ALR/ALA, MAP Alert-SC), stretch goal
+Rules: one MT in flight per recipient (TS 23.040 3.1), queued SMs set TP-MMS (`moreMessagesToSend`), and every
+SM to the same MS gets a unique TP-SCTS.
+
+Message status: `ACCEPTED` → `PENDING` → `DELIVERING` → `DELIVERED` / `WAITING` / `FAILED` / `EXPIRED`.
+
+## 3. Alert-Service-Centre - UDM to SMSC (S6c ALR/ALA, MAP Alert-SC)
 
 `POST /smsc/alert-service-centre`
 
@@ -102,15 +117,18 @@ the UDM or SMSF (`UNKNOWN_SUBSCRIBER`, `CALL_BARRED`, `TELESERVICE_NOT_PROVISION
 { "msisdn": "46700000002", "scAddress": "46700000100", "alertReason": "UE_PRESENT" }
 ```
 
-`200 OK` `{ "result": "SUCCESS", "diameterResultCode": 2001, "redelivering": 1 }`. The SMSC then retries every
-`WAITING` SMS for that MSISDN. `400 UNEXPECTED_DATA_VALUE` if `msisdn` is missing.
+`200 OK` `{ "result": "SUCCESS", "diameterResultCode": 2001, "redelivering": ["smsc-17"] }`, then every `WAITING`
+SM for that MSISDN is retried in order. `400 MISSING_AVP` (5005) without `msisdn`, `400 UNEXPECTED_DATA_VALUE`
+(5004) for another SC address or a body that is not JSON.
 
 ## 4. Triggers and observability
 
 | Method and path | What |
 | --- | --- |
-| `POST /api/mt` `{ "from": "46700000009", "to": "46700000002", "text": "Hi" }` | Originate an MT SMS. `202` `{ messageId }` |
+| `POST /api/mt` `{ "from": "46700000009", "to": "46700000002", "text": "Hi" }` | Originate an MT SMS (`from` defaults to the SC address, text at most 160 characters). `202` `{ messageId, track }`; `?wait=1` answers `200` with the final status and history; `?dryRun=1` shows the TPDU without sending |
 | `GET /api/messages` | The message store, newest last |
+| `GET /api/messages/<id>` | One message with its history |
+| `GET /log?limit=<n>` | Shared call-flow log, newest first: `{ id, ts, dir, peer, method, path, status, body, ms? }`. Answers we give have `method: null` and the operation name as `path` |
 | `GET /api/log?since=<n>` | Incoming and outgoing messages: `{ id, ts, dir, peer, what, status, body, ms? }` |
 | `GET /api/metrics` | Counters, results per operation, per-peer in/out/errors/latency, NRF health, messages by status |
 | `GET /metrics` | The same in Prometheus text format (`smsc_*`) |

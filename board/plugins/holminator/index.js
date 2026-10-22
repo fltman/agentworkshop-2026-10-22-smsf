@@ -31,6 +31,8 @@ const st = {
   dataDir: null,
   timers: [],
   metrics: newMetrics(),
+  inflight: new Set(), // recipients with an SMS-DELIVER outstanding: only one at a time per MS (TS 23.040 6.2)
+  lastScts: new Map(), // recipient -> last TP-SCTS second used, so timestamps stay unique per MS
 };
 
 // Counters reset on restart; message totals by status come from the persisted store instead.
@@ -162,8 +164,9 @@ async function heartbeat() {
 // The NRF adds apiRoot to discovery results; peers may also publish an absolute or a relative apiPrefix.
 function baseOf(inst) {
   const svc = (inst.nfServices || [])[0] || {};
-  if (svc.apiRoot) return svc.apiRoot.replace(/\/$/, '');
   const prefix = svc.apiPrefix || inst.apiPrefix || '';
+  // An NRF that prefixes scheme+fqdn to an already absolute apiPrefix gives "https://hosthttps://host/..." as apiRoot.
+  if (svc.apiRoot && !/^https?:\/\/.*https?:\/\//.test(svc.apiRoot)) return svc.apiRoot.replace(/\/$/, '');
   if (/^https?:\/\//.test(prefix)) return prefix.replace(/\/$/, '');
   if (prefix.startsWith('/')) return `${HOST}${prefix}`.replace(/\/$/, '');
   return null;
@@ -179,7 +182,8 @@ async function resolve(nfType, instanceId) {
   inc('nrf_discoveries');
   const r = await call('nrf', 'GET', `${NRF_DISC}/nf-instances?${q}`, undefined, { op: 'NFDiscover' });
   const list = r.body && Array.isArray(r.body.nfInstances) ? r.body.nfInstances : [];
-  const inst = (instanceId && list.find(i => i.nfInstanceId === instanceId)) || list[0];
+  // With an instance id, only that instance will do: another SMSF does not hold the UE's context.
+  const inst = instanceId ? list.find(i => i.nfInstanceId === instanceId) : list[0];
   if (!inst) { inc('nrf_discoveries_empty'); return null; }
   const base = baseOf(inst);
   if (base) st.disc.set(key, { base, ts: Date.now() });
@@ -196,16 +200,21 @@ function every(ms, fn) {
   return t;
 }
 
-function notImplemented(res, what) {
-  return send(res, 501, { result: 'FAILURE', diameterResultCode: 5012, cause: `${what} not implemented yet` });
-}
-
 function reply(res, peer, what, status, body) {
   rec('out', peer, `answer ${what}`, status, body);
   peerStats(peer).out++;
   const cause = body && body.smDeliveryFailureCause && body.smDeliveryFailureCause.smEnumeratedDeliveryFailureCause;
   countResult(what, (body && body.result ? body.result : String(status)) + (cause ? `/${cause}` : ''));
   return send(res, status, body);
+}
+
+// Shared call-flow log shape {ts, dir, peer, method, path, status, body}; answers carry method null and the operation as path.
+function flowEntry(e) {
+  const m = /^(GET|POST|PUT|PATCH|DELETE) (\S+)(.*)$/.exec(e.what || '');
+  let path = m ? m[2] : String(e.what || '').replace(/^answer /, '');
+  if (m) { try { path = new URL(path).pathname; } catch { /* already a path */ } }
+  return { id: e.id, ts: e.ts, dir: e.dir, peer: e.peer, method: m ? m[1] : null, path,
+    status: e.status ?? null, body: e.body ?? null, ...(m && m[3] ? { note: m[3].trim() } : {}), ...(e.ms === undefined ? {} : { ms: e.ms }) };
 }
 
 // Inbound request from a peer: logged and counted the same way for every operation.
@@ -318,7 +327,7 @@ async function moForward(req, res, url) {
   // as one it still holds; TP-RD=0 tells it to accept.
   const dup = st.messages.find(m => m.direction === 'MO' && m.mr === s.mr && m.to === to
     && ((from && m.from === from) || (supi && m.supi === supi))
-    && ['ACCEPTED', 'PENDING', 'WAITING'].includes(m.status));
+    && ['ACCEPTED', ...ACTIVE].includes(m.status));
   if (dup && s.rd) {
     return fail('EQUIPMENT_PROTOCOL_ERROR', tpdu.FCS.SM_REJECTED_DUPLICATE_SM, `duplicate of ${dup.id} (TP-MR ${s.mr}, TP-RD=1)`);
   }
@@ -336,6 +345,7 @@ async function moForward(req, res, url) {
   const msg = saveMessage({
     id: `smsc-${++st.msgSeq}`,
     direction: 'MO',
+    kind: 'SMS',
     status: 'ACCEPTED',
     from, supi, to,
     text: s.text, mr: s.mr, srr: s.srr, pid: s.pid, dcs: s.dcs,
@@ -354,8 +364,258 @@ async function moForward(req, res, url) {
   return true;
 }
 
-// MT delivery of an accepted MO SMS to its recipient comes with step 3 (PLAN.md).
-function onMoAccepted() {}
+// ---------- MT: the SC as SMS-GMSC towards the recipient (TS 23.040 10.1, 3.2.6-3.2.8; TS 29.338 S6c/SGd) ----------
+// Message states: PENDING (ready for an attempt) -> DELIVERING -> DELIVERED | WAITING (absent or temporary failure,
+// redelivered on Alert-Service-Centre or on nextRetryAt) | FAILED (permanent) | EXPIRED (validity period over).
+const ACTIVE = ['PENDING', 'DELIVERING', 'WAITING'];
+const RETRY_BASE_MS = 30000;
+const RETRY_MAX_MS = 10 * 60000;
+const SWEEP_MS = 10000;
+
+function hist(m, event, detail) { m.history.push({ ts: new Date().toISOString(), event, detail }); }
+function setStatus(m, status, detail) { m.status = status; hist(m, status, detail); saveStore(); }
+
+// TP-SCTS is the SC arrival time, nudged forward so no two SMs to the same MS share one (TS 23.040 6.2 (1)).
+function sctsFor(m) {
+  if (!m.sctsAt) {
+    const want = Math.floor(Date.parse(m.submittedAt) / 1000);
+    const s = Math.max(want, (st.lastScts.get(m.to) || 0) + 1);
+    st.lastScts.set(m.to, s);
+    m.sctsAt = new Date(s * 1000).toISOString();
+  }
+  return new Date(m.sctsAt);
+}
+
+function buildMtTpdu(m, moreToSend) {
+  if (m.kind === 'STATUS_REPORT') {
+    return tpdu.encodeStatusReport({ mr: m.mr, ra: m.ra, sctsDate: new Date(m.origSctsAt), dtDate: new Date(m.dischargeAt), st: m.st, moreToSend });
+  }
+  return tpdu.encodeDeliver({
+    from: m.from || tpdu.digitsOf(m.supi) || SC_ADDRESS, text: m.text, sri: !!m.srr, date: sctsFor(m), moreToSend, pid: m.pid || 0,
+  });
+}
+
+function enqueue(m, detail) {
+  setStatus(m, 'PENDING', detail);
+  kick(m.to);
+}
+
+// One SMS-DELIVER outstanding per recipient; the next PENDING one goes when the previous attempt is done.
+function kick(to) {
+  if (st.inflight.has(to)) return;
+  const next = st.messages.find(m => m.to === to && m.status === 'PENDING');
+  if (!next) return;
+  st.inflight.add(to);
+  attemptMt(next)
+    .catch(e => { console.error(`[${TEAM}] mt:`, e.message); retryLater(next, `internal error: ${e.message}`); })
+    .finally(() => { st.inflight.delete(to); kick(to); });
+}
+
+function expired(m) { return m.expiresAt && Date.now() > Date.parse(m.expiresAt); }
+
+async function attemptMt(m) {
+  if (expired(m)) return expire(m);
+  m.attempts = (m.attempts || 0) + 1;
+  m.nextRetryAt = null;
+  setStatus(m, 'DELIVERING', `attempt ${m.attempts}`);
+  inc('mt_attempts');
+
+  const udm = await resolve('UDM');
+  if (!udm) return retryLater(m, 'no UDM in the NRF');
+  inc('sri_requests');
+  const sri = await call('udm', 'POST', `${udm}/sms-routing/v1/send-routing-info-for-sm`, {
+    msisdn: m.to, scAddress: SC_ADDRESS, smRpPri: false, smRpMti: m.kind === 'STATUS_REPORT' ? 1 : 0,
+  }, { op: 'SRI-for-SM' });
+  const sr = sri.body && sri.body.result;
+  if (sri.status !== 200) {
+    hist(m, 'SRI-for-SM', `${sri.status} ${sr || sri.error || ''}`.trim());
+    // ABSENT_SUBSCRIBER_SM: the UDM has put our address in MWD and will alert us (TS 23.040 3.2.8 case 1).
+    if (sr === 'ABSENT_SUBSCRIBER_SM') { m.mwd = true; inc('mt_absent'); return waitForAlert(m, 'absent subscriber (no SMSF registered), in MWD at the UDM'); }
+    if (sr === 'UNKNOWN_SUBSCRIBER') return fail(m, tpdu.ST.NOT_OBTAINABLE, 'unknown subscriber');
+    if (sr === 'TELESERVICE_NOT_PROVISIONED') return fail(m, tpdu.ST.INCOMPATIBLE_DESTINATION, 'SMS not provisioned for the recipient');
+    if (sr === 'CALL_BARRED') return fail(m, tpdu.ST.SERVICE_REJECTED_STOPPED, 'MT SMS barred for the recipient');
+    if (sri.status === 0 || sri.status >= 500) return retryLater(m, `SRI-for-SM failed (${sri.status || sri.error})`);
+    return fail(m, tpdu.ST.REMOTE_PROCEDURE_ERROR, `SRI-for-SM answered ${sri.status} ${sr || ''}`.trim());
+  }
+
+  const supi = sri.body.supi || null;
+  const smsfId = sri.body.servingNode && sri.body.servingNode.smsfInstanceId;
+  m.servingSmsf = smsfId || null;
+  hist(m, 'SRI-for-SM', `200, ${supi}, serving SMSF ${smsfId || 'none'}`);
+  const smsf = smsfId ? await resolve('SMSF', smsfId) : null;
+  if (!smsf) return retryLater(m, `serving SMSF ${smsfId || '(none)'} not found in the NRF`);
+
+  const more = st.messages.some(x => x !== m && x.to === m.to && x.status === 'PENDING');
+  const hex = tpdu.bytesToHex(buildMtTpdu(m, more));
+  m.tpduHex = hex;
+  const fwd = await call('smsf', 'POST', `${smsf}/smsc/mt-forward-short-message`, {
+    supi, msisdn: m.to, scAddress: SC_ADDRESS, sms: { hex }, smsRecordId: `${m.id}-${m.attempts}`, moreMessagesToSend: more,
+  }, { op: 'MT-Forward-Short-Message' });
+  const fr = fwd.body && fwd.body.result;
+  if (fwd.body && fwd.body.deliveryReport && fwd.body.deliveryReport.hex) m.deliveryReportHex = fwd.body.deliveryReport.hex;
+  hist(m, 'MT-Forward-Short-Message', `${fwd.status} ${fr || fwd.error || ''}`.trim());
+
+  if (fwd.status === 200) return delivered(m);
+  if (fr === 'ABSENT_SUBSCRIBER' || (fwd.status === 404 && fr === 'UNKNOWN_SUBSCRIBER')) {
+    inc('mt_absent');
+    await reportDeliveryStatus(m, 'ABSENT_SUBSCRIBER');
+    return waitForAlert(m, 'absent subscriber at the SMSF, reported to the UDM for MWD');
+  }
+  const rpCause = m.deliveryReportHex ? tpdu.rpErrorCause(m.deliveryReportHex) : null;
+  if (rpCause === 22) { // RP-Cause 22: memory capacity exceeded (TS 24.011 8.2.5.4)
+    await reportDeliveryStatus(m, 'MEMORY_CAPACITY_EXCEEDED');
+    return waitForAlert(m, 'UE memory full, reported to the UDM for MWD');
+  }
+  if (fwd.status === 502 && m.deliveryReportHex) return fail(m, tpdu.ST.ERROR_IN_SME_STOPPED, `UE answered RP-ERROR${rpCause === null ? '' : ` cause ${rpCause}`}`);
+  if (fwd.status === 0 || fwd.status >= 500) return retryLater(m, `MT-Forward failed (${fwd.status || fwd.error} ${fr || ''})`.trim());
+  return fail(m, tpdu.ST.REMOTE_PROCEDURE_ERROR, `MT-Forward answered ${fwd.status} ${fr || ''}`.trim());
+}
+
+// TS 23.040 3.2.6 / 8.1.1: the GMSC reports to the UDM so it can set MWD, or clear it after success.
+async function reportDeliveryStatus(m, deliveryOutcome) {
+  const udm = await resolve('UDM');
+  if (!udm) return;
+  inc('udm_delivery_reports');
+  const r = await call('udm', 'POST', `${udm}/sms-routing/v1/report-sm-delivery-status`,
+    { msisdn: m.to, scAddress: SC_ADDRESS, deliveryOutcome }, { op: 'Report-SM-Delivery-Status' });
+  hist(m, 'Report-SM-Delivery-Status', `${deliveryOutcome}: ${r.status}`);
+  if (r.status === 200 && deliveryOutcome !== 'SUCCESSFUL_TRANSFER') m.mwd = true;
+}
+
+async function delivered(m) {
+  m.deliveredAt = new Date().toISOString();
+  setStatus(m, 'DELIVERED', `delivered to ${m.to}`);
+  inc(m.kind === 'STATUS_REPORT' ? 'status_reports_sent' : 'mt_delivered');
+  if (m.mwd) { m.mwd = false; await reportDeliveryStatus(m, 'SUCCESSFUL_TRANSFER'); }
+  statusReport(m, tpdu.ST.RECEIVED_BY_SME);
+}
+
+// Alert-driven redelivery, with a slow autonomous retry in case the alert never comes (TS 23.040 3.2.7 note 5).
+function waitForAlert(m, detail) {
+  m.nextRetryAt = new Date(Date.now() + RETRY_MAX_MS).toISOString();
+  setStatus(m, 'WAITING', detail);
+}
+
+function retryLater(m, detail) {
+  const ms = Math.min(RETRY_BASE_MS * 2 ** Math.max(0, (m.attempts || 1) - 1), RETRY_MAX_MS);
+  m.nextRetryAt = new Date(Date.now() + ms).toISOString();
+  inc('mt_retries_scheduled');
+  setStatus(m, 'WAITING', `${detail}; retry in ${Math.round(ms / 1000)} s`);
+}
+
+function fail(m, stValue, detail) {
+  m.failure = detail;
+  setStatus(m, 'FAILED', detail);
+  inc(m.kind === 'STATUS_REPORT' ? 'status_reports_failed' : 'mt_failed');
+  statusReport(m, stValue);
+}
+
+function expire(m) {
+  setStatus(m, 'EXPIRED', `validity period ended ${m.expiresAt}`);
+  inc('mt_expired');
+  statusReport(m, tpdu.ST.VALIDITY_PERIOD_EXPIRED);
+}
+
+// TS 23.040 3.2.9: when the SUBMIT had TP-SRR=1 the SC returns an SMS-STATUS-REPORT to the originating MS once the
+// outcome is final. Never for a status report itself, and only when there is an MS to send it to.
+function statusReport(orig, stValue) {
+  if (orig.direction !== 'MO' || orig.kind === 'STATUS_REPORT' || !orig.srr || !orig.from) return null;
+  const now = new Date();
+  const sr = saveMessage({
+    id: `smsc-${++st.msgSeq}`, direction: 'MT', kind: 'STATUS_REPORT', status: 'PENDING',
+    from: SC_ADDRESS, to: orig.from, ra: orig.to, mr: orig.mr, st: stValue, reportFor: orig.id,
+    text: `status report for ${orig.id}: TP-ST 0x${stValue.toString(16).padStart(2, '0')}`,
+    origSctsAt: orig.submittedAt, dischargeAt: now.toISOString(),
+    submittedAt: now.toISOString(), expiresAt: new Date(now.getTime() + DEFAULT_VALIDITY_MS).toISOString(),
+    history: [{ ts: now.toISOString(), event: 'PENDING', detail: `TP-ST 0x${stValue.toString(16).padStart(2, '0')} for ${orig.id}` }],
+  });
+  inc('status_reports_generated');
+  orig.statusReportId = sr.id;
+  saveStore();
+  kick(sr.to);
+  return sr;
+}
+
+// Every accepted MO SMS goes on to its recipient as MT.
+function onMoAccepted(msg) {
+  inc('mt_originated');
+  enqueue(msg, `queued for MT delivery to ${msg.to}`);
+}
+
+// Expire, and move due WAITING messages back to PENDING. Also picks up PENDING ones after a restart.
+function sweep() {
+  const now = Date.now();
+  const touched = new Set();
+  for (const m of st.messages) {
+    if (!ACTIVE.includes(m.status)) continue;
+    if (m.status !== 'DELIVERING' && expired(m)) { expire(m); continue; }
+    if (m.status === 'WAITING' && m.nextRetryAt && Date.parse(m.nextRetryAt) <= now) {
+      m.status = 'PENDING'; hist(m, 'PENDING', 'retry'); touched.add(m.to);
+    }
+    if (m.status === 'PENDING') touched.add(m.to);
+  }
+  saveStore();
+  for (const to of touched) kick(to);
+}
+
+// TS 29.338 / TS 23.040 3.2.7: the UDM tells us the MS is reachable again; deliver what waits for it.
+async function alertServiceCentre(req, res) {
+  const what = 'Alert-Service-Centre';
+  let b;
+  inc('alerts_received');
+  try { b = await readJson(req); } catch {
+    inbound('udm', 'POST /smsc/alert-service-centre', 'invalid JSON');
+    return reply(res, 'udm', what, 400, { result: 'UNEXPECTED_DATA_VALUE', diameterResultCode: 5004, detail: 'body is not JSON' });
+  }
+  inbound('udm', 'POST /smsc/alert-service-centre', b);
+  const msisdn = tpdu.digitsOf(b && b.msisdn);
+  if (!msisdn) return reply(res, 'udm', what, 400, { result: 'MISSING_AVP', diameterResultCode: 5005, detail: 'msisdn is mandatory' });
+  if (b.scAddress && !sameAddr(b.scAddress, SC_ADDRESS)) {
+    return reply(res, 'udm', what, 400, { result: 'UNEXPECTED_DATA_VALUE', diameterResultCode: 5004, detail: `SC address ${b.scAddress} is not ${SC_ADDRESS}` });
+  }
+  const waiting = st.messages.filter(m => m.to === msisdn && m.status === 'WAITING');
+  for (const m of waiting) { m.nextRetryAt = null; m.status = 'PENDING'; hist(m, 'PENDING', `Alert-Service-Centre ${b.alertReason || ''}`.trim()); }
+  saveStore();
+  inc('alerts_redelivering', waiting.length);
+  reply(res, 'udm', what, 200, { result: 'SUCCESS', diameterResultCode: 2001, redelivering: waiting.map(m => m.id) });
+  kick(msisdn);
+  return true;
+}
+
+// POST /api/mt: the SC originates an SM itself (an application, or anyone testing). ?dryRun=1 builds the
+// SMS-DELIVER without storing or sending; ?wait=1 answers when the first attempt has an outcome (max 25 s).
+async function apiMt(req, res, url) {
+  const what = 'MT origination';
+  let b;
+  try { b = await readJson(req); } catch { return reply(res, 'api', what, 400, { result: 'UNEXPECTED_DATA_VALUE', detail: 'body is not JSON' }); }
+  inbound('api', `POST /api/mt${flag(url, 'dryRun') ? ' [dry run]' : ''}`, b);
+  const to = tpdu.digitsOf(b && b.to);
+  const from = tpdu.digitsOf(b && b.from) || SC_ADDRESS;
+  if (!to || to.length > 15) return reply(res, 'api', what, 400, { result: 'MISSING_AVP', detail: 'to (MSISDN, at most 15 digits) is mandatory' });
+  if (typeof b.text !== 'string' || !b.text.length) return reply(res, 'api', what, 400, { result: 'MISSING_AVP', detail: 'text is mandatory' });
+  if (b.text.length > 160) return reply(res, 'api', what, 400, { result: 'UNEXPECTED_DATA_VALUE', detail: 'text is longer than one SM (160 characters); concatenation is not supported' });
+  const now = new Date();
+  const validityMs = Number(b.validitySeconds) > 0 ? Number(b.validitySeconds) * 1000 : DEFAULT_VALIDITY_MS;
+  if (flag(url, 'dryRun')) {
+    inc('test_requests');
+    const t = tpdu.encodeDeliver({ from, text: b.text, sri: false, date: now });
+    return reply(res, 'api', what, 200, {
+      result: 'SUCCESS', dryRun: true, tpduHex: tpdu.bytesToHex(t), decoded: tpdu.decodeDeliver(t),
+      wouldDo: ['NFDiscover UDM', `SRI-for-SM ${to}`, 'NFDiscover SMSF by servingNode.smsfInstanceId', 'MT-Forward-Short-Message'],
+    });
+  }
+  const m = saveMessage({
+    id: `smsc-${++st.msgSeq}`, direction: 'MT', kind: 'SMS', status: 'PENDING', from, to, text: b.text, srr: false,
+    submittedAt: now.toISOString(), expiresAt: new Date(now.getTime() + validityMs).toISOString(),
+    history: [{ ts: now.toISOString(), event: 'ACCEPTED', detail: `originated by the SC API from ${from}` }],
+  });
+  inc('mt_originated');
+  enqueue(m, `queued for MT delivery to ${to}`);
+  if (!flag(url, 'wait')) return reply(res, 'api', what, 202, { result: 'ACCEPTED', messageId: m.id, status: m.status, track: `/t/${TEAM}/api/messages/${m.id}` });
+  const until = Date.now() + 25000;
+  while (['PENDING', 'DELIVERING'].includes(m.status) && Date.now() < until) await sleep(200);
+  return reply(res, 'api', what, 200, { result: m.status, messageId: m.id, message: m });
+}
 
 function metricsSnapshot() {
   const byStatus = {}, byDirection = {};
@@ -418,10 +678,12 @@ function testCatalogue() {
       { method: 'POST', path: `${base}/smsc/mo-forward-short-message`, what: 'MO-Forward-Short-Message (TS 29.338 OFR/OFA). Real: stores the SM and delivers it as MT.', example: mo },
       { method: 'POST', path: `${base}/smsc/mo-forward-short-message?dryRun=1`, what: 'Same, nothing stored or delivered; the answer includes the decoded SMS-SUBMIT.', example: mo },
       { method: 'POST', path: `${base}/smsc/mo-forward-short-message?dryRun=1`, what: 'RP-DATA wrapped SMS-SUBMIT is accepted too.', example: { ...mo, sms: { hex: rpHex } } },
-      { method: 'POST', path: `${base}/smsc/alert-service-centre`, what: 'Alert-Service-Centre from the UDM: redeliver waiting SMs.', example: { msisdn: '46700000002', scAddress: SC_ADDRESS, alertReason: 'UE_PRESENT' } },
-      { method: 'POST', path: `${base}/api/mt`, what: 'Make the SMSC originate an MT SMS (SRI-for-SM to UDM, then MT-Forward to the SMSF).', example: { from: '46700000100', to: '46700000002', text: 'Hello from the SMSC', srr: true } },
+      { method: 'POST', path: `${base}/smsc/alert-service-centre`, what: 'Alert-Service-Centre from the UDM: every WAITING SM for that MSISDN is delivered again. Answers with the ids it redelivers.', example: { msisdn: '46700000002', scAddress: SC_ADDRESS, alertReason: 'UE_PRESENT' } },
+      { method: 'POST', path: `${base}/api/mt?wait=1`, what: 'Make the SMSC originate an MT SMS: SRI-for-SM to the UDM, then MT-Forward to the serving SMSF. ?wait=1 answers with the outcome of the first attempt (DELIVERED, WAITING, FAILED), without it you get 202 and a messageId.', example: { from: '46700000100', to: '46700000002', text: 'Hello from the SMSC', validitySeconds: 3600 } },
+      { method: 'POST', path: `${base}/api/mt?dryRun=1`, what: 'Build the SMS-DELIVER we would send, decoded, without sending anything.', example: { to: '46700000002', text: 'Hello' } },
+      { method: 'GET', path: `${base}/api/messages/smsc-1`, what: 'One message with its full history: SRI answer, MT-Forward answer, MWD reports, status report.' },
       { method: 'POST', path: `${base}/test/encode`, what: 'Build a TPDU: type SUBMIT or DELIVER; rp=true wraps it in RP-DATA.', example: { type: 'SUBMIT', to: '46700000002', text: 'Hello', mr: 1, srr: false, rd: false, rp: false } },
-      { method: 'POST', path: `${base}/test/decode`, what: 'Decode RP-DATA, SMS-SUBMIT or SMS-DELIVER hex.', example: { hex: submitHex } },
+      { method: 'POST', path: `${base}/test/decode`, what: 'Decode RP-DATA, SMS-SUBMIT, SMS-DELIVER or SMS-STATUS-REPORT hex.', example: { hex: submitHex } },
       { method: 'GET', path: `${base}/api/messages`, what: 'Messages the SMSC holds, with history.' },
       { method: 'GET', path: `${base}/api/log?since=0`, what: 'Every request and answer, in and out.' },
       { method: 'GET', path: `${base}/api/metrics`, what: 'Counters, results per operation, per-peer traffic and latency (JSON).' },
@@ -469,20 +731,22 @@ async function handle(req, res, { path: p, url }) {
   if (req.method === 'GET' && p === '/test') return send(res, 200, testCatalogue());
   if (req.method === 'POST' && p === '/test/encode') return testEncode(req, res);
   if (req.method === 'POST' && p === '/test/decode') return testDecode(req, res);
-  if (req.method === 'POST' && p === '/smsc/alert-service-centre') {
-    let b = null;
-    try { b = await readJson(req); } catch { /* logged below */ }
-    inbound('udm', 'POST /smsc/alert-service-centre', b);
-    inc('alerts_received');
-    return notImplemented(res, 'Alert-Service-Centre');
+  if (req.method === 'POST' && p === '/smsc/alert-service-centre') return alertServiceCentre(req, res);
+  if (req.method === 'POST' && p === '/api/mt') return apiMt(req, res, url);
+  if (req.method === 'GET' && p.startsWith('/api/messages/')) {
+    const m = st.messages.find(x => x.id === decodeURIComponent(p.slice('/api/messages/'.length)));
+    return m ? send(res, 200, m) : send(res, 404, { error: 'no such message' });
   }
-  if (req.method === 'POST' && p === '/api/mt') return notImplemented(res, 'MT origination');
   if (req.method === 'GET' && p === '/api/messages') return send(res, 200, st.messages);
   if (req.method === 'GET' && p === '/api/metrics') return send(res, 200, metricsSnapshot());
   if (req.method === 'GET' && p === '/metrics') {
     res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' });
     res.end(metricsText());
     return true;
+  }
+  if (req.method === 'GET' && p === '/log') {
+    const limit = Math.min(Number((url && url.searchParams.get('limit')) || 200) || 200, LOG_MAX);
+    return send(res, 200, st.log.slice(-limit).reverse().map(flowEntry));
   }
   if (req.method === 'GET' && p === '/api/log') {
     const since = Number((url && url.searchParams.get('since')) || 0);
@@ -501,13 +765,16 @@ module.exports = {
   init(ctx) {
     st.dataDir = ctx && ctx.dataDir;
     loadStore();
+    // An attempt cut short by a restart is simply tried again.
+    for (const m of st.messages) if (m.status === 'DELIVERING') { m.status = 'PENDING'; hist(m, 'PENDING', 'restart during an attempt'); }
     // The NRF may load after us or lose its state on a redeploy: heartbeat() re-registers when needed.
     const first = setTimeout(() => { heartbeat().catch(e => console.error(`[${TEAM}] nrf:`, e.message)); }, 3000);
     if (first.unref) first.unref();
     every(HEARTBEAT_S * 1000, heartbeat);
+    every(SWEEP_MS, sweep);
   },
   handle,
   // For tests.
   _st: st,
-  _internals: { nfProfile, resolve, registerInNrf, heartbeat, baseOf, saveStore, metricsSnapshot, metricsText, newMetrics, SC_ADDRESS, NF_ID, NF_TYPE },
+  _internals: { sweep, kick, nfProfile, resolve, registerInNrf, heartbeat, baseOf, saveStore, metricsSnapshot, metricsText, newMetrics, SC_ADDRESS, NF_ID, NF_TYPE },
 };

@@ -58,6 +58,8 @@ No confirmation step. The human can say no afterwards; then resurrect it and log
 # Add dissolution metadata
 # Move to dissolved/
 mv .claude/capabilities/[name].md .claude/dissolved/[name].md
+# Remove its runnable agent
+rm -f .claude/agents/[name].md
 ```
 
 Add to frontmatter:

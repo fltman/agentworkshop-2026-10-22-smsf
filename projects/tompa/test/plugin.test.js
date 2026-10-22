@@ -195,3 +195,21 @@ test('POST bodies are capped at 64 KB (413), malformed JSON is 400 (spore backen
   const r = await fetch(`http://127.0.0.1:${amf.address().port}/t/tompa/ue/${UE1}/sms`, { method: 'POST', body: '{nope' });
   assert.strictEqual(r.status, 400);
 });
+
+test('mt-error: the next MT is answered with RP-ERROR and the injected cause, then RP-ACK again', async () => {
+  await api('POST', `/ue/${UE1}/register`);
+  const set = await api('POST', `/ue/${UE1}/mt-error`, { cause: 22 });
+  assert.deepStrictEqual(set.body.mtError, { cause: 22, left: 1 });
+  const uplinks = () => seen.filter(x => x.url.endsWith(`/ue-contexts/${UE1}/sendsms`));
+  const before = uplinks().length;
+  await n1n2(UE1, mtRpData(9, '46700000002', 'nope').rp, 'mt-err-1');
+  await new Promise(r => setTimeout(r, 150));
+  const err = uplinks().at(-1).body.jsonData.smsPayload.hex;
+  assert.strictEqual(uplinks().length, before + 1);
+  assert.deepStrictEqual(err, sms.rpError(9, 22));
+  assert.ok(!(await api('GET', `/ue/${UE1}/inbox`)).body.some(m => m.text === 'nope'));
+  await n1n2(UE1, mtRpData(10, '46700000002', 'yes').rp, 'mt-err-2');
+  await new Promise(r => setTimeout(r, 150));
+  assert.deepStrictEqual(uplinks().at(-1).body.jsonData.smsPayload.hex, sms.rpAck(10));
+  assert.strictEqual((await api('POST', `/ue/${UE1}/mt-error`, { cause: 500 })).status, 400);
+});

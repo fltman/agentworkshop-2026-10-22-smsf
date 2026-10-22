@@ -68,13 +68,13 @@ const CASES = [
       await c.tompa('POST', `/ue/${UE(1)}/register`); // leave UE1 registered for the other cases
       return r && r.state === 'DEREGISTERED' && s.status === 204 ? ok('SMSF 204', r) : nok(`state ${r && r.state}, SMSF ${s.status} ${causeOf(s)}`, r);
     } },
-  { id: 'mo_ok', group: 'MO', title: 'MO SMS UE1 → UE2', expect: 'accepted, text in UE2 inbox',
+  { id: 'mo_ok', group: 'MO', title: 'MO SMS UE1 → UE2', expect: 'accepted by the SMSC (SMSF 200, RP-ACK)',
+    // Since holminator PR 25 an MO terminates at the SMSC (#build 193): no MT to UE2, the MT cases cover the inbox.
     async run(c) {
-      await ensureReg(c, 1); await ensureReg(c, 2);
-      const text = tag();
-      const r = await c.tompa('POST', `/ue/${UE(1)}/sms`, { to: `msisdn-${MSISDN(2)}`, text });
-      if (r.status !== 200) return nok(`MO ${r.status}, SMSF ${smsfOf(r.body).status} ${causeOf(smsfOf(r.body))}`, r.body);
-      return (await waitInbox(c, 2, text)) ? ok(`delivered: "${text}"`, r.body) : nok('accepted, but not in UE2 inbox within 10 s', r.body);
+      await ensureReg(c, 1);
+      const r = await c.tompa('POST', `/ue/${UE(1)}/sms`, { to: `msisdn-${MSISDN(2)}`, text: tag() });
+      const s = smsfOf(r.body);
+      return r.status === 200 && s.status === 200 ? ok('SMSF 200, accepted by the SMSC', r.body) : nok(`MO ${r.status}, SMSF ${s.status} ${causeOf(s)}`, r.body);
     } },
   { id: 'mo_barred', group: 'MO', title: 'MO SMS from UE5 (MO-barred)', expect: 'refused, SMSF 403 MO_SMS_BARRED',
     async run(c) {

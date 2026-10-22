@@ -34,7 +34,7 @@ const SUBSCRIBERS = [
 
 const ues = new Map();
 function newUe(supi, gpsi) {
-  return { supi, gpsi, state: 'DEREGISTERED', smsActive: false, reachable: true, lastSmsf: null, inbox: [], outbox: [] };
+  return { supi, gpsi, state: 'DEREGISTERED', smsActive: false, reachable: true, mtError: null, lastSmsf: null, inbox: [], outbox: [] };
 }
 for (const [supi, gpsi] of SUBSCRIBERS) ues.set(supi, newUe(supi, gpsi));
 
@@ -324,6 +324,17 @@ async function moSms(req, res, ue) {
   return send(res, ok ? 200 : 502, { smsRecordId, delivered: ok, smsf: { status: r.status, body: r.body } });
 }
 
+async function setMtError(req, res, ue) {
+  let b;
+  try { b = await readJson(req); } catch (e) { return bodyProblem(res, e); }
+  const cause = b.cause === undefined ? 22 : b.cause;
+  const count = b.count === undefined ? 1 : b.count;
+  if (!Number.isInteger(cause) || cause < 1 || cause > 127) return problem(res, 400, 'INVALID_IE', 'cause must be an RP cause 1-127');
+  if (!Number.isInteger(count) || count < 0 || count > 100) return problem(res, 400, 'INVALID_IE', 'count must be 0-100');
+  ue.mtError = count ? { cause, left: count } : null;
+  return send(res, 200, { supi: ue.supi, mtError: ue.mtError });
+}
+
 async function setReachable(req, res, ue) {
   let b;
   try { b = await readJson(req); } catch (e) { return bodyProblem(res, e); }
@@ -361,7 +372,15 @@ async function n1n2(req, res, supi) {
   let parsed = null;
   let parseError = null;
   try { parsed = sms.parseMt(hexPayload); } catch (e) { parseError = e.message; }
-  if (parsed) {
+  // Injected failure (POST /ue/{supi}/mt-error): the UE reads the MT but rejects it with RP-ERROR and this cause.
+  let injected = null;
+  if (parsed && ue.mtError && ue.mtError.left > 0) {
+    injected = ue.mtError.cause;
+    if (--ue.mtError.left === 0) ue.mtError = null;
+    parseError = `injected RP-ERROR cause ${injected}`;
+    parsed = { ...parsed, injected };
+  }
+  if (parsed && !injected) {
     ue.inbox.unshift({ ts: new Date().toISOString(), smsRecordId: b.smsRecordId || null, kind: parsed.kind, from: parsed.from,
       text: parsed.text !== null ? parsed.text : (b.smsPayload.text || null), scAddress: parsed.scAddress, hex: hexPayload });
     ue.inbox.length = Math.min(ue.inbox.length, 20);
@@ -370,10 +389,12 @@ async function n1n2(req, res, supi) {
 
   // TS 23.502 4.13.3.6: the UE answers the MT SMS on the uplink. RP-ACK if we could read it, RP-ERROR otherwise.
   // RP-ERROR cause 111 = protocol error, unspecified (TS 24.011 8.2.5.4).
-  const answer = parsed ? sms.rpAck(parsed.rpMr) : sms.rpError(parseInt(hexPayload.slice(2, 4), 16) || 0, 111);
-  if (parsed) { kpis.mt.delivered++; kpis.report.rpAck++; } else kpis.report.rpError++;
+  const accepted = parsed && !injected;
+  const answer = accepted ? sms.rpAck(parsed.rpMr)
+    : injected ? sms.rpError(parsed.rpMr, injected) : sms.rpError(parseInt(hexPayload.slice(2, 4), 16) || 0, 111);
+  if (accepted) { kpis.mt.delivered++; kpis.report.rpAck++; } else kpis.report.rpError++;
   const t = setTimeout(() => {
-    uplink(ue, b.smsRecordId, answer, parsed ? undefined : `RP-ERROR: ${parseError}`)
+    uplink(ue, b.smsRecordId, answer, accepted ? undefined : `RP-ERROR: ${parseError}`)
       .then(r => {
         judge(r.entry, diagnose.smsfResponse('report', ue.supi, r.status, r.body));
         if (r.status === 200) kpis.report.uplinkOk++; else kpis.report.uplinkFailed++;
@@ -402,6 +423,7 @@ const runner = scenario.createRunner({
   inbox: supi => ueBy(supi).inbox,
   lastLogId: () => seq,
   logSince: id => log.filter(e => e.id > id),
+  originateMt: (to, text) => call('smsc', 'POST', `${HOST}/t/holminator/api/mt`, { to, text }),
 });
 const load = traffic.createGenerator({
   sendSms: (supi, to, text) => invoke(moSms, ueBy(supi), { to, text }),
@@ -442,7 +464,7 @@ module.exports = {
     }
 
     if (req.method === 'GET' && path === '/ue') return send(res, 200, [...ues.values()]);
-    const u = path.match(/^\/ue\/([^/]+)(?:\/(register|deregister|sms|reachable|inbox))?$/);
+    const u = path.match(/^\/ue\/([^/]+)(?:\/(register|deregister|sms|reachable|inbox|mt-error))?$/);
     if (u) {
       const ue = ueOr404(res, decodeURIComponent(u[1]));
       if (!ue) return true;
@@ -455,6 +477,7 @@ module.exports = {
       if (action === 'deregister') return deregister(res, ue);
       if (action === 'sms') return moSms(req, res, ue);
       if (action === 'reachable') return setReachable(req, res, ue);
+      if (action === 'mt-error') return setMtError(req, res, ue);
       return problem(res, 405, 'METHOD_NOT_ALLOWED', 'see CONTRACT.md');
     }
 

@@ -5,6 +5,9 @@
 //   setReachable(supi, bool)         -> {supi, reachable, smsf}
 //   inbox(supi)                      -> [{text, from, ...}] newest first
 //   logSince(id) / lastLogId()       -> AMF log entries newer than id (optional, used to localise MT faults)
+//   originateMt(msisdn, text)        -> optional: start the MT leg at the SMSC. Since holminator PR 25 an MO terminates
+//                                      at the SMSC and is no longer relayed as MT (#build 193), so without it the MT
+//                                      steps only work against an SMSC that still relays.
 
 const diagnose = require('./diagnose');
 
@@ -65,6 +68,11 @@ async function mo(s, from, toN, text) {
   return { ok: false, smsf: { status: r ? r.status : 0, body: b }, local: true };
 }
 
+// The MT leg for UE n: originated at the SMSC when the dep exists, else the MO relay (old SMSC behaviour) carries it.
+async function mtLeg(s, n, text) {
+  if (s.deps.originateMt) await s.deps.originateMt(MSISDN(n).replace('msisdn-', ''), text);
+}
+
 // An N1N2 for this UE since logId that the boundary decoder judged a fault: the MT reached us but was malformed.
 function mtFaultSince(s, logId, supi) {
   if (!s.deps.logSince) return null;
@@ -83,6 +91,7 @@ async function happyPath(s) {
   const m = await mo(s, UE(1), 2, text);
   if (m.local) return fail(`AMF refused locally: ${short(m.smsf)}`, 'AMF (local)', 'tompa', moSent(UE(1), MSISDN(2)));
   if (!m.ok) return fromSmsf('sendsms', UE(1), m.smsf, moSent(UE(1), MSISDN(2))) || fail(short(m.smsf), 'AMF→SMSF', OWNER.smsf, moSent(UE(1), MSISDN(2)));
+  await mtLeg(s, 2, text);
   const hit = await waitInbox(s, UE(2), text);
   if (hit) { s.mtWorks = true; return pass(`MO 200, MT RP-DATA delivered to UE2 from ${hit.from || '?'}`); }
   s.mtWorks = false;
@@ -121,6 +130,7 @@ async function mtBarred(s) {
   const m = await mo(s, UE(1), 4, text);
   if (m.local) return skip(`AMF refused locally: ${short(m.smsf)}`);
   if (!m.ok) return pass(`MO refused with ${short(m.smsf)}`);
+  await mtLeg(s, 4, text);
   const hit = await waitInbox(s, UE(4), text);
   if (hit) {
     return fail(`MO 200 and the MT SMS was delivered to the MT-barred UE4`, 'SMSC→UDM (SRI-for-SM)', OWNER.smsc,
@@ -145,6 +155,7 @@ async function mwdAlert(s) {
       return fromSmsf('sendsms', UE(1), m.smsf, moSent(UE(1), MSISDN(2))) ||
         fail(short(m.smsf), 'AMF→SMSF', OWNER.smsf, moSent(UE(1), MSISDN(2)));
     }
+    await mtLeg(s, 2, text);
     await s.sleep(s.mwdHoldMs);
   } finally {
     await s.deps.setReachable(UE(2), true);

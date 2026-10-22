@@ -63,6 +63,7 @@ Activate body we send: `{"supi","gpsi","amfId","accessType":"3GPP_ACCESS","guami
 | Send MO SMS | `POST /ue/{supi}/sms` body `{"to":"msisdn-46700000002","text":"hello","srr":true}` | UplinkSMS to SMSF, returns the result. `srr` (optional) sets TP-SRR to request a status report; it arrives in the inbox with `kind: "status-report"` |
 | Reachability | `POST /ue/{supi}/reachable` body `{"reachable":false}` | next MT SMS gets 504 `UE_NOT_REACHABLE`. Setting it back to true triggers the stretch-goal alert path. |
 | Inbox | `GET /ue/{supi}/inbox` | MT SMS the UE has received |
+| MT failure | `POST /ue/{supi}/mt-error` body `{"cause":22,"count":1}` (both optional, defaults shown) | the next `count` MT SMS to this UE are answered with RP-ERROR and this RP cause (TS 24.011 8.2.5.4) and not put in the inbox; `count` 0 clears it |
 
 Registrations survive a restart of our plugin (every deploy): the registered set is saved, and after a restart
 each of those UEs is re-registered at the AMF and re-activated at the SMSF (a fresh PUT ue-contexts) once our NRF

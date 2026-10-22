@@ -129,3 +129,18 @@ test('POST /scenario/run?step=N and GET /scenario on the plugin, against an offl
     assert.strictEqual((await api('POST', '/scenario/run?step=9')).status, 400);
   } finally { stub.close(); amf.close(); }
 });
+
+test('MO terminating at the SMSC (holminator #build 193): the MT leg comes from originateMt and all steps pass', async () => {
+  const deps = core({ alert: true, dropMt: true });
+  const send = deps.sendSms;
+  // An SMSC that no longer relays: MO is accepted but never delivered; MT only via originateMt.
+  deps.sendSms = (supi, to, text) => (supi === 'imsi-001010000000005' ? send(supi, to, text) : { status: 200, body: { delivered: true, smsf: { status: 200, body: {} } } });
+  const mts = [];
+  const dropless = core({ alert: true });
+  deps.inbox = dropless.inbox;
+  deps.setReachable = dropless.setReachable;
+  deps.originateMt = async (to, text) => { mts.push(to); return dropless.sendSms('imsi-001010000000001', `msisdn-${to}`, text); };
+  const r = await createRunner(deps, clock()).run();
+  assert.deepStrictEqual(r.steps.map(s => s.verdict), ['pass', 'pass', 'pass', 'pass', 'pass', 'pass']);
+  assert.deepStrictEqual(mts, ['46700000002', '46700000004', '46700000002']);
+});

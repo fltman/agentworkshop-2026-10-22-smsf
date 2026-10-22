@@ -578,7 +578,7 @@ await t('GET /kpi: common shape, requests and errors derived from answers and pe
   for (const f of ['nf', 'up', 'requests', 'errors', 'latencyMs', 'extra']) assert.ok(f in k0, `field ${f}`);
   assert.equal(k0.nf, 'SMSC'); assert.equal(k0.up, true);
   for (const f of ['requests', 'errors', 'latencyMs']) assert.equal(typeof k0[f], 'number', f);
-  assert.deepEqual(Object.keys(k0.extra).sort(), ['alerts_received', 'consistent', 'mo_accepted', 'mt_delivered', 'mt_failed', 'pdus_in', 'pdus_out', 'registeredInNrf', 'status_reports_sent', 'waiting']);
+  assert.deepEqual(Object.keys(k0.extra).sort(), ['alerts_received', 'consistent', 'mo_accepted', 'mo_srr_requested', 'mt_delivered', 'mt_failed', 'mt_status_reports_simulated', 'pdus_in', 'pdus_out', 'registeredInNrf', 'status_reports_sent', 'waiting']);
   const m = (await j('GET', '/api/metrics')).body;
   for (const f of ['mo_accepted', 'mt_delivered', 'mt_failed', 'status_reports_sent', 'alerts_received']) assert.equal(k0.extra[f], m.counters[f] || 0, f);
   assert.equal(k0.extra.registeredInNrf, m.nrf.registered);
@@ -704,7 +704,7 @@ await t('tile: MO flow ends at the SMSC, MT flow runs SMSC->UDM->SMSF->AMF->UE w
   const cur = kpiCards({ counters: { mo_received: 4, mo_forwarded: 7, mt_originated: 1 }, messages: { total: 3 } }, msgs);
   assert.equal(card(cur, 'MO received').v, 4); assert.equal(card(cur, 'MO forwarded').v, 7); assert.ok(!card(cur, 'MO forwarded').est);
   assert.equal(card(cur, 'MT originated').v, 1); assert.equal(card(cur, 'MT originated').grp, 'MT');
-  assert.ok(cur.filter(c => c.grp === 'MT').every(c => !/^MO/.test(c.label)) && cur.filter(c => c.grp === 'MO').length === 2);
+  assert.ok(cur.filter(c => c.grp === 'MT').every(c => !/^MO/.test(c.label)) && cur.filter(c => c.grp === 'MO').length === 3);
   assert.doesNotThrow(() => kpiCards({}, null), 'missing metrics do not throw');
   const subOf = (cards, label, what) => card(cards, label).subs.find(s => s[1] === what)[0];
   const exact = kpiCards({ counters: { mo_received: 1, mo_forwarded: 1, mo_expired: 2, mt_attempts_exhausted: 3, mt_alert_fast_retries: 4 } }, []);
@@ -758,7 +758,7 @@ await t('tile: PDU, RP-Cause, status report, SGd and consistency panels read /ap
   assert.equal(rc.in.map(c => c.cause).join('|'), '111 PROTOCOL_ERROR|22 MEMORY_CAPACITY_EXCEEDED', 'most frequent first, pre-seeded zeros hidden');
   assert.equal(rc.out.length, 0);
   const sp = srPanel(m);
-  assert.equal(sp.fields.map(f => f.k).join(), 'generated,sent,delivered,failed,expired,waiting');
+  assert.equal(sp.fields.map(f => f.k).join(), 'requested,generated,sent,delivered,failed,expired,waiting');
   assert.equal(sp.fields.find(f => f.k === 'waiting').v, '–'); assert.equal(sp.fields.find(f => f.k === 'failed').v, 0);
   assert.equal(sp.byTpSt.map(r => `${r.code} ${r.name} ${r.n}`).join('|'),
     '0x46 SM validity period expired 2|0x00 received by SME 1|0x9a permanent (reserved/SC specific) 1');
@@ -775,8 +775,88 @@ await t('tile: PDU, RP-Cause, status report, SGd and consistency panels read /ap
   assert.equal(countersSince(m), '2026-10-22T08:00:00.000Z');
   assert.equal(countersSince({ metrics: { since: 'T' } }), 'T', 'metrics.since also read');
   const html = fs.readFileSync(path.join(root, 'board/public/colony/holminator/index.html'), 'utf8');
-  for (const id of ['pdus', 'causesin', 'causesout', 'srstats', 'tpst', 'sgdops', 'consistency', 'consfail', 'since'])
+  for (const id of ['pdus', 'causesin', 'causesout', 'srstats', 'tpst', 'srstatsmt', 'tpstmt', 'sgdops', 'consistency', 'consfail', 'since'])
     assert.ok(html.includes(`id="${id}"`), `tile has #${id}`);
+});
+await t('tile: TP-SRR both ways: MO status reports (to the UE) vs MT status reports (simulated to the SME), "–" on an old backend', async () => {
+  const vm = await import('node:vm');
+  const app = fs.readFileSync(path.join(root, 'board/public/colony/holminator/app.js'), 'utf8');
+  const a = app.indexOf('// ---------- flow model (pure'), b = app.indexOf('// ---------- end flow model');
+  const ctx = vm.createContext({});
+  vm.runInContext(`${app.slice(a, b)};this.api={kpiCards,srPanel,flowModel,srrNote};`, ctx);
+  const { kpiCards, srPanel, flowModel, srrNote } = ctx.api;
+  const card = (cards, label) => cards.find(c => c.label === label);
+  const subOf = (c, what) => c.subs.find(s => s[1] === what)[0];
+
+  // KPI cards: the UE-bound status reports are an MO outcome; the MT card counts the simulated SME reports.
+  const cur = kpiCards({ counters: { mo_forwarded: 1, status_reports_sent: 3, status_reports_generated: 4, status_reports_failed: 1,
+    mo_srr_requested: 5, mt_srr_requested: 2, mt_status_reports_simulated: 1, mt_delivered: 6 } }, []);
+  const moSr = card(cur, 'MO status reports'), mtSr = card(cur, 'MT status reports');
+  assert.equal(moSr.grp, 'MO'); assert.equal(moSr.v, 3);
+  assert.equal(subOf(moSr, 'requested'), 5); assert.equal(subOf(moSr, 'generated'), 4); assert.equal(subOf(moSr, 'failed'), 1);
+  assert.equal(mtSr.grp, 'MT'); assert.equal(mtSr.v, 1); assert.equal(subOf(mtSr, 'requested'), 2);
+  assert.match(mtSr.note, /originating SME, simulated/);
+  assert.equal(card(cur, 'MT delivered'), undefined);
+  assert.equal(card(cur, 'MT SMS delivered').v, 6); assert.match(card(cur, 'MT SMS delivered').title, /status reports excluded/);
+  const old = kpiCards({ counters: { mo_forwarded: 1, status_reports_sent: 0 } }, []);
+  assert.equal(card(old, 'MT status reports').v, '–', 'no mt_status_reports_simulated yet');
+  assert.equal(subOf(card(old, 'MT status reports'), 'requested'), '–');
+  assert.equal(subOf(card(old, 'MO status reports'), 'requested'), '–');
+  assert.equal(card(old, 'MO status reports').v, 0, 'a real 0 stays 0');
+
+  // Status report panel split: MO (statusReports) and MT (statusReportsMt), TP-ST names on both.
+  const sp = srPanel({ statusReports: { requested: 5, generated: 4, byTpSt: { '0x00': 4 } },
+    statusReportsMt: { requested: 2, simulated: 1, byTpSt: { '0x00': 0, '0x46': 1 } } });
+  assert.equal(sp.fields.find(f => f.k === 'requested').v, 5);
+  assert.equal(sp.mt.fields.map(f => `${f.k}=${f.v}`).join(), 'requested=2,simulated=1');
+  assert.equal(sp.mt.byTpSt.map(r => `${r.code} ${r.name} ${r.n}`).join('|'), '0x46 SM validity period expired 1', 'pre-seeded zero TP-ST rows hidden');
+  const spOld = srPanel({ statusReports: { generated: 1 } });
+  assert.equal(spOld.mt.known, false); assert.ok(spOld.mt.fields.every(f => f.v === '–')); assert.equal(spOld.mt.byTpSt, null);
+
+  // MT flow: with srr the last step is the simulated status report to the originating SME.
+  const h = (...ev) => ev.map(([event, detail]) => ({ event, detail }));
+  const hist = h(['DELIVERING'], ['SRI-for-SM', '200, x'], ['MT-Forward-Short-Message', '200 SUCCESS'], ['DELIVERED']);
+  const names = f => f.nodes.map(n => n.nm).join('>');
+  const done = flowModel({ direction: 'MT', kind: 'SMS', status: 'DELIVERED', srr: true, statusReport: { tpSt: '0x00', at: 'T' }, history: hist });
+  assert.equal(names(done), 'SMSC>NRF>UDM>SMSF>AMF>UE>orig. SME');
+  const last = done.nodes.at(-1);
+  assert.equal(last.end, true); assert.equal(last.st, 'done'); assert.match(last.edge, /status report \(simulated\)/); assert.match(last.sub, /0x00 received by SME/);
+  assert.equal(flowModel({ direction: 'MT', kind: 'SMS', status: 'PENDING', srr: true, history: [] }).nodes.at(-1).st, 'off');
+  assert.equal(flowModel({ direction: 'MT', kind: 'SMS', status: 'EXPIRED', srr: true, statusReport: { tpSt: '0x46' }, history: [] }).nodes.at(-1).st, 'fail');
+  assert.equal(names(flowModel({ direction: 'MT', kind: 'SMS', status: 'DELIVERED', history: hist })), 'SMSC>NRF>UDM>SMSF>AMF>UE', 'no srr, no extra step');
+  assert.equal(names(flowModel({ direction: 'MT', kind: 'STATUS_REPORT', srr: true, status: 'DELIVERED', history: [] })), 'SMSC>NRF>UDM>SMSF>AMF>UE');
+
+  // Row notes.
+  const msgs = [{ id: 'smsc-2', direction: 'MT', kind: 'STATUS_REPORT', status: 'DELIVERED' }];
+  assert.equal(srrNote({ direction: 'MO', kind: 'SMS', srr: true, statusReportId: 'smsc-2' }, msgs).text, 'SRR · report smsc-2 DELIVERED');
+  assert.equal(srrNote({ direction: 'MO', kind: 'SMS', srr: true, statusReportId: 'smsc-3' }, msgs).text, 'SRR · report smsc-3');
+  assert.equal(srrNote({ direction: 'MT', kind: 'SMS', srr: true, statusReport: { tpSt: '0x00' } }, []).text, 'SRR · report TP-ST 0x00 (simulated)');
+  assert.match(srrNote({ direction: 'MT', kind: 'SMS', srr: true }, []).text, /pending \(simulated\)/);
+  assert.equal(srrNote({ direction: 'MT', kind: 'SMS' }, []), null);
+  assert.equal(srrNote({ direction: 'MT', kind: 'STATUS_REPORT', srr: true }, []), null);
+});
+await t('tile: Reset metrics button posts {clearMessages} and notes the outcome, or that the backend has no reset', async () => {
+  const vm = await import('node:vm');
+  const app = fs.readFileSync(path.join(root, 'board/public/colony/holminator/app.js'), 'utf8');
+  const a = app.indexOf('// ---------- flow model (pure'), b = app.indexOf('// ---------- end flow model');
+  const ctx = vm.createContext({});
+  vm.runInContext(`${app.slice(a, b)};this.api={resetNote};`, ctx);
+  const { resetNote } = ctx.api;
+  const since = '2026-10-22T09:07:00.000Z', d = new Date(since);
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  const ok = resetNote({ status: 200, body: { ok: true, since, clearedMessages: 3 } });
+  assert.equal(ok.ok, true); assert.equal(ok.text, `reset at ${hm} (3 messages cleared)`);
+  assert.equal(resetNote({ status: 200, body: { ok: true, since, clearedMessages: 1 } }).text, `reset at ${hm} (1 message cleared)`);
+  assert.equal(resetNote({ status: 200, body: { ok: true, since, clearedMessages: 0 } }).text, `reset at ${hm} (0 messages cleared)`);
+  for (const res of [{ status: 404, body: { error: 'not found' } }, { status: 405, body: '' }, { status: 200, body: 'html' }, { status: 502, body: { ok: true, since } }, null]) {
+    const n = resetNote(res);
+    assert.equal(n.ok, false); assert.equal(n.text, 'reset not supported by this backend');
+  }
+  const html = fs.readFileSync(path.join(root, 'board/public/colony/holminator/index.html'), 'utf8');
+  assert.match(html, /id="since"[\s\S]{0,200}id="resetbtn"/, 'reset button next to the since label');
+  assert.match(html, /<input type="checkbox" id="resetclear">/, 'clear-messages checkbox, unchecked by default');
+  assert.match(app, /confirm\('Reset all SMSC metrics\?'\)/);
+  assert.match(app, /post\('\/api\/metrics\/reset', \{ clearMessages \}\)/);
 });
 await t('POST /test/decode decodes RP-ACK with SUBMIT-REPORT and honours kind/direction hints', async () => {
   const r = await j('POST', '/test/decode', { hex: '03014109010062012280055500' });
@@ -1162,13 +1242,14 @@ await t('metrics: MO counted as mo_received/mo_accepted/mo_forwarded; mt_origina
         assert.ok(Object.values(m.rpCauses[d]).every(v => v === 0));
       }
       const { byTpSt, ...sr } = m.statusReports;
-      assert.deepEqual(sr, { generated: 0, sent: 0, delivered: 0, failed: 0, expired: 0, waiting: 0 });
+      assert.deepEqual(sr, { requested: 0, generated: 0, sent: 0, delivered: 0, failed: 0, expired: 0, waiting: 0 });
       for (const k of ['0x00', '0x46', '0x60', '0x62', '0x65']) assert.equal(byTpSt[k], 0, k);
       assert.ok(Object.values(byTpSt).every(v => v === 0));
+      assert.deepEqual(m.statusReportsMt, { requested: 0, simulated: 0, byTpSt: { ...byTpSt } }, 'statusReportsMt pre-seeded with the same TP-ST keys');
       assert.deepEqual(m.sgd.operationsOut, zeroed(OUT_OPS));
       assert.deepEqual(m.sgd.operationsIn, { 'MO-Forward-SM': 0, 'Alert-SC': 0 });
       assert.deepEqual(m.sgd.results, m.results);
-      assert.deepEqual(m.consistency.map(c => c.name), ['mo_pdus', 'mt_attempts_forwarded', 'mt_attempts_answered', 'status_reports', 'mo_store']);
+      assert.deepEqual(m.consistency.map(c => c.name), ['mo_pdus', 'mt_attempts_forwarded', 'mt_attempts_answered', 'status_reports', 'mo_status_reports', 'mt_status_reports', 'mo_store']);
       assert.ok(m.consistency.every(c => c.ok && typeof c.detail === 'string'), JSON.stringify(m.consistency));
       const text = f.p._internals.metricsText();
       assert.match(text, /smsc_pdus_total\{dir="in",type="RP-DATA\/SMS-SUBMIT"\} 0/);
@@ -1199,8 +1280,13 @@ await t('metrics: MO counted as mo_received/mo_accepted/mo_forwarded; mt_origina
       assert.deepEqual(Object.entries(m.rpCauses.in).filter(([, v]) => v), [['22 MEMORY_CAPACITY_EXCEEDED', 1]]);
       assert.deepEqual(Object.entries(m.rpCauses.out).filter(([, v]) => v), [['1 UNASSIGNED_UNALLOCATED_NUMBER', 1]]);
       const { byTpSt, ...sr } = m.statusReports;
-      assert.deepEqual(sr, { generated: 1, sent: 1, delivered: 1, failed: 0, expired: 0, waiting: 0 });
+      assert.deepEqual(sr, { requested: 1, generated: 1, sent: 1, delivered: 1, failed: 0, expired: 0, waiting: 0 });
       assert.deepEqual(Object.entries(byTpSt).filter(([, v]) => v), [['0x00', 1]]);
+      // The generator asks for a status report by default: 3 requested, only the DELIVERED one is final (0x00), the
+      // RP-ERROR 22 and no-report MTs are WAITING, so mt_status_reports holds with 2 open.
+      assert.deepEqual(m.statusReportsMt.requested, 3); assert.deepEqual(m.statusReportsMt.simulated, 1);
+      assert.deepEqual(Object.entries(m.statusReportsMt.byTpSt).filter(([, v]) => v), [['0x00', 1]]);
+      assert.match(m.consistency.find(x => x.name === 'mt_status_reports').detail, /^3 == 3: .*\(2\)$/);
       const c = m.counters;
       assert.deepEqual([c.mo_received, c.mo_accepted, c.mo_rejected, c.mo_forwarded], [2, 1, 1, 1]);
       assert.deepEqual([c.mt_originated, c.mt_attempts, c.mt_forward_not_sent, c.mt_delivered, c.status_reports_sent], [4, 4, 0, 1, 1]);
@@ -1254,7 +1340,9 @@ await t('metrics: each consistency check reports ok:false with a useful detail w
       mo_pdus: [mx.pdus.in, 'RP-DATA/SMS-SUBMIT', /^1 != 0: in RP-DATA\/SMS-SUBMIT/],
       mt_attempts_forwarded: [mx.pdus.out, 'RP-DATA/SMS-DELIVER', /^0 != 1: mt_attempts == out RP-DATA/],
       mt_attempts_answered: [mx.pdus.in, 'none/no-report', /^0 != 1: mt_attempts == in RP-ACK/],
-      status_reports: [mx.counters, 'status_reports_generated', /^1 != 0: generated == delivered/],
+      status_reports: [mx.counters, 'status_reports_sent', /^0 != 1: generated == delivered/],
+      mo_status_reports: [mx.counters, 'mo_srr_requested', /^1 != 0: mo_srr_requested == status_reports_generated/],
+      mt_status_reports: [mx.counters, 'mt_srr_requested', /^1 != 0: mt_srr_requested == mt_status_reports_simulated/],
       mo_store: [mx.counters, 'mo_received', /^1 != 0: mo_received == MO records/],
     };
     assert.ok(Object.values(checks()).every(c => c.ok), 'all ok before skewing');
@@ -1274,6 +1362,205 @@ await t('metrics: each consistency check reports ok:false with a useful detail w
     fs.rmSync(dirC, { recursive: true, force: true });
   }
 });
+
+// ---------- status-report requests both ways, metrics reset, TP-RD duplicate window ----------
+{
+  const modPath = path.join(root, 'board/plugins/holminator/index.js');
+  const fresh = async dir => {
+    const cached = require.cache[require.resolve(modPath)];
+    delete require.cache[require.resolve(modPath)];
+    const p = require(modPath);
+    require.cache[require.resolve(modPath)] = cached;
+    p.init({ dataDir: dir });
+    const s = http.createServer(async (req, res) => {
+      const url = new URL(req.url, 'http://x');
+      const handled = await p.handle(req, res, { path: url.pathname.replace(/^\/t\/holminator/, '') || '/', url });
+      if (!handled && !res.headersSent) { res.writeHead(404); res.end(); }
+    });
+    await new Promise(r => s.listen(0, r));
+    const b = `http://127.0.0.1:${s.address().port}/t/holminator`;
+    const jj = async (method, p2, body) => {
+      const r = await fetch(b + p2, { method, headers: { 'content-type': 'application/json' }, body: body && JSON.stringify(body) });
+      return { status: r.status, body: await r.json().catch(() => r.status) };
+    };
+    const close = () => { for (const tm of p._st.timers) clearInterval(tm); s.close(); };
+    return { p, j: jj, close };
+  };
+  const ck = m => Object.fromEntries(m.consistency.map(c => [c.name, c]));
+
+  await t('MT srr: TP-SRI set in the SMS-DELIVER, one simulated status report per final outcome (DELIVERED, FAILED, EXPIRED), counted in statusReportsMt', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'holminator-mtsrr-'));
+    const f = await fresh(dir);
+    try {
+      udmRules['46700000361'] = [404, { result: 'UNKNOWN_SUBSCRIBER' }];
+      const ok = (await f.j('POST', '/api/mt?wait=1', { to: '46700000360', text: 'srr ok', srr: true })).body;
+      const bad = (await f.j('POST', '/api/mt?wait=1', { to: '46700000361', text: 'srr fail', srr: true })).body;
+      const plain = (await f.j('POST', '/api/mt?wait=1', { to: '46700000362', text: 'no srr', srr: false })).body;
+      const dry = (await f.j('POST', '/api/mt?dryRun=1', { to: '46700000362', text: 'dry', srr: true })).body;
+      assert.equal(dry.decoded.sri, true, 'dry run shows TP-SRI');
+      assert.deepEqual([ok.result, bad.result, plain.result], ['DELIVERED', 'FAILED', 'DELIVERED']);
+      const get = id => f.p._st.messages.find(x => x.id === id);
+      assert.equal(tpdu.decodeDeliver(tpdu.hexToBytes(callsFor('46700000360', 'mt-forward').at(-1).body.sms.hex)).sri, true, 'TP-SRI=1 sent');
+      assert.equal(tpdu.decodeDeliver(tpdu.hexToBytes(callsFor('46700000362', 'mt-forward').at(-1).body.sms.hex)).sri, false);
+      assert.equal(get(ok.messageId).statusReport.tpSt, '0x00'); assert.ok(!Number.isNaN(Date.parse(get(ok.messageId).statusReport.at)));
+      assert.equal(get(ok.messageId).history.at(-1).detail, 'status report to originating SME (simulated), TP-ST 0x00');
+      assert.equal(get(bad.messageId).statusReport.tpSt, '0x43', 'unknown subscriber: not obtainable');
+      assert.equal(get(plain.messageId).statusReport, undefined, 'no srr, no report');
+      // EXPIRED: an srr MT whose validity is over ends with TP-ST 0x46 on the next attempt.
+      udmRules['46700000363'] = [404, { result: 'ABSENT_SUBSCRIBER_SM', diameterResultCode: 5550 }];
+      const exp = (await f.j('POST', '/api/mt?wait=1', { to: '46700000363', text: 'srr expire', srr: true, validitySeconds: 1 })).body;
+      assert.equal(exp.result, 'WAITING');
+      let m = (await f.j('GET', '/api/metrics')).body;
+      assert.equal(ck(m).mt_status_reports.ok, true, 'a WAITING srr MT is still open'); assert.match(ck(m).mt_status_reports.detail, /not final yet .* \(1\)$/);
+      get(exp.messageId).expiresAt = new Date(Date.now() - 1000).toISOString();
+      f.p._internals.sweep();
+      assert.equal(get(exp.messageId).status, 'EXPIRED'); assert.equal(get(exp.messageId).statusReport.tpSt, '0x46');
+      f.p._internals.sweep();
+      m = (await f.j('GET', '/api/metrics')).body;
+      assert.deepEqual([m.counters.mt_srr_requested, m.counters.mt_status_reports_simulated], [3, 3]);
+      assert.deepEqual(Object.entries(m.statusReportsMt.byTpSt).filter(([, v]) => v), [['0x00', 1], ['0x43', 1], ['0x46', 1]]);
+      assert.deepEqual([m.statusReportsMt.requested, m.statusReportsMt.simulated], [3, 3]);
+      assert.equal(m.statusReports.generated, 0, 'simulated MT reports are not SMS-STATUS-REPORT records');
+      assert.equal(f.p._st.messages.filter(x => x.kind === 'STATUS_REPORT').length, 0);
+      assert.ok(m.consistency.every(c => c.ok), JSON.stringify(m.consistency, null, 1));
+      const k = (await f.j('GET', '/kpi')).body.extra;
+      assert.deepEqual([k.mo_srr_requested, k.mt_status_reports_simulated], [0, 3]);
+      const text = f.p._internals.metricsText();
+      assert.match(text, /smsc_mt_status_reports_simulated_total 3/);
+      assert.match(text, /smsc_mo_srr_requested_total 0/);
+      assert.match(text, /smsc_status_reports_mt_by_tp_st_total\{tp_st="0x46"\} 1/);
+      // A simulated report that went missing breaks mt_status_reports.
+      f.p._st.metrics.counters.mt_status_reports_simulated--;
+      m = (await f.j('GET', '/api/metrics')).body;
+      assert.equal(ck(m).mt_status_reports.ok, false); assert.match(ck(m).mt_status_reports.detail, /^3 != 2: mt_srr_requested/);
+    } finally {
+      f.close(); fs.rmSync(dir, { recursive: true, force: true });
+      for (const n of ['46700000361', '46700000363']) delete udmRules[n];
+    }
+  });
+
+  await t('MT srr default: /api/mt without srr sets TP-SRI and gets a simulated report; srr:false sets no TP-SRI and gets none', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'holminator-mtsrrdef-'));
+    const f = await fresh(dir);
+    try {
+      const sri = n => tpdu.decodeDeliver(tpdu.hexToBytes(callsFor(n, 'mt-forward').at(-1).body.sms.hex)).sri;
+      const get = id => f.p._st.messages.find(x => x.id === id);
+      const def = (await f.j('POST', '/api/mt?wait=1', { to: '46700000368', text: 'default srr' })).body;
+      assert.equal(def.result, 'DELIVERED');
+      assert.equal(sri('46700000368'), true, 'TP-SRI=1 by default');
+      assert.equal(get(def.messageId).srr, true);
+      assert.equal(get(def.messageId).statusReport.tpSt, '0x00');
+      assert.equal((await f.j('POST', '/api/mt?dryRun=1', { to: '46700000368', text: 'dry' })).body.decoded.sri, true, 'dry run defaults to TP-SRI too');
+      let m = (await f.j('GET', '/api/metrics')).body;
+      assert.deepEqual([m.counters.mt_srr_requested, m.counters.mt_status_reports_simulated], [1, 1]);
+      const off = (await f.j('POST', '/api/mt?wait=1', { to: '46700000369', text: 'no srr', srr: false })).body;
+      assert.equal(off.result, 'DELIVERED');
+      assert.equal(sri('46700000369'), false, 'srr:false gives TP-SRI=0');
+      assert.equal(get(off.messageId).srr, false);
+      assert.equal(get(off.messageId).statusReport, undefined, 'no simulated report');
+      assert.ok(!get(off.messageId).history.some(h => h.event === 'STATUS_REPORT'));
+      assert.equal((await f.j('POST', '/api/mt?dryRun=1', { to: '46700000369', text: 'dry', srr: false })).body.decoded.sri, false);
+      m = (await f.j('GET', '/api/metrics')).body;
+      assert.deepEqual([m.counters.mt_srr_requested, m.counters.mt_status_reports_simulated], [1, 1], 'srr:false is not counted');
+      assert.equal(f.p._st.messages.filter(x => x.kind === 'STATUS_REPORT').length, 0, 'MT reports are simulated, never sent');
+      assert.ok(m.consistency.every(c => c.ok), JSON.stringify(m.consistency, null, 1));
+    } finally { f.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  await t('MO srr: mo_srr_requested counts every accepted MO with TP-SRR, also one without an originator (no report); mo_status_reports holds and can fail', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'holminator-mosrr-'));
+    const f = await fresh(dir);
+    try {
+      await f.j('POST', '/smsc/mo-forward-short-message', moBody({ msisdn: '46700000364', sms: { hex: subHex({ mr: 220, to: '46700000365', srr: true }) } }));
+      const { msisdn, ...noMsisdn } = moBody({ sms: { hex: subHex({ mr: 221, to: '46700000365', srr: true }) } });
+      assert.equal((await f.j('POST', '/smsc/mo-forward-short-message', noMsisdn)).status, 200);
+      await f.j('POST', '/smsc/mo-forward-short-message', moBody({ msisdn: '46700000366', sms: { hex: subHex({ mr: 222, to: '46700000365' }) } }));
+      await f.j('POST', '/smsc/mo-forward-short-message?dryRun=1', moBody({ msisdn: '46700000367', sms: { hex: subHex({ mr: 223, srr: true }) } }));
+      await waitFor(() => f.p._st.messages.filter(x => x.kind === 'STATUS_REPORT').every(x => x.status === 'DELIVERED'));
+      const srs = f.p._st.messages.filter(x => x.kind === 'STATUS_REPORT');
+      assert.ok(srs.length === 1 && srs.every(x => !x.srr && !x.statusReport), 'a status report never requests a status report');
+      assert.equal(tpdu.decodeAny(callsFor('46700000364', 'mt-forward').at(-1).body.sms.hex).tpdu.type, 'SMS-STATUS-REPORT');
+      let m = (await f.j('GET', '/api/metrics')).body;
+      assert.deepEqual([m.counters.mo_srr_requested, m.statusReports.requested, m.counters.status_reports_generated], [2, 2, 1]);
+      assert.equal(ck(m).mo_status_reports.ok, true, ck(m).mo_status_reports.detail);
+      assert.match(ck(m).mo_status_reports.detail, /^2 == 2: .*\(1\)$/, 'the MO without originator is the one without a report');
+      assert.ok(m.consistency.every(c => c.ok), JSON.stringify(m.consistency, null, 1));
+      // A status report generated twice for one MO breaks the check.
+      f.p._st.metrics.counters.status_reports_generated++;
+      m = (await f.j('GET', '/api/metrics')).body;
+      assert.equal(ck(m).mo_status_reports.ok, false); assert.match(ck(m).mo_status_reports.detail, /^2 != 3: mo_srr_requested/);
+    } finally { f.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  await t('POST /api/metrics/reset: every key back to 0, since=now, logged, persisted; clearMessages drops the store and cancels redelivery timers', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'holminator-reset-'));
+    const f = await fresh(dir);
+    try {
+      const zero = (await f.j('GET', '/api/metrics')).body;
+      await f.j('POST', '/smsc/mo-forward-short-message', moBody({ msisdn: '46700000370', sms: { hex: subHex({ mr: 230, to: '46700000371', srr: true }) } }));
+      await f.j('POST', '/api/mt?wait=1', { to: '46700000372', text: 'before reset', srr: true });
+      await waitFor(() => f.p._st.messages.filter(x => x.direction === 'MT').every(x => x.status === 'DELIVERED'));
+      const before = (await f.j('GET', '/api/metrics')).body;
+      assert.ok(before.counters.mo_received > 0 && before.pdus.in['RP-DATA/SMS-SUBMIT'] > 0);
+      await new Promise(r => setTimeout(r, 5));
+      const r = await f.j('POST', '/api/metrics/reset');
+      assert.equal(r.status, 200); assert.equal(r.body.ok, true); assert.equal(r.body.clearedMessages, 0);
+      assert.ok(Date.parse(r.body.since) > Date.parse(before.since), 'since moves to now');
+      const m = (await f.j('GET', '/api/metrics')).body;
+      assert.equal(m.since, r.body.since); assert.equal(m.startedAt, before.startedAt, 'startedAt is the process, kept');
+      for (const k of ['counters', 'pdus', 'rpCauses', 'statusReportsMt']) assert.deepEqual(m[k], zero[k], k);
+      assert.deepEqual(m.statusReports.byTpSt, zero.statusReports.byTpSt);
+      assert.deepEqual([m.sgd.operationsOut, m.sgd.operationsIn, m.results], [zero.sgd.operationsOut, zero.sgd.operationsIn, {}]);
+      assert.equal(m.messages.total, 3, 'messages stay without clearMessages (MO, its status report, MT)');
+      assert.ok(m.consistency.every(c => c.ok), 'messages from before since are not counted');
+      const saved = JSON.parse(fs.readFileSync(path.join(dir, 'store.json'), 'utf8'));
+      assert.equal(saved.metrics.since, r.body.since); assert.equal(saved.metrics.counters.mo_received, 0);
+      const log = (await f.j('GET', '/api/log')).body;
+      assert.ok(log.some(e => e.what === 'POST /api/metrics/reset' && e.dir === 'in'), 'reset is in /api/log');
+      // clearMessages: a WAITING MT with a scheduled alert redelivery is dropped and its timer cancelled.
+      udmRules['46700000373'] = [404, { result: 'ABSENT_SUBSCRIBER_SM', diameterResultCode: 5550 }];
+      assert.equal((await f.j('POST', '/api/mt?wait=1', { to: '46700000373', text: 'waits' })).body.result, 'WAITING');
+      delete udmRules['46700000373'];
+      await f.j('POST', '/smsc/alert-service-centre', { msisdn: '46700000373', alertReason: 'UE_PRESENT' });
+      assert.equal(f.p._st.timers.filter(x => x.redeliver).length, 1, 'alert scheduled a redelivery');
+      const intervals = f.p._st.timers.filter(x => !x.redeliver).length;
+      const c = await f.j('POST', '/api/metrics/reset', { clearMessages: true });
+      assert.deepEqual([c.body.ok, c.body.clearedMessages], [true, 4]);
+      assert.deepEqual((await f.j('GET', '/api/messages')).body, []);
+      assert.equal(f.p._st.timers.filter(x => x.redeliver).length, 0, 'redelivery timer cancelled');
+      assert.equal(f.p._st.timers.length, intervals, 'heartbeat and sweep keep running');
+      assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'store.json'), 'utf8')).messages.length, 0);
+      const after = (await f.j('GET', '/api/metrics')).body;
+      assert.equal(after.counters.mt_originated, 0); assert.ok(after.consistency.every(x => x.ok));
+      assert.ok((await f.j('GET', '/test')).body.endpoints.some(e => e.method === 'POST' && e.path.endsWith('/api/metrics/reset')), 'listed in GET /test');
+    } finally { f.close(); fs.rmSync(dir, { recursive: true, force: true }); delete udmRules['46700000373']; }
+  });
+
+  await t('TP-RD: same TP-MR is a duplicate only within DUP_WINDOW_MS of a FORWARDED MO; after it, accepted even with TP-RD=1', async () => {
+    const body = rd => moBody({ msisdn: '46700000380', sms: { hex: subHex({ mr: 240, to: '46700000381', rd }) } });
+    const first = await j('POST', '/smsc/mo-forward-short-message', body(false));
+    assert.equal(first.status, 200);
+    const d0 = (await j('GET', '/api/metrics')).body.counters.mo_duplicates_accepted;
+    const within = await j('POST', '/smsc/mo-forward-short-message', body(true));
+    assert.equal(within.status, 403, 'TP-RD=1 within the window: rejected as duplicate');
+    assert.equal(report(within.body.deliveryReport.hex)[1], tpdu.FCS.SM_REJECTED_DUPLICATE_SM);
+    const within0 = await j('POST', '/smsc/mo-forward-short-message', body(false));
+    assert.equal(within0.status, 200);
+    assert.equal((await msg(within0.body.messageId)).duplicateOf, first.body.messageId, 'TP-RD=0 within the window: accepted, marked duplicate');
+    assert.equal((await j('GET', '/api/metrics')).body.counters.mo_duplicates_accepted, d0 + 1);
+    // Age both earlier MOs past the window (still well inside their 24 h validity).
+    const old = new Date(Date.now() - plugin._internals.MO_LIMITS.DUP_WINDOW_MS - 1000).toISOString();
+    for (const id of [first.body.messageId, within0.body.messageId]) plugin._st.messages.find(x => x.id === id).forwardedAt = old;
+    const after1 = await j('POST', '/smsc/mo-forward-short-message', body(true));
+    assert.equal(after1.status, 200, 'TP-RD=1 after the window: not a duplicate, not rejected');
+    assert.equal((await msg(after1.body.messageId)).duplicateOf, null);
+    plugin._st.messages.find(x => x.id === after1.body.messageId).forwardedAt = old;
+    const after0 = await j('POST', '/smsc/mo-forward-short-message', body(false));
+    assert.equal((await msg(after0.body.messageId)).duplicateOf, null, 'TP-RD=0 after the window: not counted as duplicate');
+    assert.equal((await j('GET', '/api/metrics')).body.counters.mo_duplicates_accepted, d0 + 1);
+    assert.equal(plugin._internals.MO_LIMITS.DUP_WINDOW_MS, 60000);
+  });
+}
 
 srv.close(); fake.close();
 for (const tm of plugin._st.timers) clearInterval(tm);

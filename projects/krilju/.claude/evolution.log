@@ -6,3 +6,6 @@
 2026-10-22 10:38 MUTATE: energy sms-rp-codec 60, smsf-interop-test 70 (RP fix and sequence diagrams used them; no overlap, no split needed)
 2026-10-22 10:39 SPAWN: sms-traffic-runner (scripted e2e traffic over the UDM test subscribers; brainstorm topic and testing request)
 2026-10-22 11:05 MUTATE: sms-traffic-runner (live e2e run produced a working procedure, recorded in the capability; energy 70), smsf-service energy 85 (flow tagging added)
+2026-10-22 11:50 MUTATE: smsf-interop-test (shape-pinning, multi-instance and error-table rules after rpCause, failover and RP-Cause 11.3 faults); energy smsf-service 90, sms-rp-codec 70 (failover and cause mapping work); no split/merge/dissolve needed
+2026-10-22 12:02 EVOLVE: no change (10-min round; live RP-ERROR and RP-Cause checks passed with existing capabilities, no gap or overlap, energies stay 90/70/70/70)
+2026-10-22 12:12 MUTATE: sms-traffic-runner (traffic driver asks for status reports on every MO; status reports are a new MT source through the SMSF)

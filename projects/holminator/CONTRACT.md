@@ -76,12 +76,18 @@ for RP-ERROR that the SMSF should put in the RP-ERROR to the UE (TS 23.040 3.4.2
 | --- | --- | --- |
 | `UNKNOWN_SERVICE_CENTRE` (3) | none | `scAddress` or RP-DA is not 46700000100 |
 | `INVALID_SME_ADDRESS` (5) | C3 | TP-DA empty or longer than 15 digits |
-| `EQUIPMENT_PROTOCOL_ERROR` (1) | C5 | TP-RD=1 and an SM with the same TP-MR, TP-DA and originator is still held (TS 23.040 9.2.3.25; a `FORWARDED` MO counts as held until its validity period ends). TP-RD=0 duplicates are accepted. |
+| `EQUIPMENT_PROTOCOL_ERROR` (1) | C5 | TP-RD=1 and an SM with the same TP-MR, TP-DA and originator is still held (TS 23.040 9.2.3.25; an MO counts as held while `ACCEPTED`/`PENDING`/`DELIVERING`/`WAITING`, or for 60 s (`DUP_WINDOW_MS`, env `HOLMINATOR_DUP_WINDOW_MS`; covers RP TR1M retransmissions) after it went `FORWARDED`, because UEs wrap TP-MR at 256). TP-RD=0 duplicates inside that window are accepted with `duplicateOf` set and counted in `mo_duplicates_accepted`; after the window the same TP-MR is a new SM. |
 
 ## 2. MT SMS - SMSC origination
 
 An MT record (`direction: "MT"`) comes from exactly two sources: `POST /api/mt` (the generator, `kind: "SMS"`) and a
 status report for an MO with TP-SRR (`kind: "STATUS_REPORT"`, `reportFor` = the MO id). An MO is never relayed as MT.
+
+`POST /api/mt` asks for a status report by default: `srr` defaults to `true` and sets TP-SRI in the SMS-DELIVER;
+send `srr: false` for TP-SRI=0 and no report. A status report MT never requests a status report. The originator of a generator MT is an external SME we
+simulate, so its status report is recorded, not sent: on the final outcome (DELIVERED, FAILED, EXPIRED) the MT record
+gets `statusReport: { tpSt: "0x00", at }` (TP-ST as a hex string) and the history line
+`status report to originating SME (simulated), TP-ST 0x..`, counted in `statusReportsMt`.
 
 1. `POST {udm}/sms-routing/v1/send-routing-info-for-sm` with `{ msisdn, scAddress, smRpPri: false, smRpMti }`
    (`smRpMti` 1 for a status report, else 0). 200 gives `servingNode.smsfInstanceId`.
@@ -145,14 +151,15 @@ before reporting `ABSENT_SUBSCRIBER` and waiting for the next alert. `400 MISSIN
 
 | Method and path | What |
 | --- | --- |
-| `POST /api/mt` `{ "from": "46700000009", "to": "46700000002", "text": "Hi" }` | Originate an MT SMS (`from` defaults to the SC address, text at most 160 characters; optional `validitySeconds`, and `singleShot: true` for one attempt only). `202` `{ messageId, track }`; `?wait=1` answers `200` with the final status and history; `?dryRun=1` shows the TPDU without sending |
+| `POST /api/mt` `{ "from": "46700000009", "to": "46700000002", "text": "Hi", "srr": true }` | Originate an MT SMS (`from` defaults to the SC address, text at most 160 characters; optional `validitySeconds`, `singleShot: true` for one attempt only, and `srr` (default `true`: TP-SRI and a simulated status report to the SME; `false` for neither)). `202` `{ messageId, track }`; `?wait=1` answers `200` with the final status and history; `?dryRun=1` shows the TPDU without sending |
 | `GET /api/messages` | The message store, oldest first (no parameters: everything we hold, at most 500). `?limit=<n>` keeps the newest n. `?since=smsc-<n>` (or just `<n>`) keeps messages created after that id; `?since=<ISO time>` keeps messages whose `updatedAt` (the `ts` of their last history entry) is later. Both combine: filter first, then limit. A bad value is `400 { error }` |
 | `GET /api/messages/<id>` | One message with its history |
 | `GET /log?limit=<n>` | Shared call-flow log, newest first: `{ id, ts, dir, peer, method, path, status, body, ms? }`. Answers we give have `method: null` and the operation name as `path` |
 | `GET /api/log?since=<n>` | Incoming and outgoing messages: `{ id, ts, dir, peer, what, status, body, ms? }` |
 | `GET /api/metrics` | Counters, PDUs, RP-Causes, status reports, SGd operations and self-checks; schema below. Persisted in `store.json` with the messages, so they survive a deploy; `since` is when they started counting, `startedAt` is this process |
-| `GET /metrics` | The same in Prometheus text format (`smsc_*`): `smsc_<counter>_total`, `smsc_pdus_total{dir,type}`, `smsc_rp_causes_total{dir,cause}`, `smsc_status_reports_total{outcome}`, `smsc_status_reports_waiting`, `smsc_status_reports_by_tp_st_total{tp_st}`, `smsc_sgd_operations_total{dir,operation}`, `smsc_consistency_ok{check}` |
-| `GET /kpi` | Common KPI summary (tompa, #build 142): `{ nf: "SMSC", up: true, requests, errors, latencyMs, extra: { mo_accepted, mt_delivered, mt_failed, waiting, status_reports_sent, alerts_received, registeredInNrf, pdus_in, pdus_out, consistent } }`. `requests`: inbound peer requests we answered; `errors`: our answers with status >= 400 plus outbound peer errors (no answer or 5xx); `latencyMs`: average outbound peer latency (0 before the first call); `waiting`: messages in WAITING now; `pdus_in`/`pdus_out`: totals of `pdus.in`/`pdus.out`; `consistent`: every consistency check is ok. Counters persist across restarts |
+| `POST /api/metrics/reset` `{ "clearMessages": false }` | Every metric back to its pre-seeded 0 (counters, results, peers, pdus, rpCauses, both byTpSt, SGd operations), `since` = now, saved to `store.json` and logged in `/api/log`. `startedAt` and NRF health stay. `clearMessages: true` also drops every stored message and cancels pending redelivery timers (a clean slate; otherwise records from before `since` are left out of the consistency checks). Body optional. Answers `{ ok: true, since, clearedMessages }` |
+| `GET /metrics` | The same in Prometheus text format (`smsc_*`): `smsc_<counter>_total`, `smsc_pdus_total{dir,type}`, `smsc_rp_causes_total{dir,cause}`, `smsc_status_reports_total{outcome}`, `smsc_status_reports_waiting`, `smsc_status_reports_by_tp_st_total{tp_st}`, `smsc_status_reports_mt_requested_total`, `smsc_status_reports_mt_simulated_total`, `smsc_status_reports_mt_by_tp_st_total{tp_st}`, `smsc_sgd_operations_total{dir,operation}`, `smsc_consistency_ok{check}` |
+| `GET /kpi` | Common KPI summary (tompa, #build 142): `{ nf: "SMSC", up: true, requests, errors, latencyMs, extra: { mo_accepted, mt_delivered, mt_failed, waiting, status_reports_sent, alerts_received, registeredInNrf, pdus_in, pdus_out, consistent, mo_srr_requested, mt_status_reports_simulated } }`. `requests`: inbound peer requests we answered; `errors`: our answers with status >= 400 plus outbound peer errors (no answer or 5xx); `latencyMs`: average outbound peer latency (0 before the first call); `waiting`: messages in WAITING now; `pdus_in`/`pdus_out`: totals of `pdus.in`/`pdus.out`; `consistent`: every consistency check is ok. Counters persist across restarts |
 | `GET /status` | `{ nfInstanceId, registeredInNrf, messages }` |
 
 ### `GET /api/metrics` schema
@@ -170,7 +177,8 @@ Every key below exists from the start with value 0 (no key appears only after it
            "RP-ERROR/SMS-DELIVER-REPORT", "none/no-report" },
     out: { "RP-ACK/SMS-SUBMIT-REPORT", "RP-ERROR/SMS-SUBMIT-REPORT", "RP-DATA/SMS-DELIVER", "RP-DATA/SMS-STATUS-REPORT" } },
   rpCauses: { in: { "22 MEMORY_CAPACITY_EXCEEDED": n, ... }, out: { ... } },   // every TS 24.011 8.2.5.4 cause
-  statusReports: { generated, sent, delivered, failed, expired, waiting, byTpSt: { "0x00": n, ... } },
+  statusReports: { requested, generated, sent, delivered, failed, expired, waiting, byTpSt: { "0x00": n, ... } },
+  statusReportsMt: { requested, simulated, byTpSt: { "0x00": n, ... } },   // same pre-seeded TP-ST keys
   sgd: { results,                      // same object as top-level results
          operationsOut: { "SRI-for-SM", "MT-Forward-SM", "Report-SM-Delivery-Status", "NFDiscover", "NFRegister", "NFUpdate" },
          operationsIn:  { "MO-Forward-SM", "Alert-SC" } },
@@ -186,13 +194,16 @@ Every key below exists from the start with value 0 (no key appears only after it
   rejection, per TS 23.040 11.3: 5555 `UNKNOWN_SERVICE_CENTRE` gives 1, `SC_CONGESTION` 42, `INVALID_SME_ADDRESS` 21,
   `USER_NOT_SC_USER` 28, `EQUIPMENT_PROTOCOL_ERROR` 21 (no row in 11.3); 5552 facility not supported gives 69; 5004 and
   5005 (unexpected data value) and 5012 (system failure) give 38.
-- `statusReports`:
+- `statusReports` (MO side, real SMS-STATUS-REPORT MTs to the UE):
+  - `requested`: accepted MOs with TP-SRR=1 (`mo_srr_requested`), also those that get no report (no originating MSISDN).
   - `generated`: records made for TP-SRR.
   - `sent`: MT-Forward attempts that carry one.
   - `delivered`: acknowledged by the UE, the same as the counter `status_reports_sent`.
   - `failed`, `expired`.
   - `waiting`: currently PENDING, DELIVERING or WAITING.
   - `byTpSt`: generated per TP-ST.
+- `statusReportsMt` (generator MTs with `srr`, the default, simulated towards the originating SME): `requested`
+  (`mt_srr_requested`), `simulated` (`mt_status_reports_simulated`), `byTpSt` per simulated TP-ST.
 - Counters:
   - General: `requests_in`, `answers_error`, `test_requests`, `store_evicted`.
   - MO: `mo_received`, `mo_accepted`, `mo_rejected`, `mo_dry_runs`, `mo_duplicates_accepted`, `mo_forwarded`, `mo_expired`.
@@ -200,7 +211,8 @@ Every key below exists from the start with value 0 (no key appears only after it
     SRI failure, SMSF not found), `mt_delivered`, `mt_failed`, `mt_expired`, `mt_absent`, `mt_retries_scheduled`,
     `mt_rp_error_temporary`, `mt_attempts_exhausted`, `mt_alert_fast_retries`.
   - UDM and alerts: `sri_requests`, `udm_delivery_reports`, `alerts_received`, `alerts_redelivering`.
-  - Status reports: `status_reports_generated`, `status_reports_sent`, `status_reports_failed`, `status_reports_expired`.
+  - Status reports: `status_reports_generated`, `status_reports_sent`, `status_reports_failed`, `status_reports_expired`,
+    `mo_srr_requested`, `mt_srr_requested`, `mt_status_reports_simulated`.
   - NRF: `nrf_register_attempts`, `nrf_registrations`, `nrf_heartbeats_ok`, `nrf_heartbeats_failed`,
     `nrf_discoveries`, `nrf_discoveries_empty`, `nrf_discovery_cache_hits`.
 - `consistency`. Attempts still in flight are added on the right-hand side, so the checks also hold mid-attempt.
@@ -211,6 +223,8 @@ Every key below exists from the start with value 0 (no key appears only after it
   | `mt_attempts_forwarded` | `mt_attempts` == out `RP-DATA/SMS-DELIVER` + out `RP-DATA/SMS-STATUS-REPORT` + `mt_forward_not_sent` |
   | `mt_attempts_answered` | `mt_attempts` == in RP-ACK (both) + in RP-ERROR + in `none/no-report` + `mt_forward_not_sent` |
   | `status_reports` | `generated` == `delivered` + `failed` + `expired` + `waiting` (only reports generated since `since`) |
+  | `mo_status_reports` | `mo_srr_requested` == `status_reports_generated` + MOs with TP-SRR stored since `since` that have no `statusReportId` (no originating MSISDN, or not forwarded yet). Skipped (ok) if `store_evicted` > 0 |
+  | `mt_status_reports` | `mt_srr_requested` == `mt_status_reports_simulated` + generator MTs with `srr` stored since `since` that are not final yet. Skipped (ok) if `store_evicted` > 0 |
   | `mo_store` | `mo_received` == MO records stored since `since` + `mo_rejected` + `mo_dry_runs`. If `store_evicted` > 0 this check is skipped and reported as ok, with the reason in `detail` |
 
 Tile: `https://smsf.torget.bjarby.com/colony/holminator/`: metrics, message store with history, live log and a

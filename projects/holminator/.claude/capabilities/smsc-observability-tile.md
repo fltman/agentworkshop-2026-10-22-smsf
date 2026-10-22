@@ -4,9 +4,9 @@ type: capability
 domain: frontend
 tools: Read, Write, Edit, Bash
 model: inherit
-energy: 80
+energy: 95
 spawned: 2026-10-22
-can-merge-with: [smsc-sgd-service]
+can-merge-with: [smsc-mo-service, smsc-mt-store-forward]
 ---
 
 # SMSC observability, test surface and tile
@@ -28,4 +28,9 @@ test surface (`GET /test`, `?dryRun=1`, `?scenario=`, `/test/encode`, `/test/dec
 - The tile polls a bounded message window (/api/messages?limit=), never the whole store. The common /kpi summary (tompa #build 142) is ours to keep in shape.
 
 ## Boundaries
-- Does not decide SMSC behaviour; that is smsc-sgd-service. Merge back into it if the tile stops changing.
+- Does not decide SMSC behaviour; that is smsc-mo-service and smsc-mt-store-forward. Merge back into them if the tile stops changing.
+
+## Learned (MUTATE 2026-10-22 12:40)
+- TP-SRR both ways: MO status reports go to the UE as real MTs; MT status reports go to the originating SME, simulated (message.statusReport.tpSt). Hide the backend's pre-seeded zero rows in breakdown tables.
+- Operator actions (e.g. Reset metrics) belong on the tile: confirm dialog, low-key button, inline note for success or "not supported".
+- Pitfall: a status-check test needs a non-2xx reply whose body still says ok:true, otherwise removing the check goes unnoticed.

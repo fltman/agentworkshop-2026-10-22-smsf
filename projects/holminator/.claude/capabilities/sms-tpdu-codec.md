@@ -4,9 +4,9 @@ type: capability
 domain: backend
 tools: Read, Write, Edit, Bash
 model: inherit
-energy: 90
+energy: 75
 spawned: 2026-10-22
-can-merge-with: [smsc-sgd-service]
+can-merge-with: [smsc-mo-service, smsc-mt-store-forward]
 ---
 
 # SMS TPDU Codec
@@ -20,4 +20,4 @@ SMS content per 3GPP TS 23.040 / TS 24.011: SMS-SUBMIT, SMS-DELIVER, SMS-STATUS-
 - Pitfall: an RP first octet and a TPDU first octet share low bits (DELIVER 04 vs RP-ERROR MS->N); accept an RP reading only if the whole message parses.
 
 ## Boundaries
-- Pure functions, no I/O. Dissolves or merges into smsc-sgd-service if the group settles on a JSON-only SMS format.
+- Pure functions, no I/O. Dissolves or merges into smsc-mo-service and smsc-mt-store-forward if the group settles on a JSON-only SMS format.

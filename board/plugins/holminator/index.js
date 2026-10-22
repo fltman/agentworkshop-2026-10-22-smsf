@@ -44,6 +44,7 @@ const COUNTERS = [
   'mt_retries_scheduled', 'mt_rp_error_temporary', 'mt_attempts_exhausted', 'mt_alert_fast_retries',
   'sri_requests', 'udm_delivery_reports', 'alerts_received', 'alerts_redelivering',
   'status_reports_generated', 'status_reports_sent', 'status_reports_failed', 'status_reports_expired',
+  'mo_srr_requested', 'mt_srr_requested', 'mt_status_reports_simulated',
   'nrf_register_attempts', 'nrf_registrations', 'nrf_heartbeats_ok', 'nrf_heartbeats_failed',
   'nrf_discoveries', 'nrf_discoveries_empty', 'nrf_discovery_cache_hits',
 ];
@@ -55,6 +56,7 @@ const OPS_IN = ['MO-Forward-SM', 'Alert-SC'];
 const rpCauseKey = c => `${c} ${String(tpdu.RP_CAUSE[c] || 'Unknown RP-Cause').toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, '')}`;
 const tpStKey = v => `0x${Number(v).toString(16).padStart(2, '0')}`;
 const zeros = keys => Object.fromEntries(keys.map(k => [k, 0]));
+const TP_ST_KEYS = [...new Set([...Object.values(tpdu.ST), 0x60].map(tpStKey))].sort();
 function newMetrics() {
   const now = new Date().toISOString();
   const causes = Object.keys(tpdu.RP_CAUSE).map(Number).map(rpCauseKey);
@@ -67,19 +69,20 @@ function newMetrics() {
     nrf: { lastHeartbeatAt: null, lastHeartbeatStatus: null, lastRegisteredAt: null },
     pdus: { in: zeros(PDUS_IN), out: zeros(PDUS_OUT) },
     rpCauses: { in: zeros(causes), out: zeros(causes) },
-    byTpSt: zeros([...new Set([...Object.values(tpdu.ST), 0x60].map(tpStKey))].sort()),
+    byTpSt: zeros(TP_ST_KEYS),
+    byTpStMt: zeros(TP_ST_KEYS), // simulated status reports to the originating SME of an /api/mt with srr
     operationsOut: zeros(OPS_OUT),
     operationsIn: zeros(OPS_IN),
   };
 }
 st.metrics = newMetrics();
 // Persisted parts of st.metrics, merged over fresh pre-seeded defaults on load.
-const PERSISTED = ['since', 'counters', 'results', 'peers', 'pdus', 'rpCauses', 'byTpSt', 'operationsOut', 'operationsIn'];
+const PERSISTED = ['since', 'counters', 'results', 'peers', 'pdus', 'rpCauses', 'byTpSt', 'byTpStMt', 'operationsOut', 'operationsIn'];
 function restoreMetrics(saved) {
   const m = newMetrics();
   if (!saved || typeof saved !== 'object') return m;
   if (saved.since) m.since = saved.since;
-  for (const k of ['counters', 'results', 'peers', 'byTpSt', 'operationsOut', 'operationsIn']) Object.assign(m[k], saved[k] || {});
+  for (const k of ['counters', 'results', 'peers', 'byTpSt', 'byTpStMt', 'operationsOut', 'operationsIn']) Object.assign(m[k], saved[k] || {});
   for (const k of ['pdus', 'rpCauses']) for (const d of ['in', 'out']) Object.assign(m[k][d], (saved[k] && saved[k][d]) || {});
   return m;
 }
@@ -334,6 +337,9 @@ function moRejected(cause) {
   rpCause('out', cause);
 }
 
+// TP-RD duplicate window for FORWARDED MOs (mutable for tests via _internals.MO_LIMITS, or env).
+const MO_LIMITS = { DUP_WINDOW_MS: Number(process.env.HOLMINATOR_DUP_WINDOW_MS) || 60000 };
+
 const sameAddr = (a, b) => tpdu.digitsOf(a) === tpdu.digitsOf(b);
 const sleep = ms => new Promise(r => { const t = setTimeout(r, ms); if (t.unref) t.unref(); });
 const flag = (url, name) => !!url && ['1', 'true', 'yes'].includes(String(url.searchParams.get(name) || '').toLowerCase());
@@ -401,10 +407,12 @@ async function moForward(req, res, url) {
   const from = tpdu.digitsOf(b.msisdn) || null;
   const supi = b.supi || null;
   // TS 23.040 9.2.3.25: TP-RD=1 tells the SC to reject an SMS-SUBMIT with the same TP-MR and TP-DA from the same OA
-  // as one it still holds; TP-RD=0 tells it to accept. A FORWARDED MO counts as held until its validity period ends.
+  // as one it still holds; TP-RD=0 tells it to accept. A FORWARDED MO counts as held only for DUP_WINDOW_MS after it
+  // was forwarded (RP TR1M retransmissions): UEs wrap TP-MR at 256, so a longer window flags normal traffic.
   const dup = st.messages.find(m => m.direction === 'MO' && m.mr === s.mr && m.to === to
     && ((from && m.from === from) || (supi && m.supi === supi))
-    && (['ACCEPTED', ...ACTIVE].includes(m.status) || (m.status === 'FORWARDED' && !expired(m))));
+    && (['ACCEPTED', ...ACTIVE].includes(m.status)
+      || (m.status === 'FORWARDED' && !expired(m) && Date.now() - Date.parse(m.forwardedAt || m.submittedAt) < MO_LIMITS.DUP_WINDOW_MS)));
   if (dup && s.rd) {
     return fail('EQUIPMENT_PROTOCOL_ERROR', tpdu.FCS.SM_REJECTED_DUPLICATE_SM, `duplicate of ${dup.id} (TP-MR ${s.mr}, TP-RD=1)`);
   }
@@ -437,6 +445,7 @@ async function moForward(req, res, url) {
   });
 
   inc('mo_accepted');
+  if (s.srr) inc('mo_srr_requested');
   pdu('out', 'RP-ACK/SMS-SUBMIT-REPORT');
   reply(res, 'smsf', what, 200, {
     result: 'SUCCESS', diameterResultCode: 2001, messageId: msg.id, deliveryReport: report,
@@ -481,6 +490,7 @@ function redeliverAfter(ms, to, ids, reason) {
     } catch (e) { console.error(`[${TEAM}] redeliver:`, e.message); }
   }, ms);
   if (tm.unref) tm.unref();
+  tm.redeliver = true;
   st.timers.push(tm);
 }
 
@@ -699,6 +709,7 @@ function expire(m) {
 // TS 23.040 3.2.9: when the SUBMIT had TP-SRR=1 the SC returns an SMS-STATUS-REPORT to the originating MS once the
 // outcome is final. Never for a status report itself, and only when there is an MS to send it to.
 function statusReport(orig, stValue) {
+  if (orig.direction === 'MT' && orig.kind !== 'STATUS_REPORT') return orig.srr ? simulatedStatusReport(orig, stValue) : null;
   if (orig.direction !== 'MO' || orig.kind === 'STATUS_REPORT' || !orig.srr || !orig.from) return null;
   const now = new Date();
   const sr = saveMessage({
@@ -716,6 +727,19 @@ function statusReport(orig, stValue) {
   saveStore();
   kick(sr.to);
   return sr;
+}
+
+// An /api/mt with srr: the originator is an external SME we simulate, so its SMS-STATUS-REPORT is recorded, not
+// sent (like MO onward delivery). Once per MT, on its final outcome (DELIVERED, FAILED, EXPIRED).
+function simulatedStatusReport(m, stValue) {
+  if (m.statusReport) return null;
+  const key = tpStKey(stValue);
+  m.statusReport = { tpSt: key, at: new Date().toISOString() };
+  hist(m, 'STATUS_REPORT', `status report to originating SME (simulated), TP-ST ${key}`);
+  inc('mt_status_reports_simulated');
+  bump(st.metrics.byTpStMt, key);
+  saveStore();
+  return m.statusReport;
 }
 
 // Every accepted MO terminates here (PROJEKT.md: UE -> AMF -> SMSF -> SMSC, result back to the UE). Onward delivery
@@ -787,22 +811,25 @@ async function apiMt(req, res, url) {
   if (!to || to.length > 15) return reply(res, 'api', what, 400, { result: 'MISSING_AVP', detail: 'to (MSISDN, at most 15 digits) is mandatory' });
   if (typeof b.text !== 'string' || !b.text.length) return reply(res, 'api', what, 400, { result: 'MISSING_AVP', detail: 'text is mandatory' });
   if (b.text.length > 160) return reply(res, 'api', what, 400, { result: 'UNEXPECTED_DATA_VALUE', detail: 'text is longer than one SM (160 characters); concatenation is not supported' });
+  // The generator always asks for a status report (TP-SRI) unless the body says srr: false.
+  const srr = !(b.srr === false || b.srr === 0 || b.srr === 'false');
   const now = new Date();
   const validityMs = Number(b.validitySeconds) > 0 ? Number(b.validitySeconds) * 1000 : DEFAULT_VALIDITY_MS;
   if (flag(url, 'dryRun')) {
     inc('test_requests');
-    const t = tpdu.encodeDeliver({ from, text: b.text, sri: false, date: now });
+    const t = tpdu.encodeDeliver({ from, text: b.text, sri: srr, date: now });
     return reply(res, 'api', what, 200, {
       result: 'SUCCESS', dryRun: true, tpduHex: tpdu.bytesToHex(t), decoded: tpdu.decodeDeliver(t),
       wouldDo: ['NFDiscover UDM', `SRI-for-SM ${to}`, 'NFDiscover SMSF by servingNode.smsfInstanceId', 'MT-Forward-Short-Message'],
     });
   }
   const m = saveMessage({
-    id: `smsc-${++st.msgSeq}`, direction: 'MT', kind: 'SMS', status: 'PENDING', from, to, text: b.text, srr: false, singleShot: !!b.singleShot,
+    id: `smsc-${++st.msgSeq}`, direction: 'MT', kind: 'SMS', status: 'PENDING', from, to, text: b.text, srr, singleShot: !!b.singleShot,
     submittedAt: now.toISOString(), expiresAt: new Date(now.getTime() + validityMs).toISOString(),
     history: [{ ts: now.toISOString(), event: 'ACCEPTED', detail: `originated by the SC API from ${from}` }],
   });
   inc('mt_originated');
+  if (m.srr) inc('mt_srr_requested');
   enqueue(m, `queued for MT delivery to ${to}`);
   if (!flag(url, 'wait')) return reply(res, 'api', what, 202, { result: 'ACCEPTED', messageId: m.id, status: m.status, track: `/t/${TEAM}/api/messages/${m.id}` });
   const until = Date.now() + 25000;
@@ -833,6 +860,7 @@ function metricsSnapshot() {
     pdus: { in: { ...st.metrics.pdus.in }, out: { ...st.metrics.pdus.out } },
     rpCauses: { in: { ...st.metrics.rpCauses.in }, out: { ...st.metrics.rpCauses.out } },
     statusReports: statusReportStats(),
+    statusReportsMt: { requested: st.metrics.counters.mt_srr_requested, simulated: st.metrics.counters.mt_status_reports_simulated, byTpSt: { ...st.metrics.byTpStMt } },
     sgd: { results: st.metrics.results, operationsOut: { ...st.metrics.operationsOut }, operationsIn: { ...st.metrics.operationsIn } },
     consistency: consistency(),
   };
@@ -842,6 +870,7 @@ const sinceCounting = m => !m.submittedAt || Date.parse(m.submittedAt) >= Date.p
 function statusReportStats() {
   const c = st.metrics.counters;
   return {
+    requested: c.mo_srr_requested, // accepted MOs with TP-SRR=1
     generated: c.status_reports_generated, // SMS-STATUS-REPORT records made (TP-SRR outcomes)
     sent: st.metrics.pdus.out['RP-DATA/SMS-STATUS-REPORT'], // MT-Forward attempts carrying one
     delivered: c.status_reports_sent, // acknowledged by the UE (the counter keeps its old name)
@@ -870,11 +899,42 @@ function consistency() {
   const srWaiting = st.messages.filter(m => m.kind === 'STATUS_REPORT' && ACTIVE.includes(m.status) && sinceCounting(m)).length;
   chk('status_reports', sr.generated, sr.delivered + sr.failed + sr.expired + srWaiting,
     `generated == delivered + failed + expired + waiting (${srWaiting} generated since ${st.metrics.since})`);
+  // Every accepted MO with TP-SRR gets exactly one status report from onMoAccepted/expire via statusReport(), unless
+  // it has no originating MSISDN (supi only); a record still ACCEPTED has none yet either.
+  const moNoReport = st.messages.filter(m => m.direction === 'MO' && m.srr && !m.statusReportId && sinceCounting(m)).length;
+  const mtSrrOpen = st.messages.filter(m => m.direction === 'MT' && m.kind !== 'STATUS_REPORT' && m.srr && !m.statusReport && sinceCounting(m)).length;
+  if (c.store_evicted) out.push({ name: 'mo_status_reports', ok: true, detail: `not checked: ${c.store_evicted} message(s) evicted from the store` });
+  else chk('mo_status_reports', c.mo_srr_requested, c.status_reports_generated + moNoReport,
+    `mo_srr_requested == status_reports_generated (${c.status_reports_generated}) + MOs with TP-SRR and no report (no originator or not forwarded yet) since ${st.metrics.since} (${moNoReport})`);
+  if (c.store_evicted) out.push({ name: 'mt_status_reports', ok: true, detail: `not checked: ${c.store_evicted} message(s) evicted from the store` });
+  else chk('mt_status_reports', c.mt_srr_requested, c.mt_status_reports_simulated + mtSrrOpen,
+    `mt_srr_requested == mt_status_reports_simulated (${c.mt_status_reports_simulated}) + MTs with srr not final yet since ${st.metrics.since} (${mtSrrOpen})`);
   const moStored = st.messages.filter(m => m.direction === 'MO' && sinceCounting(m)).length;
   if (c.store_evicted) out.push({ name: 'mo_store', ok: true, detail: `not checked: ${c.store_evicted} message(s) evicted from the store (max ${STORE_MAX})` });
   else chk('mo_store', c.mo_received, moStored + c.mo_rejected + c.mo_dry_runs,
     `mo_received == MO records stored since ${st.metrics.since} (${moStored}) + mo_rejected (${c.mo_rejected}) + mo_dry_runs (${c.mo_dry_runs})`);
   return out;
+}
+
+// POST /api/metrics/reset {clearMessages?}: every metric back to its pre-seeded 0 and since=now. startedAt (this
+// process) and the NRF health stay. clearMessages also drops the store and cancels pending redelivery timers, so no
+// message from before since can skew the consistency checks. An MT attempt already in flight still finishes.
+async function metricsReset(req, res) {
+  let b = {};
+  try { b = await readJson(req); } catch { return send(res, 400, { error: 'body is not JSON' }); }
+  const clear = !!(b && b.clearMessages === true);
+  st.metrics = { ...newMetrics(), startedAt: st.metrics.startedAt, nrf: st.metrics.nrf };
+  let cleared = 0;
+  if (clear) {
+    cleared = st.messages.length;
+    for (const m of st.messages) { m.nextRetryAt = null; m.viaAlert = false; }
+    st.messages = [];
+    for (const tm of st.timers.filter(x => x.redeliver)) { clearTimeout(tm); st.timers.splice(st.timers.indexOf(tm), 1); }
+  }
+  saveStore();
+  const body = { ok: true, since: st.metrics.since, clearedMessages: cleared };
+  rec('in', 'api', 'POST /api/metrics/reset', 200, { request: b, answer: body });
+  return send(res, 200, body);
 }
 
 // GET /kpi: the common KPI summary every NF team offers (tompa, #build 142). Derived from the metrics above.
@@ -901,6 +961,8 @@ function kpi() {
       pdus_in: Object.values(st.metrics.pdus.in).reduce((s, v) => s + v, 0),
       pdus_out: Object.values(st.metrics.pdus.out).reduce((s, v) => s + v, 0),
       consistent: consistency().every(x => x.ok),
+      mo_srr_requested: c.mo_srr_requested || 0,
+      mt_status_reports_simulated: c.mt_status_reports_simulated || 0,
     },
   };
 }
@@ -961,6 +1023,9 @@ function metricsText() {
   }
   for (const [k, v] of Object.entries(m.statusReports)) if (k !== 'byTpSt') line(k === 'waiting' ? 'status_reports_waiting' : 'status_reports_total', k === 'waiting' ? {} : { outcome: k }, v);
   for (const [tpSt, v] of Object.entries(m.statusReports.byTpSt)) line('status_reports_by_tp_st_total', { tp_st: tpSt }, v);
+  line('status_reports_mt_requested_total', {}, m.statusReportsMt.requested);
+  line('status_reports_mt_simulated_total', {}, m.statusReportsMt.simulated);
+  for (const [tpSt, v] of Object.entries(m.statusReportsMt.byTpSt)) line('status_reports_mt_by_tp_st_total', { tp_st: tpSt }, v);
   for (const [operation, v] of Object.entries(m.sgd.operationsOut)) line('sgd_operations_total', { dir: 'out', operation }, v);
   for (const [operation, v] of Object.entries(m.sgd.operationsIn)) line('sgd_operations_total', { dir: 'in', operation }, v);
   for (const ck of m.consistency) line('consistency_ok', { check: ck.name }, ck.ok ? 1 : 0);
@@ -982,7 +1047,7 @@ function testCatalogue() {
       { method: 'POST', path: `${base}/smsc/mo-forward-short-message?dryRun=1`, what: 'Same, nothing stored or delivered; the answer includes the decoded SMS-SUBMIT.', example: mo },
       { method: 'POST', path: `${base}/smsc/mo-forward-short-message?dryRun=1`, what: 'RP-DATA wrapped SMS-SUBMIT is accepted too.', example: { ...mo, sms: { hex: rpHex } } },
       { method: 'POST', path: `${base}/smsc/alert-service-centre`, what: 'Alert-Service-Centre from the UDM: every WAITING SM for that MSISDN is delivered again. Answers with the ids it redelivers.', example: { msisdn: '46700000002', scAddress: SC_ADDRESS, alertReason: 'UE_PRESENT' } },
-      { method: 'POST', path: `${base}/api/mt?wait=1`, what: 'Make the SMSC originate an MT SMS: SRI-for-SM to the UDM, then MT-Forward to the serving SMSF. ?wait=1 answers with the outcome of the first attempt (DELIVERED, WAITING, FAILED), without it you get 202 and a messageId.', example: { from: '46700000100', to: '46700000002', text: 'Hello from the SMSC', validitySeconds: 3600 } },
+      { method: 'POST', path: `${base}/api/mt?wait=1`, what: 'Make the SMSC originate an MT SMS: SRI-for-SM to the UDM, then MT-Forward to the serving SMSF. ?wait=1 answers with the outcome of the first attempt (DELIVERED, WAITING, FAILED), without it you get 202 and a messageId. srr defaults to true (TP-SRI set, simulated status report to the originating SME on the final outcome); send srr:false to skip it.', example: { from: '46700000100', to: '46700000002', text: 'Hello from the SMSC', validitySeconds: 3600, srr: true } },
       { method: 'POST', path: `${base}/api/mt?dryRun=1`, what: 'Build the SMS-DELIVER we would send, decoded, without sending anything.', example: { to: '46700000002', text: 'Hello' } },
       { method: 'GET', path: `${base}/api/messages/smsc-1`, what: 'One message with its full history: SRI answer, MT-Forward answer, MWD reports, status report.' },
       { method: 'POST', path: `${base}/test/encode`, what: 'Build a TPDU: type SUBMIT or DELIVER; rp=true wraps it in RP-DATA. SUBMIT vp: a relative octet, or {type:"absolute",time,tzMinutes}, {type:"enhanced",format:"none|relative|seconds|hhmmss",value,singleShot}, {type:"raw",vpf,hex}.', example: { type: 'SUBMIT', to: '46700000002', text: 'Hello', mr: 1, srr: false, rd: false, rp: false } },
@@ -992,6 +1057,7 @@ function testCatalogue() {
       { method: 'GET', path: `${base}/api/log?since=0`, what: 'Every request and answer, in and out.' },
       { method: 'GET', path: `${base}/api/metrics`, what: 'Counters, results per operation, per-peer traffic and latency (JSON).' },
       { method: 'GET', path: `${base}/metrics`, what: 'The same in Prometheus text format.' },
+      { method: 'POST', path: `${base}/api/metrics/reset`, what: 'Zero every metric (all keys re-seeded at 0) and set since=now. {clearMessages:true} also drops every stored message and cancels its retries, for a clean slate. Answers {ok, since, clearedMessages}.', example: { clearMessages: false } },
       { method: 'GET', path: `${base}/status`, what: 'NF identity and NRF registration.' },
     ],
     moScenarios: Object.fromEntries(Object.entries(MO_SCENARIOS).map(([k, v]) => [k, v.what])),
@@ -1047,6 +1113,7 @@ async function handle(req, res, { path: p, url }) {
   }
   if (req.method === 'GET' && p === '/kpi') return send(res, 200, kpi());
   if (req.method === 'GET' && p === '/api/metrics') return send(res, 200, metricsSnapshot());
+  if (req.method === 'POST' && p === '/api/metrics/reset') return metricsReset(req, res);
   if (req.method === 'GET' && p === '/metrics') {
     res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' });
     res.end(metricsText());
@@ -1100,5 +1167,5 @@ module.exports = {
   handle,
   // For tests.
   _st: st,
-  _internals: { sweep, kick, nfProfile, resolve, registerInNrf, heartbeat, baseOf, saveStore, metricsSnapshot, metricsText, newMetrics, SC_ADDRESS, NF_ID, NF_TYPE, TIMING, MT_LIMITS },
+  _internals: { sweep, kick, nfProfile, resolve, registerInNrf, heartbeat, baseOf, saveStore, metricsSnapshot, metricsText, newMetrics, SC_ADDRESS, NF_ID, NF_TYPE, TIMING, MT_LIMITS, MO_LIMITS },
 };

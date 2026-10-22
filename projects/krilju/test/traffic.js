@@ -18,8 +18,8 @@ async function post(path, body) {
 
 // A UE that lost its registration (AMF sim restart) answers 409: register it again and retry once.
 async function moSms(n, to, text) {
-  let r = await post(`tompa/ue/${supi(n)}/sms`, { to, text });
-  if (r.status === 409) { await ensureRegistered(n); r = await post(`tompa/ue/${supi(n)}/sms`, { to, text }); }
+  let r = await post(`tompa/ue/${supi(n)}/sms`, { to, text, srr: true });
+  if (r.status === 409) { await ensureRegistered(n); r = await post(`tompa/ue/${supi(n)}/sms`, { to, text, srr: true }); }
   return r;
 }
 

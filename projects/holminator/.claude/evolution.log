@@ -4,3 +4,5 @@
 2026-10-22 10:06 SPAWN: sms-tpdu-codec (need: TS 23.040 SMS-SUBMIT/DELIVER/STATUS-REPORT encoding; may merge if group picks JSON-only)
 2026-10-22 10:26 SPAWN: smsc-observability-tile (metrics, open test endpoints and the tile had no owner; other teams test against us through them)
 2026-10-22 10:26 ENERGY: smsc-sgd-service 70, sms-tpdu-codec 70, smsc-interop-contract 60 (MO forward and test codec endpoints used both)
+2026-10-22 10:42 MUTATE: all 4 capabilities now run as their own agents via .claude/agents wrappers; spawn/dissolve keep them in sync (HIVE was doing all work in one session)
+2026-10-22 10:47 ENERGY: smsc-sgd-service 90, sms-tpdu-codec 80, smsc-interop-contract 70, smsc-observability-tile 70 (PR 16: MT engine, status report codec, peer bug report, /log and new tile); sgd-service at split threshold, watch

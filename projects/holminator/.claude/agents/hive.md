@@ -64,6 +64,14 @@ Execute right away:
 - Apply mutations
 - Archive dissolutions
 
+### 5. RUN CAPABILITIES AS AGENTS
+
+Every active capability has a runnable agent at `.claude/agents/<name>.md` (frontmatter: `include-custom-instructions: true`, `name`, quoted `description`, `tools`; body: "read and act as `.claude/capabilities/<name>.md`"). The capability file stays the definition and holds the energy.
+
+- Work goes to the capability that owns it: invoke it with the Task tool, agent type `<name>`. Independent work runs in parallel as several agents.
+- SPAWN, SPLIT, MERGE, MUTATE (rename) and DISSOLVE keep `.claude/agents/` in sync: create, rename or remove the wrapper together with the capability file.
+- A new wrapper loads only after the CLI restarts. Until then, read the capability file and do its work directly.
+
 ## Capability Template
 
 When spawning, use this structure:

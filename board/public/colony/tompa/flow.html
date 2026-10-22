@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tompa · 5G Core Light call flow</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; font-size: 12px; }
+  .src { padding: 2px 8px; border-radius: 10px; background: var(--card); }
+  .src.ok { color: var(--ok); } .src.bad { color: var(--bad); }
+  #wrap { background: var(--card); border-radius: 8px; overflow: auto; max-height: 72vh; }
+  svg text { font: 11px system-ui, sans-serif; fill: var(--fg); }
+  svg .lane-h { font-weight: 600; font-size: 13px; }
+  svg .lane { stroke: #344155; stroke-dasharray: 3 4; }
+  svg .req { stroke: var(--acc); } svg .res { stroke: var(--dim); stroke-dasharray: 5 3; }
+  svg .err { stroke: var(--bad); } svg text.err { fill: var(--bad); }
+  svg .fault { stroke: var(--bad); stroke-width: 2.5; }
+  svg .row:hover rect { fill: #263140; } svg .row { cursor: pointer; }
+  svg .ts { fill: var(--dim); font-size: 10px; }
+  #detail { margin-top: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Call flow <small>5G Core Light, live from the teams' logs</small></h1>
+  <a class="pill" href="./">← AMF + UE tile</a>
+</header>
+<div class="bar">
+  <label><input type="checkbox" id="hb"> NRF heartbeats</label>
+  <label><input type="checkbox" id="nrf" checked> NRF discovery and registration</label>
+  <label>filter <input id="q" placeholder="imsi, msisdn, path…"></label>
+  <label>last <select id="n"><option>40</option><option selected>80</option><option>200</option></select> messages</label>
+  <label><input type="checkbox" id="live" checked> live</label>
+  <span id="sources"></span>
+</div>
+<div id="wrap"><svg id="flow" xmlns="http://www.w3.org/2000/svg"></svg></div>
+<div class="card" id="detail"><span class="meta">Click an arrow for the message.</span></div>
+<script src="flow.js"></script>
+</body>
+</html>

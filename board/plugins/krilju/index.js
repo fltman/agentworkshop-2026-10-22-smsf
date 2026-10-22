@@ -22,9 +22,13 @@ const log = [];
 const disc = new Map(); // nfType -> { base, ts }
 let registered = false;
 
+const { AsyncLocalStorage } = require('async_hooks');
+const als = new AsyncLocalStorage(); // per-request { id, kind }, filled in once the SMS is identified
+const FLOW = Symbol('flow');
+const tag = (id, kind) => { const f = als.getStore(); if (f && id) { f.id = id; f.kind = kind; } };
 let logSeq = 0;
 function rec(dir, peer, what, data) {
-  log.push({ id: ++logSeq, ts: new Date().toISOString(), dir, peer, what, data });
+  log.push({ id: ++logSeq, ts: new Date().toISOString(), dir, peer, what, data, [FLOW]: als.getStore() });
   if (log.length > 500) log.shift();
 }
 
@@ -177,6 +181,7 @@ async function uplinkSms(req, res, supi) {
   let b;
   try { b = await readJson(req); } catch { return problem(res, 400, 'INVALID_JSON', 'body is not JSON'); }
   rec('in', 'amf', `POST ue-contexts/${supi}/sendsms`, b);
+  tag((b.jsonData && b.jsonData.smsRecordId) || `mo-${supi.slice(-3)}-${Date.now()}`, 'MO'); // retagged MT if this is a UE answer
   const ctx = contexts.get(supi);
   if (!ctx) return problem(res, 404, 'CONTEXT_NOT_FOUND', 'SMS not activated for this supi');
   const jd = b.jsonData || {};
@@ -187,6 +192,7 @@ async function uplinkSms(req, res, supi) {
   // The UE's answer to an MT SMS (RP-ACK / RP-ERROR) arrives here, matched on smsRecordId or on the RP-MR.
   if (rp && (rp.type === 'ACK' || rp.type === 'ERROR')) {
     const id = (jd.smsRecordId && pendingMt.has(jd.smsRecordId) && jd.smsRecordId) || pendingMr.get(`${supi}:${rp.rpMr}`);
+    tag(id, 'MT');
     const waiting = id && pendingMt.get(id);
     if (waiting) {
       pendingMt.delete(id);
@@ -229,13 +235,14 @@ async function mtForward(req, res) {
   try { b = await readJson(req); } catch { return problem(res, 400, 'INVALID_JSON', 'body is not JSON'); }
   rec('in', 'smsc', 'POST /smsc/mt-forward-short-message', b);
   const hex = b.sms && b.sms.hex;
+  const id = b.smsRecordId || `mt-${Date.now()}`;
+  tag(id, 'MT');
   if (!hex || !(b.supi || b.msisdn)) return send(res, 400, { result: 'FAILURE', cause: 'supi or msisdn and sms.hex are required' });
   let ctx = b.supi ? contexts.get(b.supi) : null;
   if (!ctx && b.msisdn) ctx = [...contexts.values()].find(c => c.gpsi && c.gpsi.replace(/^msisdn-/, '') === String(b.msisdn).replace(/^msisdn-/, ''));
   if (!ctx) return send(res, 404, { result: 'UNKNOWN_SUBSCRIBER', cause: 'no SMS context in this SMSF' });
   const amf = await resolve('AMF');
   if (!amf) return send(res, 503, { result: 'FAILURE', cause: 'no AMF found in NRF' });
-  const id = b.smsRecordId || `mt-${Date.now()}`;
   const rpMr = (rpMrSeq = (rpMrSeq + 1) & 0xff);
   const mrKey = `${ctx.supi}:${rpMr}`;
   // Register before the call: the UE's RP-ACK may arrive before the N1N2 answer returns.
@@ -309,7 +316,12 @@ module.exports = {
     if (first.unref) first.unref();
   },
 
-  async handle(req, res, { path }) {
+  handle(req, res, ctx) {
+    return als.run({}, () => handleInner(req, res, ctx));
+  },
+};
+
+async function handleInner(req, res, { path }) {
     const route = routeOf(req.method, path);
     if (route) {
       const t0 = Date.now();
@@ -329,7 +341,7 @@ module.exports = {
     if (req.method === 'POST' && path === '/smsc/mt-forward-short-message') return mtForward(req, res);
     if (req.method === 'GET' && path === '/log') {
       const lim = Math.min(500, Number(new URL(req.url, 'http://x').searchParams.get('limit')) || 100);
-      return send(res, 200, log.slice(-lim));
+      return send(res, 200, log.slice(-lim).map(e => ({ ...e, flow: e[FLOW] && e[FLOW].id, kind: e[FLOW] && e[FLOW].kind })));
     }
     if (req.method === 'GET' && path === '/metrics') {
       return send(res, 200, {
@@ -345,5 +357,4 @@ module.exports = {
     if (req.method === 'GET' && path === '/contexts') return send(res, 200, [...contexts.values()]);
     if (req.method === 'GET' && path === '/status') return send(res, 200, { nfInstanceId: NF_ID, registeredInNrf: registered, contexts: contexts.size });
     return false;
-  },
-};
+}

@@ -76,10 +76,10 @@ CALL_BARRED, FAILURE (5555). The Diameter code goes in `diameterResultCode` wher
 | 1 ✅ | Plugin skeleton: routes, log, store, NRF register and heartbeat, first PR | smsc-sgd-service | live in colony, visible in NRF |
 | 2 ✅ code, interop pending | MO forward endpoint: validation, SC address, TP-RD duplicates, TP-VP expiry, SUBMIT-REPORT on ACK and error | smsc-sgd-service, sms-tpdu-codec | krilju's SMSF gets 2001 from us |
 | 2a ✅ | Metrics (/api/metrics, /metrics), test surface (/test, ?dryRun, ?scenario, /test/encode, /test/decode), tile with metrics, store, log, test console | smsc-sgd-service | other teams can test against us without us |
-| 3 | MT: trigger, SRI to UDM, MT forward to SMSF | smsc-sgd-service | an MT SMS reaches tompa's UE |
+| 3 ✅ code, interop pending | MT: trigger, SRI to UDM, MT forward to SMSF, status reports, one in flight per MS | smsc-sgd-service | an MT SMS reaches tompa's UE |
 | 4 | Error cases, mapped result codes; absolute and enhanced TP-VP (C6/C7, SPEC-NOTES 7-9) | smsc-sgd-service | unknown, not allowed, absent all shown |
 | 5 ✅ | Tile (store, log, send form; textContent only) | smsc-sgd-service | usable in demo |
-| 6 | Stretch: store-and-forward plus alert | smsc-sgd-service | redelivery after re-register |
+| 6 ✅ | Stretch: store-and-forward plus alert, retry backoff, expiry | smsc-sgd-service | redelivery after re-register (seen locally with all five plugins) |
 | 7 | Demo script end to end | smsc-interop-contract | runs registration, MO, MT across all NFs |
 
 PR after every step. Tests: a local `node` test for our plugin under `projects/holminator/test/`, plus an interop script

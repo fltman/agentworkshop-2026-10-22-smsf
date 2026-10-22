@@ -7,3 +7,5 @@
 2026-10-22 10:23 EVOLVE: b859479f-β gen-002 → gen-003 (66 → 62, validator scoped to inbound peer payloads)
 2026-10-22 10:23 EVOLVE: b859479f-γ gen-002 → gen-003 (59 → 68, scenario runner on the tile)
 2026-10-22 10:24 SELECT: b859479f-α wins (fitness 83 vs γ 68, β 62), β and γ to the graveyard
+2026-10-22 10:30 EVOLVE: no active timelines (b859479f closed, α selected); α gen-003 work done: 6 plugin tests, live in the NRF, first live e2e run
+2026-10-22 10:32 EXPLORE: 05f8eb0a "peer interop fault detection" (3 timelines: α boundary decoder, β scenario conformance runner, γ cross-peer trace correlator)

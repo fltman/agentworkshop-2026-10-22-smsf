@@ -80,11 +80,19 @@ the same identities and holds only UE state (registered, reachable, inbox). SMS 
 
 ## Logs
 
-`GET /log` returns the latest messages in and out, newest first: `{ts, dir:"in"|"out", peer, method, path, status, body}`.
+`GET /log` returns the latest messages in and out, newest first: `{ts, dir:"in"|"out", peer, method, path, status, body, diag?}`.
+`diag` is the boundary decoder's verdict on a message from a peer: `{verdict:"ok"|"expected"|"fault", hop, owner, finding, expected}`.
+
+`GET /faults` lists the peer faults seen, de-duplicated: `{owner, hop, finding, expected, count, firstTs, lastTs, lastLogId, report}`.
+`report` is a drafted #build fault report. `GET /kpi` returns the AMF/UE KPIs shown on the tile.
+
+## NRF profile
+
+AMF, nfInstanceId `7a3e0c1d-0000-4000-8000-00000000a3f0`, one service `namf-comm` with `apiRoot`
+`https://smsf.torget.bjarby.com/t/tompa` and `apiPrefix` `/t/tompa`. Heartbeat every 30 s.
 
 ## Open questions
 
 - @krilju: is the RP-ACK via UplinkSMS (above) fine, or do you want the delivery report in the N1N2 response?
-- @smsf-hao: please confirm the NF profile fields you need from the AMF (we plan nfInstanceId, nfType, nfStatus, nfServices with apiPrefix).
 
 Changes are announced in `#build` before they ship.

@@ -2,6 +2,7 @@
 // and the Nsmsf_SMService (TS 29.540) consumer side. Served at /t/tompa/. Contract: projects/tompa/CONTRACT.md
 
 const sms = require('./sms');
+const diagnose = require('./diagnose');
 
 const TEAM = 'tompa';
 // Peers publish absolute apiPrefix values, so we register and call on the public origin (override for local runs).
@@ -64,6 +65,7 @@ function kpi() {
     mtSms: { ...kpis.mt, deliveryPct: pct(kpis.mt.delivered, kpis.mt.received) },
     deliveryReports: { ...kpis.report },
     smsfLatencyMs: { calls: l.n, avg: l.n ? Math.round(l.sumMs / l.n) : null, max: l.maxMs },
+    peerFaults: { distinct: faults.size, byOwner: [...faults.values()].reduce((o, f) => ({ ...o, [f.owner]: (o[f.owner] || 0) + f.count }), {}) },
   };
 }
 let mr = 0;
@@ -72,8 +74,26 @@ const nrf = { registered: false, lastStatus: null, timer: null };
 let smsfCache = null; // { base, ts }
 
 function rec(dir, peer, method, path, status, body) {
-  log.push({ id: ++seq, ts: new Date().toISOString(), dir, peer, method, path, status, body });
+  const entry = { id: ++seq, ts: new Date().toISOString(), dir, peer, method, path, status, body };
+  log.push(entry);
   if (log.length > 300) log.shift();
+  return entry;
+}
+
+// Peer faults found by the boundary decoder, de-duplicated per owner, hop and finding.
+const faults = new Map();
+function judge(entry, diag) {
+  if (!entry || !diag) return diag;
+  entry.diag = diag;
+  if (diag.verdict !== 'fault') return diag;
+  const key = `${diag.owner}|${diag.hop}|${diag.finding}`;
+  const f = faults.get(key) || { owner: diag.owner, hop: diag.hop, finding: diag.finding, expected: diag.expected, count: 0, firstTs: entry.ts };
+  f.count++;
+  f.lastTs = entry.ts;
+  f.lastLogId = entry.id;
+  f.report = diagnose.report(entry);
+  faults.set(key, f);
+  return diag;
 }
 
 function send(res, status, body, type = 'application/json') {
@@ -104,15 +124,15 @@ async function call(peer, method, url, body, type = 'application/json') {
     const text = await r.text();
     let json = null;
     try { json = text ? JSON.parse(text) : null; } catch { json = text; }
-    rec('in', peer, method, path, r.status, json);
+    const entry = rec('in', peer, method, path, r.status, json);
     if (peer === 'smsf') {
       const ms = Date.now() - t0;
       kpis.smsfLatency.n++; kpis.smsfLatency.sumMs += ms; kpis.smsfLatency.maxMs = Math.max(kpis.smsfLatency.maxMs, ms);
     }
-    return { status: r.status, body: json };
+    return { status: r.status, body: json, entry };
   } catch (e) {
-    rec('in', peer, method, path, 0, { error: e.message });
-    return { status: 0, body: null, error: e.message };
+    const entry = rec('in', peer, method, path, 0, { error: e.message });
+    return { status: 0, body: null, error: e.message, entry };
   }
 }
 
@@ -133,7 +153,9 @@ function profile() {
       versions: [{ apiVersionInUri: 'v1', apiFullVersion: '1.0.0' }],
       scheme: new URL(HOST).protocol.replace(':', ''),
       nfServiceStatus: 'REGISTERED',
-      apiPrefix: SELF_BASE,
+      // apiRoot carries the full address; apiPrefix stays a path (smsf-hao #build 120).
+      apiRoot: SELF_BASE,
+      apiPrefix: `/t/${TEAM}`,
     }],
   };
 }
@@ -170,6 +192,7 @@ async function smsfBase() {
   if (smsfCache && Date.now() - smsfCache.ts < 60000) return smsfCache.base;
   const r = await call('nrf', 'GET',
     `${NRF_DISC}/nf-instances?target-nf-type=SMSF&requester-nf-type=AMF&service-names=nsmsf-sms`);
+  judge(r.entry, diagnose.discovery('SMSF', r.status, r.body));
   const inst = r.body && Array.isArray(r.body.nfInstances) ? r.body.nfInstances[0] : null;
   const base = inst ? baseOf(inst, 'nsmsf-sms') : null;
   kpis.nrf.discoveries++;
@@ -192,6 +215,7 @@ async function activateSms(ue) {
   const r = await call('smsf', 'PUT', `${smsf}/nsmsf-sms/v2/ue-contexts/${ue.supi}`, {
     supi: ue.supi, gpsi: ue.gpsi, amfId: NF_ID, accessType: '3GPP_ACCESS', guami: GUAMI,
   });
+  judge(r.entry, diagnose.smsfResponse('activate', ue.supi, r.status, r.body));
   if (r.status === 0) smsfCache = null;
   ue.smsActive = r.status === 200 || r.status === 201;
   ue.lastSmsf = { op: 'activate', status: r.status, body: r.body };
@@ -214,6 +238,7 @@ async function deregister(res, ue) {
     const base = await smsfBase();
     if (base) {
       const r = await call('smsf', 'DELETE', `${base}/nsmsf-sms/v2/ue-contexts/${ue.supi}`);
+      judge(r.entry, diagnose.smsfResponse('deactivate', ue.supi, r.status, r.body));
       smsf = { status: r.status, body: r.body };
     }
   }
@@ -244,6 +269,7 @@ async function moSms(req, res, ue) {
   const smsRecordId = `mo-${TEAM}-${Date.now()}-${rpMr}`;
   kpis.mo.attempts++;
   const r = await uplink(ue, smsRecordId, hexPayload, b.text);
+  judge(r.entry, diagnose.smsfResponse('sendsms', ue.supi, r.status, r.body));
   const ok = r.status === 200;
   if (ok) kpis.mo.ok++; else { kpis.mo.failed++; bump(kpis.mo.causes, causeOf(r)); }
   ue.outbox.unshift({ ts: new Date().toISOString(), smsRecordId, to: b.to, text: b.text, ok, status: r.status, result: r.body });
@@ -271,11 +297,12 @@ async function setReachable(req, res, ue) {
 
 async function n1n2(req, res, supi) {
   let b;
+  const n1n2Path = `/namf-comm/v1/ue-contexts/${supi}/n1-n2-messages`;
   try { b = await readJson(req); } catch {
-    rec('in', 'smsf', 'POST', `/namf-comm/v1/ue-contexts/${supi}/n1-n2-messages`, null, null);
+    judge(rec('in', 'smsf', 'POST', n1n2Path, null, null), diagnose.n1n2(null));
     return problem(res, 400, 'INVALID_JSON', 'body is not JSON');
   }
-  rec('in', 'smsf', 'POST', `/namf-comm/v1/ue-contexts/${supi}/n1-n2-messages`, null, b);
+  judge(rec('in', 'smsf', 'POST', n1n2Path, null, b), diagnose.n1n2(b));
   kpis.mt.received++;
   const cls = b.n1MessageContainer && b.n1MessageContainer.n1MessageClass;
   const hexPayload = b.smsPayload && b.smsPayload.hex;
@@ -300,7 +327,10 @@ async function n1n2(req, res, supi) {
   if (parsed) { kpis.mt.delivered++; kpis.report.rpAck++; } else kpis.report.rpError++;
   const t = setTimeout(() => {
     uplink(ue, b.smsRecordId, answer, parsed ? undefined : `RP-ERROR: ${parseError}`)
-      .then(r => { if (r.status === 200) kpis.report.uplinkOk++; else kpis.report.uplinkFailed++; })
+      .then(r => {
+        judge(r.entry, diagnose.smsfResponse('report', ue.supi, r.status, r.body));
+        if (r.status === 200) kpis.report.uplinkOk++; else kpis.report.uplinkFailed++;
+      })
       .catch(e => console.error(`[${TEAM}] delivery report:`, e.message));
   }, 50);
   if (t.unref) t.unref();
@@ -351,6 +381,9 @@ module.exports = {
 
     if (req.method === 'GET' && path === '/log') return send(res, 200, log.slice(-100).reverse());
     if (req.method === 'GET' && path === '/kpi') return send(res, 200, kpi());
+    if (req.method === 'GET' && path === '/faults') {
+      return send(res, 200, [...faults.values()].sort((a, b) => (a.lastTs < b.lastTs ? 1 : -1)));
+    }
     if (req.method === 'GET' && (path === '/status' || path === '/')) {
       return send(res, 200, { nf: 'AMF', team: TEAM, nfInstanceId: NF_ID, nrf: { registered: nrf.registered, lastStatus: nrf.lastStatus },
         smsf: smsfCache && smsfCache.base, ues: ues.size, registered: [...ues.values()].filter(x => x.state === 'REGISTERED').length });

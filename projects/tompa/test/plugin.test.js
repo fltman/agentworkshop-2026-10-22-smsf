@@ -116,6 +116,20 @@ test('MT bare TPDU (no RP layer) is answered with RP-ERROR cause 111', async () 
   assert.strictEqual(b.at(-1), 111);
 });
 
+test('boundary decoder flags the bare TPDU as a krilju fault and drafts a report; good MT stays ok', async () => {
+  const faults = (await api('GET', '/faults')).body;
+  assert.strictEqual(faults.length, 1);
+  assert.strictEqual(faults[0].owner, 'krilju');
+  assert.strictEqual(faults[0].hop, 'SMSF→AMF');
+  assert.match(faults[0].finding, /bare SMS-DELIVER TPDU/);
+  assert.match(faults[0].report, /^@krilju fault on SMSF→AMF/);
+  const mtIn = (await api('GET', '/log')).body.filter(e => e.dir === 'in' && e.path.endsWith('/n1-n2-messages'));
+  assert.deepStrictEqual(mtIn.map(e => e.diag.verdict), ['fault', 'ok']);
+  const reg3 = (await api('GET', '/log')).body.find(e => e.dir === 'in' && e.method === 'PUT' && e.path.endsWith(UE3));
+  assert.strictEqual(reg3.diag.verdict, 'expected');
+  assert.deepStrictEqual((await api('GET', '/kpi')).body.peerFaults, { distinct: 1, byOwner: { krilju: 1 } });
+});
+
 test('N1N2 error causes: 400 missing IE, 404 no context, 504 unreachable', async () => {
   const rp = mtRpData(1, '46700000002', 'x').rp;
   const bad = await api('POST', `/namf-comm/v1/ue-contexts/${UE1}/n1-n2-messages`, { smsPayload: { hex: rp } });

@@ -275,3 +275,15 @@ test('second AMF instance: serves n1n2 under /amf2; the fault switch fails one i
   assert.ok(nrfSeen.some(x => x.method === 'PUT' && x.url.endsWith(view[1].nfInstanceId)), 'ok re-registers');
   assert.ok((await api('GET', '/amf')).body.every(a => a.fault === 'ok'));
 });
+
+test('health: GET /health judges the five NFs; the canary runs scenario step 1 and is capped at once per 30 s', async () => {
+  const g = (await api('GET', '/health')).body;
+  assert.deepStrictEqual(g.nfs.map(n => n.node), ['AMF', 'SMSF', 'UDM', 'SMSC', 'NRF']);
+  assert.ok(['up', 'warming', 'degraded'].includes(g.nfs[0].verdict), 'our own AMF answers in-process');
+  assert.strictEqual(g.nfs[1].verdict, 'down', 'the stub has no krilju /status');
+  assert.strictEqual(g.summary.verdict, 'red');
+  const first = await api('POST', '/health/canary');
+  assert.strictEqual(first.status, 200);
+  assert.ok(first.body.canary && ['pass', 'fail', 'skip'].includes(first.body.canary.verdict));
+  assert.strictEqual((await api('POST', '/health/canary')).status, 429);
+});

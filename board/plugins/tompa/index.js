@@ -5,6 +5,7 @@ const sms = require('./sms');
 const diagnose = require('./diagnose');
 const scenario = require('./scenario');
 const traffic = require('./traffic');
+const health = require('./health');
 const fs = require('node:fs');
 const nodePath = require('node:path');
 
@@ -590,14 +591,67 @@ module.exports = {
     if (req.method === 'GET' && path === '/faults') {
       return send(res, 200, [...faults.values()].sort((a, b) => (a.lastTs < b.lastTs ? 1 : -1)));
     }
-    if (req.method === 'GET' && (path === '/status' || path === '/')) {
-      return send(res, 200, { nf: 'AMF', team: TEAM, nfInstanceId: NF_ID, nrf: { registered: nrf.registered, lastStatus: nrf.lastStatus },
+    if (req.method === 'GET' && path === '/health') return send(res, 200, await healthView());
+    if (req.method === 'POST' && path === '/health/canary') {
+      const r = await runCanary();
+      return send(res, r.status, r.body);
+    }
+    if (req.method === 'GET' && (path === '/status' || path === '/')) return send(res, 200, statusBody());
+    return false;
+  },
+};
+
+function statusBody() {
+  return { nf: 'AMF', team: TEAM, nfInstanceId: NF_ID, nrf: { registered: nrf.registered, lastStatus: nrf.lastStatus },
         smsf: smsfCache && smsfCache.base, ues: ues.size, registered: [...ues.values()].filter(x => x.state === 'REGISTERED').length,
         // Every merge in the group restarts the board (spore frontend2-23): tell a warm-up from a fault.
         startedAt: STARTED, uptimeS: Math.round((Date.now() - Date.parse(STARTED)) / 1000),
         instances: amfView(),
-        warmup: { state: !nrf.registered ? 'nrf-pending' : toRestore.length ? 'restoring-ues' : 'ready', uesToRestore: toRestore.length } });
+        warmup: { state: !nrf.registered ? 'nrf-pending' : toRestore.length ? 'restoring-ues' : 'ready', uesToRestore: toRestore.length } };
+}
+
+// ---------- end-to-end health (FLUX 5faaadcb): not logged, these are not 5G calls ----------
+
+const CANARY_MIN_S = 30;
+const HEALTH_CACHE_MS = 5000;
+let canary = null; let healthCache = null;
+
+async function getJson(url) {
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(4000) });
+    let body = null; try { body = await r.json(); } catch { /* not JSON */ }
+    return { status: r.status, body };
+  } catch { return { status: 0, body: null }; }
+}
+
+async function checkNfs() {
+  const now = Date.now();
+  if (healthCache && now - healthCache.at < HEALTH_CACHE_MS) return healthCache.nfs;
+  const answers = await Promise.all(health.NFS.map(nf => (nf.team === TEAM
+    ? { status: 200, body: statusBody() } : getJson(`${HOST}/t/${nf.team}/status`))));
+  const nrfAns = answers[health.NFS.findIndex(n => n.node === 'NRF')];
+  const list = nrfAns.status === 200 && nrfAns.body && Array.isArray(nrfAns.body.instances) ? nrfAns.body.instances : null;
+  const nfs = health.NFS.map((nf, i) => health.judgeNf(nf, answers[i].status, answers[i].body, list, now));
+  healthCache = { at: now, nfs };
+  return nfs;
+}
+
+async function healthView() {
+  const nfs = await checkNfs();
+  return { checkedAt: new Date().toISOString(), summary: health.summary(nfs, canary), nfs, canary, canaryMinS: CANARY_MIN_S };
+}
+
+async function runCanary() {
+  if (canary && Date.now() - Date.parse(canary.ts) < CANARY_MIN_S * 1000) return { status: 429, body: await healthView() };
+  const warming = (await checkNfs()).filter(n => n.verdict === 'warming').map(n => n.node);
+  if (warming.length) {
+    canary = { verdict: 'skip', ts: new Date().toISOString(), got: `not run: ${warming.join(', ')} warming up` };
+  } else {
+    rec('in', 'trigger', 'POST', '/health/canary', null, null);
+    try { canary = health.canaryFrom(await runner.run(1)); } catch (e) {
+      if (e.code !== 'BUSY') throw e;
+      canary = { verdict: 'skip', ts: new Date().toISOString(), got: 'not run: a scenario run is in progress' };
     }
-    return false;
-  },
-};
+  }
+  return { status: 200, body: await healthView() };
+}

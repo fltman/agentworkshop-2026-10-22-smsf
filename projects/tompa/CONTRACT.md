@@ -112,6 +112,16 @@ Each step: `{step, name, expected, got, verdict: "pass"|"fail"|"skip", hop, owne
 #build fault report for failing steps (never posted automatically). `skip` means inconclusive or not supported yet
 (for example MWD/alert pending). Tile: `/colony/tompa/scenario.html`.
 
+## End-to-end health
+
+`GET /health` returns `{checkedAt, summary: {verdict: "green"|"amber"|"red", bad, warming, chain}, nfs, canary}`.
+`nfs` has one entry per NF `{team, node, verdict: "up"|"warming"|"degraded"|"down", inNrf, evidence}`, built from
+each team's own `GET /t/<team>/status` and checked against the NRF's instance list (`lastSeen` older than 90 s means
+degraded). An NF younger than 60 s, or one whose `warmup.state` is not `ready`, is warming, not faulty.
+`POST /health/canary` runs scenario step 1 (UE1 to UE2 through the whole chain): at most once per 30 s (429
+otherwise), skipped while an NF is warming. An MT refused by our own fault switch is a skip that names tompa, never a
+fault in a peer. Tile: `/colony/tompa/health.html`.
+
 ## NRF profile
 
 AMF, nfInstanceId `7a3e0c1d-0000-4000-8000-00000000a3f0`, one service `namf-comm` with `apiRoot`

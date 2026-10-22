@@ -1,4 +1,4 @@
-# SMSF contract (team krilju) - DRAFT v0
+# SMSF contract (team krilju) - v1 (aligned with UDM v0 and AMF v0 drafts)
 
 Base URL: `https://<board>/t/krilju` (find it through the NRF: nfType `SMSF`, service `nsmsf-sms`). Everything is HTTP/JSON.
 SUPI format: `imsi-<digits>`. GPSI: `msisdn-<digits>`.
@@ -20,12 +20,17 @@ Response 200 `{"result":"SUCCESS","deliveryReport":{"hex"}}`, or 4xx/5xx with `{
 
 `POST /smsc/alert-service-centre` (not used by us; goes to SMSC when UE becomes reachable, stretch goal).
 
-## Used (proposals, owners please confirm)
+## Used (as agreed with the owners' contracts)
 
-- NRF: `PUT /nnrf-nfm/v1/nf-instances/{id}` (register), `GET /nnrf-disc/v1/nf-instances?target-nf-type=X&requester-nf-type=SMSF`
-- UDM: `PUT /nudm-uecm/v1/{supi}/registrations/smsf-3gpp-access`, `DELETE` same, `GET /nudm-sdm/v2/{supi}/sm-data` (SMS subscription: `smsSubscribed`)
-- AMF: `POST /namf-comm/v1/ue-contexts/{supi}/n1-n2-messages` (MT SMS to UE, N1 SMS container)
-- SMSC: `POST /smsc/mo-forward-short-message` body `{"supi","msisdn","sms":{"hex"},"smsRecordId"}`, answer `{"result":"SUCCESS","deliveryReport":{"hex"}}`
+- NRF: `PUT /nnrf-nfm/v1/nf-instances/{id}` (register, stable id), `GET /nnrf-disc/v1/nf-instances?target-nf-type=X&requester-nf-type=SMSF`. Base URL of a peer = `nfServices[0].apiPrefix`.
+- UDM (hetoteam): Activate does `PUT /nudm-uecm/v1/{supi}/registrations/smsf-3gpp-access`, then `GET /nudm-sdm/v2/{supi}/sms-data` (`smsSubscribed` false gives 403 SMS_NOT_ALLOWED and we deregister) and `GET .../sms-mng-data` (`moSmsSubscribed` false or `moSmsBarringAll` true gives 403 MO_SMS_BARRED on UplinkSMS). Deactivate does `DELETE` on the registration.
+- AMF (tompa): MT SMS via `POST /namf-comm/v1/ue-contexts/{supi}/n1-n2-messages` with `n1MessageContainer.n1MessageClass "SMS"`, top-level `smsPayload {contentType, hex}` and `smsRecordId`. 404 or 504 gives ABSENT_SUBSCRIBER towards the SMSC.
+- MT delivery report: the UE answers with UplinkSMS (`sendsms`) carrying the same `smsRecordId`. The SMSF matches it to the pending MT (15 s timeout), does not forward it to the SMSC as MO, and answers the SMSC's MT call with the report. A first octet with RP-MTI 4 is treated as RP-ERROR.
+- SMSC (holminator, to be confirmed): `POST /smsc/mo-forward-short-message` body `{"supi","msisdn","sms":{"hex"},"smsRecordId"}`, answer `{"result":"SUCCESS","deliveryReport":{"hex"}}`
+
+## NRF profile
+
+nfType `SMSF`, stable nfInstanceId `6f1c2c1e-0000-4000-8000-0000006b7269`, service `nsmsf-sms` v2, apiPrefix `https://smsf.torget.bjarby.com/t/krilju`.
 
 ## Triggers and logs
 

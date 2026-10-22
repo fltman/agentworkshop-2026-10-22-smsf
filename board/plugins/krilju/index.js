@@ -1,18 +1,19 @@
 // SMSF (team krilju): Nsmsf_SMService (TS 29.540) plus the SMSC-facing interface, SGd style.
 // Served at /t/krilju/. Contract: projects/krilju/CONTRACT.md
-const crypto = require('crypto');
 
 const TEAM = 'krilju';
-const PORT = Number(process.env.PORT || 8180);
-const HOST = process.env.SMSF_LOOPBACK || `http://127.0.0.1:${PORT}`;
+// Peers publish public apiPrefix values, so we use the public origin too (override for local runs).
+const HOST = (process.env.SMSF_BOARD_URL || 'https://smsf.torget.bjarby.com').replace(/\/$/, '');
 // The NRF is the one well-known address; everything else is discovered through it.
 const NRF_TEAM = process.env.NRF_TEAM || 'smsf-hao';
 const NRF_NFM = `${HOST}/t/${NRF_TEAM}/nnrf-nfm/v1`;
 const NRF_DISC = `${HOST}/t/${NRF_TEAM}/nnrf-disc/v1`;
 const SELF_BASE = `${HOST}/t/${TEAM}`;
-const NF_ID = crypto.randomUUID();
+const NF_ID = '6f1c2c1e-0000-4000-8000-0000006b7269'; // stable across restarts, so the NRF sees one SMSF
+const PENDING_MT_MS = 15000;
 
 const contexts = new Map(); // supi -> { supi, gpsi, amfId, since }
+const pendingMt = new Map(); // smsRecordId -> resolve(report)
 const log = [];
 const disc = new Map(); // nfType -> { base, ts }
 let registered = false;
@@ -93,20 +94,28 @@ async function activate(req, res, supi) {
   const udm = await resolve('UDM');
   if (!udm) return problem(res, 503, 'NF_DISCOVERY_FAILED', 'no UDM found in NRF');
 
-  const sdm = await call('udm', 'GET', `${udm}/nudm-sdm/v2/${supi}/sm-data`);
-  if (sdm.status === 404) return problem(res, 404, 'USER_UNKNOWN', 'subscriber not found in UDM');
-  if (sdm.status === 0 || sdm.status >= 500) return problem(res, 502, 'UDM_UNAVAILABLE', 'UDM did not answer');
-  const sd = sdm.body || {};
-  if (sd.smsSubscribed === false || (sd.smsSubscriptionData && sd.smsSubscriptionData.smsSubscribed === false)) {
-    return problem(res, 403, 'SMS_NOT_ALLOWED', 'SMS is not part of the subscription');
-  }
-
-  const reg = await call('udm', 'PUT', `${udm}/nudm-uecm/v1/${supi}/registrations/smsf-3gpp-access`,
-    { smsfInstanceId: NF_ID, supi, plmnId: b.plmnId || { mcc: '001', mnc: '01' } });
+  // TS 23.502 4.13.3.1: register in the UDM first, then fetch the SMS subscription data.
+  const reg = await call('udm', 'PUT', `${udm}/nudm-uecm/v1/${supi}/registrations/smsf-3gpp-access`, {
+    smsfInstanceId: NF_ID,
+    plmnId: (b.guami && b.guami.plmnId) || b.plmnId || { mcc: '001', mnc: '01' },
+    smsfMAPAddress: '46700000999',
+    smsfDiameterAddress: { name: 'smsf.krilju', realm: 'workshop' },
+  });
   if (reg.status === 404) return problem(res, 404, 'USER_UNKNOWN', 'subscriber not found in UDM');
   if (reg.status === 0 || reg.status >= 300) return problem(res, 502, 'UDM_REGISTRATION_FAILED', `UDM answered ${reg.status}`);
 
-  contexts.set(supi, { supi, gpsi: b.gpsi || sd.gpsi || null, amfId: b.amfId || null, since: new Date().toISOString() });
+  const unregister = () => call('udm', 'DELETE', `${udm}/nudm-uecm/v1/${supi}/registrations/smsf-3gpp-access`);
+  const sms = await call('udm', 'GET', `${udm}/nudm-sdm/v2/${supi}/sms-data`);
+  if (sms.status === 404) { await unregister(); return problem(res, 404, 'USER_UNKNOWN', 'no SMS data for subscriber'); }
+  if (sms.status !== 200) { await unregister(); return problem(res, 502, 'UDM_UNAVAILABLE', `UDM answered ${sms.status}`); }
+  if (!sms.body || sms.body.smsSubscribed !== true) {
+    await unregister();
+    return problem(res, 403, 'SMS_NOT_ALLOWED', 'SMS is not part of the subscription');
+  }
+  const mng = await call('udm', 'GET', `${udm}/nudm-sdm/v2/${supi}/sms-mng-data`);
+  const mngData = mng.status === 200 && mng.body ? mng.body : {};
+
+  contexts.set(supi, { supi, gpsi: b.gpsi || null, amfId: b.amfId || null, mng: mngData, since: new Date().toISOString() });
   return send(res, 201, { smsfInstanceId: NF_ID });
 }
 
@@ -128,6 +137,19 @@ async function uplinkSms(req, res, supi) {
   const jd = b.jsonData || {};
   const hex = jd.smsPayload && jd.smsPayload.hex;
   if (!hex) return problem(res, 400, 'MANDATORY_IE_MISSING', 'jsonData.smsPayload.hex missing');
+
+  // The UE's answer to an MT SMS (RP-ACK / RP-ERROR) arrives here with the smsRecordId of the MT.
+  const waiting = jd.smsRecordId && pendingMt.get(jd.smsRecordId);
+  if (waiting) {
+    pendingMt.delete(jd.smsRecordId);
+    waiting({ hex, error: (parseInt(hex.slice(0, 2), 16) & 7) === 4 });
+    return send(res, 200, { smsRecordId: jd.smsRecordId, deliveryStatus: 'SMS_DELIVERY_SUCCESS' });
+  }
+
+  const mng = ctx.mng || {};
+  if (mng.moSmsSubscribed === false || mng.moSmsBarringAll === true) {
+    return problem(res, 403, 'MO_SMS_BARRED', 'MO SMS is not allowed for this subscriber');
+  }
   const smsc = await resolve('SMSC');
   if (!smsc) return problem(res, 503, 'NF_DISCOVERY_FAILED', 'no SMSC found in NRF');
   const r = await call('smsc', 'POST', `${smsc}/smsc/mo-forward-short-message`,
@@ -150,11 +172,27 @@ async function mtForward(req, res) {
   if (!ctx) return send(res, 404, { result: 'UNKNOWN_SUBSCRIBER', cause: 'no SMS context in this SMSF' });
   const amf = await resolve('AMF');
   if (!amf) return send(res, 503, { result: 'FAILURE', cause: 'no AMF found in NRF' });
-  const r = await call('amf', 'POST', `${amf}/namf-comm/v1/ue-contexts/${ctx.supi}/n1-n2-messages`,
-    { n1MessageContainer: { n1MessageClass: 'SMS', n1MessageContent: { contentId: 'sms', hex } }, smsRecordId: b.smsRecordId });
-  if (r.status >= 200 && r.status < 300) return send(res, 200, { result: 'SUCCESS', deliveryReport: r.body && r.body.deliveryReport });
-  if (r.status === 404 || r.status === 504 || r.status === 0) return send(res, 504, { result: 'ABSENT_SUBSCRIBER', cause: 'UE not reachable' });
-  return send(res, 502, { result: 'FAILURE', cause: `AMF answered ${r.status}` });
+  const id = b.smsRecordId || `mt-${Date.now()}`;
+  // Register before the call: the UE's RP-ACK may arrive before the N1N2 answer returns.
+  const report = new Promise(resolve => {
+    pendingMt.set(id, resolve);
+    const t = setTimeout(() => { if (pendingMt.delete(id)) resolve(null); }, PENDING_MT_MS);
+    if (t.unref) t.unref();
+  });
+  const r = await call('amf', 'POST', `${amf}/namf-comm/v1/ue-contexts/${ctx.supi}/n1-n2-messages`, {
+    n1MessageContainer: { n1MessageClass: 'SMS', n1MessageContent: { contentId: 'sms' } },
+    smsPayload: { contentType: 'application/vnd.3gpp.sms', hex },
+    smsRecordId: id,
+  });
+  if (r.status < 200 || r.status >= 300) {
+    pendingMt.delete(id);
+    if (r.status === 404 || r.status === 504 || r.status === 0) return send(res, 504, { result: 'ABSENT_SUBSCRIBER', cause: 'UE not reachable' });
+    return send(res, 502, { result: 'FAILURE', cause: `AMF answered ${r.status}` });
+  }
+  const rep = await report;
+  if (!rep) return send(res, 504, { result: 'FAILURE', cause: 'no delivery report from the UE' });
+  if (rep.error) return send(res, 502, { result: 'FAILURE', cause: 'UE answered RP-ERROR', deliveryReport: { hex: rep.hex } });
+  return send(res, 200, { result: 'SUCCESS', deliveryReport: { hex: rep.hex } });
 }
 
 module.exports = {

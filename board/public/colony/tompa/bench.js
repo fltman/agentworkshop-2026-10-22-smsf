@@ -37,6 +37,8 @@ async function waitMessage(c, id, want, ms) {
 
 const smsfOf = r => (r && r.smsf) || {};
 const causeOf = s => (s.body && (s.body.cause || s.body.result)) || '';
+// SMSC ?wait=1 answers { result, messageId, message: { status, history } } (holminator CONTRACT 4).
+const mtStatus = r => r && (r.result || (r.message && r.message.status) || r.status);
 
 const CASES = [
   { id: 'reg_ok', group: 'REG', title: 'Register UE1', expect: 'SMS active, SMSF 200/201',
@@ -88,14 +90,14 @@ const CASES = [
       await c.tompa('POST', `/ue/${UE(2)}/reachable`, { reachable: true });
       const text = tag();
       const r = (await c.smsc('POST', '/api/mt?wait=1', { to: MSISDN(2), text })).body;
-      const st = r && r.status;
+      const st = mtStatus(r);
       if (st !== 'DELIVERED') return nok(`SMSC status ${st}`, r);
       return (await waitInbox(c, 2, text, 3000)) ? ok(`DELIVERED: "${text}"`, r) : nok('SMSC says DELIVERED, not in UE2 inbox', r);
     } },
   { id: 'mt_barred', group: 'MT', title: 'MT SMS SC → UE4 (MT-barred)', expect: 'FAILED (CALL_BARRED)',
     async run(c) {
       const r = (await c.smsc('POST', '/api/mt?wait=1', { to: MSISDN(4), text: tag() })).body;
-      return r && r.status === 'FAILED' ? ok('FAILED as expected', r) : nok(`SMSC status ${r && r.status}`, r);
+      return mtStatus(r) === 'FAILED' ? ok('FAILED as expected', r) : nok(`SMSC status ${mtStatus(r)}`, r);
     } },
   { id: 'mt_unreachable', group: 'MT', title: 'MT SMS to unreachable UE2, then reachable', expect: 'WAITING, then DELIVERED via the alert',
     async run(c) {

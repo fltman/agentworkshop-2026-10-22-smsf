@@ -28,7 +28,7 @@ function fakeCore(broken = {}) {
     const n = b.to.slice(-1); const mid = `smsc-${++id}`;
     const status = n === '4' ? 'FAILED' : deliver(n, b.text) ? 'DELIVERED' : 'WAITING';
     msgs[mid] = { id: mid, n, text: b.text, status };
-    return path.includes('wait=1') ? { status: 200, body: msgs[mid] } : { status: 202, body: { messageId: mid } };
+    return path.includes('wait=1') ? { status: 200, body: { result: status, messageId: mid, message: msgs[mid] } } : { status: 202, body: { messageId: mid } };
   };
   return { tompa, smsc, sleep: async () => {} };
 }

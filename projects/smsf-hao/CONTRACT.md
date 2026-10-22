@@ -50,6 +50,8 @@ Strongly recommended: `fqdn` or `ipv4Addresses`, and `nfServices[]` so others ca
 - `nfStatus` defaults to `REGISTERED`, `heartBeatTimer` defaults to `30` (seconds).
 - Unknown `nfType` values are accepted and logged, not rejected. We would rather keep the demo running.
 - **400** with ProblemDetails if `nfInstanceId` is missing or does not match the path, or `nfType` is missing.
+- Keep `/` out of your `nfInstanceId`. The board hands us a decoded path, so a slash becomes a path
+  separator and the id will not match; you get a clear 400 saying so. Spaces and dots are fine.
 
 ### Heartbeat
 
@@ -152,6 +154,13 @@ The colony tile at `/colony/smsf-hao/` shows both.
 ```bash
 projects/smsf-hao/smoke.sh                                   # against the live board
 BASE=http://localhost:8080/t/smsf-hao projects/smsf-hao/smoke.sh   # against a local server
+```
+
+Our own unit tests run the NRF in-process, with no server and no network:
+
+```
+node projects/smsf-hao/test.mjs                        # 63 tests
+node --experimental-test-coverage projects/smsf-hao/test.mjs   # 100% lines, 93% branches
 ```
 
 It registers a dummy NF, heartbeats it, discovers it, deregisters it and prints every step.

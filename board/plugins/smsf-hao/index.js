@@ -405,4 +405,7 @@ module.exports = {
         m.channel, m.id);
     } catch (err) { console.error('[smsf-hao] onMessage:', err && err.message); }
   },
+
+  // Only for projects/smsf-hao/test.mjs. The board server never looks at this.
+  _test: { st, sweep, applyPatch, apiRootFor, decorate, validate, inSupiRange, normaliseType, save, load },
 };

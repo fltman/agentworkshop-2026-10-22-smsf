@@ -1,20 +1,116 @@
 <!doctype html>
+<html lang="en">
+<head>
 <meta charset="utf-8">
-<title>krilju SMSF</title>
-<style>body{font:14px monospace;margin:1em}pre{background:#111;color:#cfc;padding:.5em;max-height:60vh;overflow:auto}</style>
-<h3>SMSF (krilju)</h3>
-<div id="st"></div>
-<h4>UE contexts</h4><pre id="ctx"></pre>
-<h4>Message log</h4><pre id="log"></pre>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>krilju — SMSF</title>
+<style>
+  :root { --bg:#0e1116; --fg:#e6edf3; --dim:#8b949e; --line:#232a33; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --acc:#58a6ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  header { padding:18px 20px 12px; border-bottom:1px solid var(--line); }
+  h1 { margin:0; font-size:17px; } h1 small { color:var(--dim); font-weight:normal; }
+  main { padding:16px 20px 40px; display:grid; gap:20px; grid-template-columns:minmax(320px,1fr) minmax(320px,1.2fr); }
+  @media (max-width:860px) { main { grid-template-columns:1fr; } }
+  section h2 { font-size:12px; text-transform:uppercase; letter-spacing:1px; color:var(--dim); margin:0 0 8px; }
+  .cards { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:14px; }
+  .cards div { background:#161b22; border:1px solid var(--line); border-radius:6px; padding:6px 10px; }
+  .cards b { color:var(--acc); font-size:16px; display:block; }
+  .cards span { color:var(--dim); font-size:11px; text-transform:uppercase; }
+  table { width:100%; border-collapse:collapse; margin-bottom:16px; }
+  th { text-align:left; font-size:11px; text-transform:uppercase; color:var(--dim); font-weight:normal; padding:4px 8px 4px 0; border-bottom:1px solid var(--line); }
+  td { padding:5px 8px 5px 0; border-bottom:1px solid var(--line); vertical-align:top; word-break:break-all; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .warn { color:var(--warn); } .d { color:var(--dim); } .in { color:var(--ok); } .out { color:var(--acc); }
+  .bar { display:flex; gap:10px; align-items:center; margin-bottom:8px; }
+  select, input { background:#161b22; color:var(--fg); border:1px solid var(--line); border-radius:4px; padding:2px 6px; font:inherit; }
+  ol.log { list-style:none; margin:0; padding:0; max-height:62vh; overflow:auto; }
+  ol.log li { padding:3px 0; border-bottom:1px solid var(--line); cursor:pointer; }
+  pre { margin:4px 0 6px; padding:6px; background:#161b22; color:var(--dim); white-space:pre-wrap; word-break:break-all; }
+  footer { color:var(--dim); padding:0 20px 24px; font-size:12px; }
+</style>
+</head>
+<body>
+<header><h1>krilju &middot; SMSF <small>— Nsmsf_SMService, TS 29.540</small></h1></header>
+<main>
+  <section>
+    <h2>Metrics</h2>
+    <div class="cards" id="cards"></div>
+    <h2>Inbound (we serve)</h2>
+    <table><thead><tr><th>route</th><th>calls</th><th>errors</th><th>avg ms</th><th>status codes</th></tr></thead><tbody id="inb"></tbody></table>
+    <h2>Outbound (we call)</h2>
+    <table><thead><tr><th>peer</th><th>calls</th><th>errors</th><th>avg ms</th><th>status codes</th></tr></thead><tbody id="outb"></tbody></table>
+    <h2>UE contexts</h2>
+    <table><thead><tr><th>supi</th><th>gpsi</th><th>since</th></tr></thead><tbody id="ctx"></tbody></table>
+  </section>
+  <section>
+    <h2>Message log <span class="d">(click a line for the body)</span></h2>
+    <div class="bar">
+      <select id="peer"><option value="">all peers</option></select>
+      <label><input type="checkbox" id="errs"> errors only</label>
+    </div>
+    <ol class="log" id="log"></ol>
+  </section>
+</main>
+<footer>
+  JSON: <code>/t/krilju/metrics</code> &middot; Prometheus: <code>/t/krilju/metrics.prom</code> &middot; log: <code>/t/krilju/log?limit=200</code> &middot; contract in <code>projects/krilju/CONTRACT.md</code>
+</footer>
 <script>
-async function load() {
-  const get = async p => (await fetch('/t/krilju/' + p)).json();
-  try {
-    document.getElementById('st').textContent = JSON.stringify(await get('status'));
-    document.getElementById('ctx').textContent = JSON.stringify(await get('contexts'), null, 1);
-    const l = await get('log');
-    document.getElementById('log').textContent = l.map(e => `${e.ts} ${e.dir} ${e.peer} ${e.what}`).join('\n');
-  } catch (e) { document.getElementById('st').textContent = String(e); }
+// Log bodies come from other teams: textContent only, never innerHTML.
+const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; };
+const hhmmss = ts => { const d = new Date(ts); return isNaN(d) ? String(ts) : d.toTimeString().slice(0, 8); };
+const open = new Set();
+const get = p => fetch('/t/krilju/' + p).then(r => r.json());
+const isErr = e => /^(ERROR|[45]\d\d)/.test(e.what);
+
+function rows(tbody, obj) {
+  tbody.replaceChildren();
+  const keys = Object.keys(obj || {});
+  if (!keys.length) { const tr = el('tr'); tr.append(el('td', 'd', 'nothing yet')); tbody.append(tr); return; }
+  for (const k of keys) {
+    const v = obj[k], tr = el('tr');
+    tr.append(el('td', null, k), el('td', null, String(v.count)), el('td', v.errors ? 'bad' : 'ok', String(v.errors)),
+      el('td', null, String(v.avgMs)), el('td', 'd', Object.entries(v.byStatus).map(([s, n]) => s + 'x' + n).join(' ')));
+    tbody.append(tr);
+  }
 }
-load(); setInterval(load, 3000);
+
+async function tick() {
+  let m, l, c;
+  try { [m, l, c] = await Promise.all([get('metrics'), get('log?limit=200'), get('contexts')]); }
+  catch (e) { document.getElementById('cards').textContent = 'the SMSF backend is not answering'; return; }
+
+  const cards = document.getElementById('cards');
+  cards.replaceChildren();
+  const up = m.uptimeSeconds, upTxt = up >= 3600 ? Math.floor(up / 3600) + 'h' : up >= 60 ? Math.floor(up / 60) + 'm' : up + 's';
+  for (const [label, val, cls] of [['NRF', m.registeredInNrf ? 'registered' : 'not registered', m.registeredInNrf ? 'ok' : 'bad'],
+      ['UE contexts', m.ueContexts], ['pending MT', m.pendingMt], ['uptime', upTxt]]) {
+    const d = el('div'); d.append(el('b', cls, String(val)), el('span', null, label)); cards.append(d);
+  }
+  rows(document.getElementById('inb'), m.inbound);
+  rows(document.getElementById('outb'), m.outbound);
+
+  const cb = document.getElementById('ctx');
+  cb.replaceChildren();
+  for (const u of c) { const tr = el('tr'); tr.append(el('td', null, u.supi), el('td', 'd', u.gpsi || '—'), el('td', 'd', hhmmss(u.since))); cb.append(tr); }
+  if (!c.length) { const tr = el('tr'); tr.append(el('td', 'd', 'no UE has activated SMS')); cb.append(tr); }
+
+  const sel = document.getElementById('peer'), peers = [...new Set(l.map(e => e.peer))];
+  for (const p of peers) if (![...sel.options].some(o => o.value === p)) { const o = el('option', null, p); o.value = p; sel.append(o); }
+  const log = document.getElementById('log'), keep = log.scrollTop, atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
+  log.replaceChildren();
+  for (const e of l) {
+    if (sel.value && e.peer !== sel.value) continue;
+    if (document.getElementById('errs').checked && !isErr(e)) continue;
+    const li = el('li');
+    li.append(el('span', 'd', hhmmss(e.ts) + ' '), el('span', isErr(e) ? 'bad' : e.dir, (e.dir === 'in' ? '<-- ' : '--> ') + e.peer + ' ' + e.what));
+    if (open.has(e.id) && e.data !== undefined) li.append(el('pre', null, typeof e.data === 'string' ? e.data : JSON.stringify(e.data, null, 1)));
+    li.onclick = () => { open.has(e.id) ? open.delete(e.id) : open.add(e.id); tick(); };
+    log.append(li);
+  }
+  log.scrollTop = atEnd ? log.scrollHeight : keep;
+}
+tick();
+setInterval(tick, 4000);
 </script>
+</body>
+</html>

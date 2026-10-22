@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tompa · AMF + UE simulator</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>AMF + UE simulator <small>team tompa · 5G Core Light</small></h1>
+  <div id="nrf" class="pill">NRF …</div>
+</header>
+
+<section class="kpis" id="kpis"></section>
+
+<section class="grid">
+  <div class="card">
+    <h2>Simulated UEs</h2>
+    <table id="ues">
+      <thead><tr><th>SUPI</th><th>GPSI</th><th>State</th><th>SMS</th><th>Reachable</th><th>Actions</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <form id="mo">
+      <h3>Send MO SMS</h3>
+      <select id="mo-from"></select>
+      <input id="mo-to" placeholder="to, e.g. msisdn-46700000002" value="msisdn-46700000002">
+      <input id="mo-text" placeholder="text" value="Hello from tompa UE" maxlength="160">
+      <button type="submit">Send</button>
+    </form>
+    <pre id="result" class="result"></pre>
+  </div>
+
+  <div class="card">
+    <h2>Failure causes</h2>
+    <div id="causes"></div>
+    <h2>Latest MT inbox</h2>
+    <ul id="inbox"></ul>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Message log <small>newest first</small></h2>
+  <table id="log">
+    <thead><tr><th>Time</th><th>Dir</th><th>Peer</th><th>Request</th><th>Status</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>

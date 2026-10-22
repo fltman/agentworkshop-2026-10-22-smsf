@@ -432,6 +432,9 @@ const load = traffic.createGenerator({
     if (ue.state === 'REGISTERED' && ue.smsActive) return { supi, already: true };
     return (await invoke(register, ue)).body;
   },
+  register: supi => invoke(register, ueBy(supi)),
+  deregister: supi => invoke(deregister, ueBy(supi)),
+  isRegistered: supi => ueBy(supi).state === 'REGISTERED',
   setTimer: (fn, ms) => { const t = setInterval(fn, ms); if (t.unref) t.unref(); return t; },
 });
 

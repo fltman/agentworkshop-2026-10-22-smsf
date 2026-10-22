@@ -48,7 +48,7 @@ function render(s) {
     card('State', s.running ? 'running' : 'idle', s.running ? `${s.remainingS}s left` : null, s.running ? 'ok' : null),
     card('Current load', fmt(s.currentRate, '/s'), `target ${fmt(s.rate, '/s')}`),
     card('In flight', fmt(s.inFlight), t.skipped ? `${t.skipped} ticks skipped` : null, t.skipped ? 'warn' : null),
-    card('Sent', t.sent),
+    card('Sent', t.sent, s.procedures ? `${s.procedures.sms} SMS, ${s.procedures.register} reg, ${s.procedures.deregister} dereg` : null),
     card('Success', fmt(sp, ' %'), 'ok + expected refusals', sp == null ? null : sp >= 95 ? 'ok' : sp >= 80 ? 'warn' : 'bad'),
     card('Ok', t.ok, null, 'ok'),
     card('Expected refusals', t.expected),

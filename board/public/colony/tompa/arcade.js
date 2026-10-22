@@ -1,4 +1,4 @@
-// "SMS Space Post": the arcade look. Every live call is an envelope rocket between NF planets.
+// "SMS Space Post": the arcade look. Every live SMS call is an envelope rocket between NF planets; UDM/NRF signalling is a data crystal.
 // Success: lands, +points, combo grows. Failure: it explodes and the combo breaks. INSERT COIN sends a real SMS.
 'use strict';
 
@@ -54,6 +54,14 @@ if (typeof window !== 'undefined') {
     cx.beginPath(); cx.moveTo(x - 9, y - 6); cx.lineTo(x, y + 1); cx.lineTo(x + 9, y - 6); cx.stroke();
   }
 
+  // Signalling to the UDM or NRF is a data crystal, not an envelope: no SMS travels there.
+  function crystal(x, y, ok) {
+    cx.fillStyle = ok ? '#79c0ff' : '#ffb4ab';
+    cx.beginPath(); cx.moveTo(x, y - 9); cx.lineTo(x + 7, y); cx.lineTo(x, y + 9); cx.lineTo(x - 7, y); cx.closePath(); cx.fill();
+    cx.strokeStyle = '#0f1419'; cx.lineWidth = 1.5; cx.stroke();
+    cx.beginPath(); cx.moveTo(x - 7, y); cx.lineTo(x + 7, y); cx.stroke();
+  }
+
   function frame(now) {
     requestAnimationFrame(frame);
     if (cv.closest('[hidden]')) return;
@@ -85,7 +93,7 @@ if (typeof window !== 'undefined') {
       const x = x1 + (x2 - x1) * r.t, y = y1 + (y2 - y1) * r.t - arc + Math.sin(time * 8 + r.wob) * 2;
       cx.fillStyle = r.i.ok ? 'rgba(63,185,80,0.5)' : 'rgba(248,81,73,0.6)';
       for (let q = 1; q < 6; q++) cx.fillRect(x - (x2 - x1) * 0.012 * q - 2, y + (y2 - y1) * -0.012 * q - 2, 4 - q * 0.5, 4 - q * 0.5);
-      envelope(x, y, r.i.ok);
+      (window.CoreFeed.kindOf(r.i) === 'signal' ? crystal : envelope)(x, y, r.i.ok);
       if (r.t >= 1) { rockets.splice(k, 1); arrive(r); }
     }
     for (let k = sparks.length - 1; k >= 0; k--) {

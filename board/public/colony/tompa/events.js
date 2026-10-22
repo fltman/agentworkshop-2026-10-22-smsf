@@ -76,7 +76,11 @@ function collect(results) {
   return out.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
 }
 
-if (typeof module !== 'undefined') module.exports = { NODES, FEEDS, normalize, collect, key, shortPath };
+// SMS travels UE → AMF → SMSF → SMSC. Calls that touch the UDM or the NRF carry subscriber data or
+// registry signalling, never the SMS itself.
+const kindOf = i => (['UDM', 'NRF'].includes(i.from) || ['UDM', 'NRF'].includes(i.to) ? 'signal' : 'sms');
+
+if (typeof module !== 'undefined') module.exports = { NODES, FEEDS, normalize, collect, key, shortPath, kindOf };
 
 // ---- browser: poll every 3 s, hand only new interactions to the subscribers ----
 if (typeof window !== 'undefined') {
@@ -95,5 +99,5 @@ if (typeof window !== 'undefined') {
     for (const s of subs) s(fresh, first);
     first = false;
   }
-  window.CoreFeed = { NODES, subscribe(fn) { subs.push(fn); }, start() { poll(); setInterval(poll, 3000); } };
+  window.CoreFeed = { NODES, kindOf, subscribe(fn) { subs.push(fn); }, start() { poll(); setInterval(poll, 3000); } };
 }

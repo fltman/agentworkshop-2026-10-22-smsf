@@ -62,7 +62,10 @@ if (typeof window !== 'undefined') {
     if (!heartbeat) addTicker(i);
     if (!animate || document.hidden || root.closest('[hidden]')) return;
     const [x1, y1] = LAYOUT[i.from], [x2, y2] = LAYOUT[i.to];
-    const dot = mk('circle', { r: i.ok ? 7 : 10, class: i.ok ? 'm-dot ok' : 'm-dot nok' });
+    const s = i.ok ? 7 : 10;
+    const dot = window.CoreFeed.kindOf(i) === 'signal'
+      ? mk('polygon', { points: `0,${-s - 2} ${s + 2},0 0,${s + 2} ${-s - 2},0`, class: `m-dot m-sig ${i.ok ? 'ok' : 'nok'}` })
+      : mk('circle', { r: s, class: i.ok ? 'm-dot ok' : 'm-dot nok' });
     gDots.append(dot);
     const a = dot.animate([{ transform: `translate(${x1}px, ${y1}px)` }, { transform: `translate(${x2}px, ${y2}px)` }],
       { duration: 1100, easing: 'ease-in-out' });

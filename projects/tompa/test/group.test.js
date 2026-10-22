@@ -64,3 +64,10 @@ test('events: NRF log lines become calls from the requesting NF', () => {
   assert.equal(ev.normalize(nrf, { dir: 'out', text: '204 heartbeat CUSTOM_SMSC 6f1c2c1e-0000-4000-8000-0000686f6c6d' }).from, 'SMSC');
   assert.equal(ev.normalize(nrf, { dir: 'in', text: 'GET nnrf-disc nf-instances' }), null);
 });
+
+test('events: calls touching UDM or NRF are signalling, the SMS chain is sms', () => {
+  assert.equal(ev.kindOf({ from: 'SMSF', to: 'UDM' }), 'signal');
+  assert.equal(ev.kindOf({ from: 'AMF', to: 'NRF' }), 'signal');
+  assert.equal(ev.kindOf({ from: 'SMSF', to: 'SMSC' }), 'sms');
+  assert.equal(ev.kindOf({ from: 'AMF', to: 'SMSF' }), 'sms');
+});

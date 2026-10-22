@@ -41,6 +41,7 @@
   .m-node .m-team { font: 11px 'Jost', sans-serif; fill: #edc884; text-anchor: middle; }
   .m-node.hit-ok circle { animation: hitok .7s; } .m-node.hit-nok circle { animation: hitnok 1.2s; }
   @keyframes hitok { 30% { fill: #2f7d3a; } } @keyframes hitnok { 20%, 60% { fill: #e2432e; } }
+  .m-dot.m-sig.ok { fill: #253850; stroke: #dca844; } .m-legend { font-size: 12px; margin-left: 14px; }
   .m-dot.ok { fill: #2f9e44; stroke: #fceed2; stroke-width: 2; } .m-dot.nok { fill: #e2432e; stroke: #121617; stroke-width: 2; }
   #map-ticker { list-style: none; margin: 0; padding: 0; font: 12px ui-monospace, monospace; }
   #map-ticker li { padding: 5px 0; border-bottom: 1px dashed #cf973b; white-space: normal; }
@@ -105,7 +106,7 @@
 </section>
 
 <section id="v-map" hidden>
-  <div class="band"><b>5G Core Light · live network</b><span id="map-tally">waiting for traffic</span></div>
+  <div class="band"><b>5G Core Light · live network</b><span id="map-tally">waiting for traffic</span><span class="m-legend">● SMS · ◆ UDM/NRF signalling</span></div>
   <div class="paper">
     <svg id="map-svg" viewBox="0 0 900 540" role="img" aria-label="5G core nodes and live calls"></svg>
     <div><h3>On the wire</h3><ul id="map-ticker"></ul></div>
@@ -115,6 +116,7 @@
 <section id="v-arcade" hidden>
   <h2>SMS SPACE POST</h2>
   <canvas id="arcade-canvas" width="900" height="540"></canvas><br>
+  <small>✉ SMS rocket · ◆ data crystal: UDM/NRF signalling</small><br>
   <button id="coin">INSERT COIN (send SMS)</button>
 </section>
 

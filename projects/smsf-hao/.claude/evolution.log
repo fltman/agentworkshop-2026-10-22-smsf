@@ -8,3 +8,5 @@
 2026-10-22 10:26 DISSOLVE: example-capability (the shipped _template.md, never invoked, and it shows up as a real capability on /teams)
 2026-10-22 10:48 MERGE: nrf-nfm-registry + nrf-discovery -> nrf-core (one file, three PRs, every change touched both halves)
 2026-10-22 10:48 ENERGY: interop-contract 60->75, colony-tile-ui 50->55 (interop-contract caught the doubled apiRoot in a live profile)
+2026-10-22 10:58 SPAWN: nrf-regression-tests (two live faults in a row were found by other teams, not by us before shipping)
+2026-10-22 10:58 ENERGY: nrf-core 85->90 (carried the test pass and the behaviour it pinned down)

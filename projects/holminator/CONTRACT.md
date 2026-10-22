@@ -149,17 +149,25 @@ before reporting `ABSENT_SUBSCRIBER` and waiting for the next alert. `400 MISSIN
 
 ## 4. Triggers and observability
 
+**Store and history.** The store holds only messages that are not final yet: `ACCEPTED`, `PENDING`, `DELIVERING`,
+`WAITING`. When a message reaches a final status (`DELIVERED` = RP-ACK from the UE, `FAILED`, `EXPIRED`, MO
+`FORWARDED`, `REJECTED`) it moves at once to the history: a ring buffer of the newest 500 finished messages (oldest
+evicted, counted in `history_evicted`). An MO is `FORWARDED` before the answer goes out, so it never sits in the store.
+Both are saved in `store.json` (`messages` = the store, `history`); an older file with final records in `messages` is
+migrated on load. Redelivery, alerts, retries, the sweep and the restart requeue only look at the store; lookups by id,
+the TP-RD duplicate window and status report links search both. The store cap (500, `store_evicted`) is only a safety net.
+
 | Method and path | What |
 | --- | --- |
 | `POST /api/mt` `{ "from": "46700000009", "to": "46700000002", "text": "Hi", "srr": true }` | Originate an MT SMS (`from` defaults to the SC address, text at most 160 characters; optional `validitySeconds`, `singleShot: true` for one attempt only, and `srr` (default `true`: TP-SRI and a simulated status report to the SME; `false` for neither)). `202` `{ messageId, track }`; `?wait=1` answers `200` with the final status and history; `?dryRun=1` shows the TPDU without sending |
-| `GET /api/messages` | The message store, oldest first (no parameters: everything we hold, at most 500). `?limit=<n>` keeps the newest n. `?since=smsc-<n>` (or just `<n>`) keeps messages created after that id; `?since=<ISO time>` keeps messages whose `updatedAt` (the `ts` of their last history entry) is later. Both combine: filter first, then limit. A bad value is `400 { error }` |
-| `GET /api/messages/<id>` | One message with its history |
+| `GET /api/messages` | Store and history together, ordered by id, oldest first (no parameters: everything we still know about). `?scope=store`: only messages not yet final; `?scope=history`: only finished ones; any other scope is `400`. `?limit=<n>` keeps the newest n. `?since=smsc-<n>` (or just `<n>`) keeps messages created after that id; `?since=<ISO time>` keeps messages whose `updatedAt` (the `ts` of their last history entry) is later. Both combine: filter first, then limit. A bad value is `400 { error }` |
+| `GET /api/messages/<id>` | One message with its history, from the store or the history |
 | `GET /log?limit=<n>` | Shared call-flow log, newest first: `{ id, ts, dir, peer, method, path, status, body, ms? }`. Answers we give have `method: null` and the operation name as `path` |
 | `GET /api/log?since=<n>` | Incoming and outgoing messages: `{ id, ts, dir, peer, what, status, body, ms? }` |
 | `GET /api/metrics` | Counters, PDUs, RP-Causes, status reports, SGd operations and self-checks; schema below. Persisted in `store.json` with the messages, so they survive a deploy; `since` is when they started counting, `startedAt` is this process |
-| `POST /api/metrics/reset` `{ "clearMessages": false }` | Every metric back to its pre-seeded 0 (counters, results, peers, pdus, rpCauses, both byTpSt, SGd operations), `since` = now, saved to `store.json` and logged in `/api/log`. `startedAt` and NRF health stay. `clearMessages: true` also drops every stored message and cancels pending redelivery timers (a clean slate; otherwise records from before `since` are left out of the consistency checks). Body optional. Answers `{ ok: true, since, clearedMessages }` |
-| `GET /metrics` | The same in Prometheus text format (`smsc_*`): `smsc_<counter>_total`, `smsc_pdus_total{dir,type}`, `smsc_rp_causes_total{dir,cause}`, `smsc_status_reports_total{outcome}`, `smsc_status_reports_waiting`, `smsc_status_reports_by_tp_st_total{tp_st}`, `smsc_status_reports_mt_requested_total`, `smsc_status_reports_mt_simulated_total`, `smsc_status_reports_mt_by_tp_st_total{tp_st}`, `smsc_sgd_operations_total{dir,operation}`, `smsc_consistency_ok{check}` |
-| `GET /kpi` | Common KPI summary (tompa, #build 142): `{ nf: "SMSC", up: true, requests, errors, latencyMs, extra: { mo_accepted, mt_delivered, mt_failed, waiting, status_reports_sent, alerts_received, registeredInNrf, pdus_in, pdus_out, consistent, mo_srr_requested, mt_status_reports_simulated } }`. `requests`: inbound peer requests we answered; `errors`: our answers with status >= 400 plus outbound peer errors (no answer or 5xx); `latencyMs`: average outbound peer latency (0 before the first call); `waiting`: messages in WAITING now; `pdus_in`/`pdus_out`: totals of `pdus.in`/`pdus.out`; `consistent`: every consistency check is ok. Counters persist across restarts |
+| `POST /api/metrics/reset` `{ "clearMessages": false }` | Every metric back to its pre-seeded 0 (counters, results, peers, pdus, rpCauses, both byTpSt, SGd operations), `since` = now, saved to `store.json` and logged in `/api/log`. `startedAt` and NRF health stay. `clearMessages: true` also drops the store and the history and cancels pending redelivery timers (a clean slate; otherwise records from before `since` are left out of the consistency checks). Body optional. Answers `{ ok: true, since, clearedMessages }` (store + history records dropped) |
+| `GET /metrics` | The same in Prometheus text format (`smsc_*`): `smsc_<counter>_total`, `smsc_pdus_total{dir,type}`, `smsc_rp_causes_total{dir,cause}`, `smsc_status_reports_total{outcome}`, `smsc_status_reports_waiting`, `smsc_status_reports_by_tp_st_total{tp_st}`, `smsc_status_reports_mt_requested_total`, `smsc_status_reports_mt_simulated_total`, `smsc_status_reports_mt_by_tp_st_total{tp_st}`, `smsc_sgd_operations_total{dir,operation}`, `smsc_store_held`, `smsc_store_held_by_status{status}`, `smsc_history_kept`, `smsc_consistency_ok{check}` |
+| `GET /kpi` | Common KPI summary (tompa, #build 142): `{ nf: "SMSC", up: true, requests, errors, latencyMs, extra: { mo_accepted, mt_delivered, mt_failed, waiting, status_reports_sent, alerts_received, registeredInNrf, pdus_in, pdus_out, consistent, mo_srr_requested, mt_status_reports_simulated, store_held } }`. `requests`: inbound peer requests we answered; `errors`: our answers with status >= 400 plus outbound peer errors (no answer or 5xx); `latencyMs`: average outbound peer latency (0 before the first call); `waiting`: messages in WAITING now; `store_held`: messages in the store now (not final); `pdus_in`/`pdus_out`: totals of `pdus.in`/`pdus.out`; `consistent`: every consistency check is ok. Counters persist across restarts |
 | `GET /status` | `{ nfInstanceId, registeredInNrf, messages }` |
 
 ### `GET /api/metrics` schema
@@ -171,7 +179,9 @@ Every key below exists from the start with value 0 (no key appears only after it
   counters: { <name>: n },              // all pre-seeded, see list
   results: { <operation>: { <result>: n } },
   peers: { <peer>: { in, out, errors, calls, latencyMsSum, latencyMsMax, latencyMsAvg } },
-  messages: { total, byStatus, byDirection },
+  messages: { total, byStatus, byDirection },   // store + history: every record we still know about
+  store: { held, max: 500, byStatus: { ACCEPTED, PENDING, DELIVERING, WAITING }, oldestAt },   // not final yet; oldestAt: oldest submittedAt or null
+  history: { kept, max: 500 },   // finished messages kept
   pdus: {
     in:  { "RP-DATA/SMS-SUBMIT", "RP-ACK/SMS-DELIVER-REPORT", "RP-ACK/STATUS-REPORT-ACK",
            "RP-ERROR/SMS-DELIVER-REPORT", "none/no-report" },
@@ -205,7 +215,8 @@ Every key below exists from the start with value 0 (no key appears only after it
 - `statusReportsMt` (generator MTs with `srr`, the default, simulated towards the originating SME): `requested`
   (`mt_srr_requested`), `simulated` (`mt_status_reports_simulated`), `byTpSt` per simulated TP-ST.
 - Counters:
-  - General: `requests_in`, `answers_error`, `test_requests`, `store_evicted`.
+  - General: `requests_in`, `answers_error`, `test_requests`, `store_evicted` (store cap hit, should stay 0),
+    `history_evicted` (finished messages dropped from the history).
   - MO: `mo_received`, `mo_accepted`, `mo_rejected`, `mo_dry_runs`, `mo_duplicates_accepted`, `mo_forwarded`, `mo_expired`.
   - MT: `mt_originated`, `mt_attempts`, `mt_forward_not_sent` (an attempt that ended before the MT-Forward: no UDM,
     SRI failure, SMSF not found), `mt_delivered`, `mt_failed`, `mt_expired`, `mt_absent`, `mt_retries_scheduled`,
@@ -223,9 +234,10 @@ Every key below exists from the start with value 0 (no key appears only after it
   | `mt_attempts_forwarded` | `mt_attempts` == out `RP-DATA/SMS-DELIVER` + out `RP-DATA/SMS-STATUS-REPORT` + `mt_forward_not_sent` |
   | `mt_attempts_answered` | `mt_attempts` == in RP-ACK (both) + in RP-ERROR + in `none/no-report` + `mt_forward_not_sent` |
   | `status_reports` | `generated` == `delivered` + `failed` + `expired` + `waiting` (only reports generated since `since`) |
-  | `mo_status_reports` | `mo_srr_requested` == `status_reports_generated` + MOs with TP-SRR stored since `since` that have no `statusReportId` (no originating MSISDN, or not forwarded yet). Skipped (ok) if `store_evicted` > 0 |
-  | `mt_status_reports` | `mt_srr_requested` == `mt_status_reports_simulated` + generator MTs with `srr` stored since `since` that are not final yet. Skipped (ok) if `store_evicted` > 0 |
-  | `mo_store` | `mo_received` == MO records stored since `since` + `mo_rejected` + `mo_dry_runs`. If `store_evicted` > 0 this check is skipped and reported as ok, with the reason in `detail` |
+  | `mo_status_reports` | `mo_srr_requested` == `status_reports_generated` + MOs with TP-SRR in store or history since `since` that have no `statusReportId` (no originating MSISDN, or not forwarded yet). Skipped (ok) if `store_evicted` or `history_evicted` > 0 |
+  | `mt_status_reports` | `mt_srr_requested` == `mt_status_reports_simulated` + generator MTs with `srr` in store or history since `since` that are not final yet. Skipped (ok) if `store_evicted` or `history_evicted` > 0 |
+  | `mo_store` | `mo_received` == MO records in store or history since `since` + `mo_rejected` + `mo_dry_runs`. If `store_evicted` or `history_evicted` > 0 this check is skipped and reported as ok, with the reason in `detail` |
+  | `store_only_pending` | Number of final records in the store == 0. `detail` names up to 5 offenders (`smsc-<n> <STATUS>`) |
 
 Tile: `https://smsf.torget.bjarby.com/colony/holminator/`: metrics, message store with history, live log and a
 test console.

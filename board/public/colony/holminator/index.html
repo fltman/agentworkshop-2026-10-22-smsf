@@ -125,7 +125,8 @@
           </select></label>
         </div>
         <label class="wide">text <input name="text" maxlength="160" value="Hello from the SMSC" required></label>
-        <div class="row checks"><label class="cb"><input type="checkbox" name="singleShot"> single-shot (one attempt, no retry or alert wait)</label></div>
+        <div class="row checks"><label class="cb"><input type="checkbox" name="singleShot"> single-shot (one attempt, no retry or alert wait)</label>
+          <label class="cb" title="TP-SRI in the SMS-DELIVER; the status report to the originating SME is simulated"><input type="checkbox" name="srr" checked> request status report (TP-SRI)</label></div>
         <div class="row btns">
           <button name="send">send and wait for outcome</button>
           <button type="button" class="ghost" id="mtdry">dry run: show SMS-DELIVER</button>

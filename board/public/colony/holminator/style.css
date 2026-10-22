@@ -131,6 +131,8 @@ tbody tr.sr td.txt { font-style:italic; }
 .tag.MO { color:var(--mo); } .tag.MT { color:var(--mt); } .tag.SR { color:var(--sr); }
 .tag.srr.st-ok { color:var(--ok); } .tag.srr.st-warn { color:var(--warn); } .tag.srr.st-bad { color:var(--bad); }
 .tag.srr a { color:inherit; }
+.tag.store { color:var(--acc); border-style:dashed; font-size:9.5px; }
+tr:not(.sel) .tag.store { opacity:.85; }
 .st { display:inline-block; font-size:11px; padding:0 7px; border-radius:999px; line-height:1.6; background:#30363d; color:var(--fg); }
 .st.ACCEPTED, .st.PENDING { background:#1f3a5f; color:#a5d6ff; }
 .st.DELIVERING { background:#1f3a5f; color:var(--acc); animation:blink 1s ease-in-out infinite; }

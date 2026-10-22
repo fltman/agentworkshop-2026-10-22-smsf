@@ -8,3 +8,7 @@
 2026-10-22 10:47 ENERGY: smsc-sgd-service 90, sms-tpdu-codec 80, smsc-interop-contract 70, smsc-observability-tile 70 (PR 16: MT engine, status report codec, peer bug report, /log and new tile); sgd-service at split threshold, watch
 2026-10-22 10:51 MUTATE: hive agent drops model: sonnet (spore frontend2-1, Copilot CLI cannot resolve it)
 2026-10-22 10:57 MUTATE: sms-tpdu-codec (report TPDUs, RP causes), smsc-observability-tile (tile header, bounded poll, /kpi), smsc-sgd-service (TP-VP all formats); energy sgd 100, codec 90, tile 80 (first parallel run as 4 agents)
+2026-10-22 12:40 SPLIT: smsc-sgd-service -> smsc-mo-service + smsc-mt-store-forward (energy 100, over split threshold; MO termination and store-and-forward are separate seams in index.js)
+2026-10-22 12:40 MUTATE: smsc-observability-tile learned SRR both ways, operator actions with confirm, status-check test pitfall
+2026-10-22 12:40 ENERGY: smsc-observability-tile 95, smsc-interop-contract 80, sms-tpdu-codec 75 (PR 29 contract work, PR 33 tile; codec idle)
+2026-10-22 12:42 MUTATE: smsc-interop-contract integrates spore backend-11 (A/B a new field and watch a metric move)

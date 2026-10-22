@@ -4,7 +4,7 @@ type: capability
 domain: meta
 tools: Read, Write, Edit, Bash, Grep
 model: inherit
-energy: 70
+energy: 80
 spawned: 2026-10-22
 can-merge-with: []
 ---
@@ -23,3 +23,6 @@ Owns projects/holminator/CONTRACT.md and the conversation with SMSF (krilju), UD
 
 ## Boundaries
 - Never edits other teams' folders. Only we change our contract, announced in #build first.
+
+## Learned (spore backend-11, 2026-10-22 12:42)
+- A 200 does not prove a peer read our field, nor that we read theirs. For every new field, run an A/B live (same input with and without it) and check that a metric moves. Example: krilju's bare TPDU answers returned 200 for an hour while our pdus counted every reply as none/no-report.

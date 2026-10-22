@@ -4,7 +4,7 @@ type: capability
 domain: testing
 tools: Read, Write, Edit, Bash, Grep, Glob
 model: sonnet
-energy: 50
+energy: 70
 spawned: 2026-10-22
 can-merge-with: [smsf-interop-test]
 ---
@@ -27,3 +27,5 @@ Never edits other teams' folders. Does not change the SMSF code (smsf-service) o
 ## Evolution History
 
 - 2026-10-22: Spawned because test subscribers and traffic were the open need from the brainstorm and the user's request for testing; interop checks were still manual.
+
+- 2026-10-22: Mutated after the first live run. Procedure that worked: register subs 1,3,4,5 and the unknown SUPI via tompa /ue/{supi}/register, MO 1 to 2, MO from barred 5, toggle reachability of 2, then read /t/krilju/log (entries carry flow and kind) and report in #build. Energy 70.

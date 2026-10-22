@@ -30,7 +30,7 @@ MO rejection by the SMSC: the SMSF answers `502` (`504` on timeout) with `{"caus
 - NRF: `PUT /nnrf-nfm/v1/nf-instances/{id}` (register, stable id), `GET /nnrf-disc/v1/nf-instances?target-nf-type=X&requester-nf-type=SMSF`. Base URL of a peer = `nfServices[0].apiPrefix`.
 - UDM (hetoteam): Activate does `PUT /nudm-uecm/v1/{supi}/registrations/smsf-3gpp-access`, then `GET /nudm-sdm/v2/{supi}/sms-data` (`smsSubscribed` false gives 403 SMS_NOT_ALLOWED and we deregister) and `GET .../sms-mng-data` (`moSmsSubscribed` false or `moSmsBarringAll` true gives 403 MO_SMS_BARRED on UplinkSMS). Deactivate does `DELETE` on the registration.
 - AMF (tompa): MT SMS via `POST /namf-comm/v1/ue-contexts/{supi}/n1-n2-messages` with `n1MessageContainer.n1MessageClass "SMS"`, top-level `smsPayload {contentType, hex}` and `smsRecordId`. 404 or 504 gives ABSENT_SUBSCRIBER towards the SMSC.
-- MT delivery report: the UE answers with UplinkSMS (`sendsms`) carrying the same `smsRecordId`. The SMSF matches it to the pending MT (15 s timeout), does not forward it to the SMSC as MO, and answers the SMSC's MT call with the report. A first octet with RP-MTI 4 is treated as RP-ERROR.
+- MT delivery report: the UE answers with UplinkSMS (`sendsms`) carrying the same `smsRecordId`. The SMSF matches it to the pending MT, does not forward it to the SMSC as MO, and answers the SMSC's MT call with the report. A first octet with RP-MTI 4 is treated as RP-ERROR.
 - SMSC (holminator, to be confirmed): `POST /smsc/mo-forward-short-message` body `{"supi","msisdn","sms":{"hex"},"smsRecordId"}`, answer `{"result":"SUCCESS","deliveryReport":{"hex"}}`
 
 ## NRF profile
@@ -48,3 +48,12 @@ The RP layer (TS 24.011) exists only between UE and SMSF. The SMSF to SMSC leg c
 `GET /t/krilju/log` last messages in/out, `GET /t/krilju/contexts` current UE contexts.
 
 Changes are announced in `#build` before they ship.
+
+## RP timers (TS 24.011 TR1M)
+
+- An RP-DATA sent to the UE keeps its RP-MR reserved for TR1M = 35 s (`SMSF_TR1M_MS`).
+- The SMSC call is answered at the latest after 15 s (`SMSF_MT_REPLY_MS`, the SMSC gives up after 20 s): `504 {result:"FAILURE", cause:"no delivery report from the UE"}`.
+- A UE answer after that but inside TR1M is accepted (`200`, counted as `lateReport`); the SMSC already got the timeout and retries by itself.
+- After TR1M the RP-MR is released and a UE answer gets `404 NO_PENDING_MT`.
+- MO: the SMSC call has a 15 s deadline (`SMSF_MO_SMSC_MS`), shorter than the UE's own TR1M; a miss gives `504` and an RP-ERROR cause 38 to the UE.
+- Counters: `GET /t/krilju/metrics` field `rpTimers` and Prometheus `smsf_rp_timer_total{event="mtReplyDeadline|tr1mExpired|lateReport"}`.

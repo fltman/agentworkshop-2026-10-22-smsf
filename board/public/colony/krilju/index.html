@@ -26,12 +26,19 @@
   ol.log { list-style:none; margin:0; padding:0; max-height:62vh; overflow:auto; }
   ol.log li { padding:3px 0; border-bottom:1px solid var(--line); cursor:pointer; }
   pre { margin:4px 0 6px; padding:6px; background:#161b22; color:var(--dim); white-space:pre-wrap; word-break:break-all; }
+  .flow { border:1px solid var(--line); border-radius:6px; margin-bottom:10px; padding:4px 8px; background:#161b22; }
+  .flow h3 { margin:2px 0; font-size:12px; font-weight:normal; } .flow svg { width:100%; display:block; }
+  .flow text { fill:var(--fg); font:10px ui-monospace,Menlo,monospace; }
   footer { color:var(--dim); padding:0 20px 24px; font-size:12px; }
 </style>
 </head>
 <body>
 <header><h1>krilju &middot; SMSF <small>— Nsmsf_SMService, TS 29.540</small></h1></header>
 <main>
+  <section style="grid-column:1/-1">
+    <h2>Live flows <span class="d">(one ladder per SMS, newest first; red = error)</span></h2>
+    <div id="flows"><span class="d">no SMS traffic yet</span></div>
+  </section>
   <section>
     <h2>Metrics</h2>
     <div class="cards" id="cards"></div>
@@ -74,6 +81,35 @@ function rows(tbody, obj) {
   }
 }
 
+// Ladder per SMS (grouped by smsRecordId). Lanes are the NFs the SMSF talks to; arrows come from the log.
+const LANES = ['amf', 'smsf', 'udm', 'nrf', 'smsc'], NS = 'http://www.w3.org/2000/svg';
+const svg = (tag, attrs, text) => { const n = document.createElementNS(NS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); if (text !== undefined) n.textContent = text; return n; };
+function ladder(steps) {
+  const W = 640, H = 34 + steps.length * 22, x = l => 60 + LANES.indexOf(l) * ((W - 120) / (LANES.length - 1));
+  const s = svg('svg', { viewBox: `0 0 ${W} ${H}` });
+  LANES.forEach(l => { s.append(svg('text', { x: x(l), y: 12, 'text-anchor': 'middle' }, l.toUpperCase()), svg('line', { x1: x(l), x2: x(l), y1: 18, y2: H, stroke: '#232a33' })); });
+  steps.forEach((e, i) => {
+    const y = 34 + i * 22, from = e.dir === 'in' ? e.peer : 'smsf', to = e.dir === 'in' ? 'smsf' : e.peer;
+    if (!LANES.includes(from) || !LANES.includes(to)) return;
+    const col = isErr(e) ? '#f85149' : e.dir === 'in' ? '#3fb950' : '#58a6ff', x1 = x(from), x2 = x(to);
+    s.append(svg('line', { x1, x2, y1: y, y2: y, stroke: col, 'stroke-width': 1.5 }),
+      svg('path', { d: `M${x2},${y} l${x2 > x1 ? -6 : 6},-3 v6 z`, fill: col }),
+      svg('text', { x: (x1 + x2) / 2, y: y - 4, 'text-anchor': 'middle' }, e.what.replace(/https?:\/\/[^/]+/, '').slice(0, 48)));
+  });
+  return s;
+}
+function flows(l) {
+  const box = document.getElementById('flows'), by = new Map();
+  for (const e of l) if (e.flow) { if (!by.has(e.flow)) by.set(e.flow, []); by.get(e.flow).push(e); }
+  box.replaceChildren();
+  if (!by.size) { box.append(el('span', 'd', 'no SMS traffic yet')); return; }
+  for (const [id, steps] of [...by].reverse().slice(0, 6)) {
+    const d = el('div', 'flow'), failed = steps.some(isErr);
+    d.append(el('h3', failed ? 'bad' : 'ok', `${steps[0].kind || '?'} ${id} · ${hhmmss(steps[0].ts)} · ${failed ? 'error' : 'ok'}`), ladder(steps));
+    box.append(d);
+  }
+}
+
 async function tick() {
   let m, l, c;
   try { [m, l, c] = await Promise.all([get('metrics'), get('log?limit=200'), get('contexts')]); }
@@ -86,6 +122,7 @@ async function tick() {
       ['UE contexts', m.ueContexts], ['pending MT', m.pendingMt], ['uptime', upTxt]]) {
     const d = el('div'); d.append(el('b', cls, String(val)), el('span', null, label)); cards.append(d);
   }
+  flows(l);
   rows(document.getElementById('inb'), m.inbound);
   rows(document.getElementById('outb'), m.outbound);
 

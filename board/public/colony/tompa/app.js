@@ -43,6 +43,7 @@ function renderKpi(k) {
     tile('SMSF latency', l.avg == null ? '–' : `${l.avg} ms`, `avg · max ${l.max} ms · ${l.calls} calls`),
     tile('Deregistrations', `${k.deregistration.ok}/${k.deregistration.attempts}`, 'ok / attempts'),
     tile('NRF discovery', `${k.nrf.discoveries}`, `misses ${k.nrf.discoveryMisses} · HB failed ${k.nrf.heartbeatsFailed}`, k.nrf.discoveryMisses ? 'warn' : ''),
+    tile('Peer faults', `${k.peerFaults.distinct}`, Object.entries(k.peerFaults.byOwner).map(([o, n]) => `${o} ${n}`).join(' · ') || 'none seen', k.peerFaults.distinct ? 'bad' : 'ok'),
   );
   const causes = [
     ...Object.entries(r.causes).map(([c, n]) => [`activation: ${c}`, n]),
@@ -88,15 +89,28 @@ function renderLog(entries) {
     el('td', {}, e.peer),
     el('td', {}, `${e.method} ${e.path}`),
     el('td', { class: e.status >= 400 || e.status === 0 ? 'err' : '' }, e.status == null ? '' : e.status),
+    el('td', { class: e.diag ? `d-${e.diag.verdict}` : '' }, !e.diag ? '' : e.diag.verdict === 'ok' ? 'ok'
+      : e.diag.verdict === 'expected' ? `expected: ${e.diag.finding}` : `${e.diag.hop} @${e.diag.owner}: ${e.diag.finding}`),
   )));
+}
+
+function renderFaults(list) {
+  $('faults').replaceChildren(...(list.length
+    ? list.map(f => el('div', { class: 'fault' },
+      el('div', {}, el('b', {}, `@${f.owner}`), ` ${f.hop} ×${f.count}`),
+      el('div', {}, f.finding),
+      el('div', { class: 'meta' }, `expected: ${f.expected}`),
+      el('button', { onclick: () => navigator.clipboard && navigator.clipboard.writeText(f.report) }, 'copy report')))
+    : [el('div', { class: 'meta' }, 'no peer faults seen')]));
 }
 
 async function refresh() {
   try {
-    const [k, u, l] = await Promise.all([api('GET', '/kpi'), api('GET', '/ue'), api('GET', '/log')]);
+    const [k, u, l, f] = await Promise.all([api('GET', '/kpi'), api('GET', '/ue'), api('GET', '/log'), api('GET', '/faults')]);
     if (k.status === 200) renderKpi(k.body);
     if (u.status === 200) renderUes(u.body);
     if (l.status === 200) renderLog(l.body);
+    if (f.status === 200) renderFaults(f.body);
   } catch (e) {
     $('nrf').textContent = `backend unreachable: ${e.message}`;
     $('nrf').className = 'pill bad';

@@ -28,3 +28,6 @@ input, select { background: var(--bg); color: var(--fg); border: 1px solid #3441
 #inbox { list-style: none; padding: 0; margin: 0; font-size: 12px; } #inbox li { padding: 4px 0; border-bottom: 1px solid #263140; }
 #inbox .meta { color: var(--dim); font-size: 11px; }
 .in { color: var(--acc); } .out { color: var(--warn); }
+.fault { padding: 6px 0; border-bottom: 1px solid #263140; font-size: 12px; } .fault b { color: var(--bad); }
+.meta { color: var(--dim); font-size: 11px; }
+td.d-ok { color: var(--ok); } td.d-expected { color: var(--dim); } td.d-fault { color: var(--bad); white-space: normal; }

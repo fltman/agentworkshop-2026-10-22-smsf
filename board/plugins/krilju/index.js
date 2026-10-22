@@ -279,6 +279,22 @@ function prometheus() {
   return out.join('\n') + '\n';
 }
 
+function routeOf(method, path) {
+  if (/^\/nsmsf-sms\/v2\/ue-contexts\/[^/]+\/sendsms$/.test(path) && method === 'POST') return { name: 'UplinkSMS', peer: 'amf' };
+  if (/^\/nsmsf-sms\/v2\/ue-contexts\/[^/]+$/.test(path) && method === 'PUT') return { name: 'Activate', peer: 'amf' };
+  if (/^\/nsmsf-sms\/v2\/ue-contexts\/[^/]+$/.test(path) && method === 'DELETE') return { name: 'Deactivate', peer: 'amf' };
+  if (method === 'POST' && path === '/smsc/mt-forward-short-message') return { name: 'MT-Forward-Short-Message', peer: 'smsc' };
+  return null;
+}
+
+function prometheus() {
+  const out = [`smsf_uptime_seconds ${Math.round((Date.now() - startedAt) / 1000)}`,
+    `smsf_ue_contexts ${contexts.size}`, `smsf_registered_in_nrf ${registered ? 1 : 0}`, `smsf_pending_mt ${pendingMt.size}`];
+  for (const [k, v] of inbound) for (const [st, n] of Object.entries(v.byStatus)) out.push(`smsf_inbound_total{route="${k}",status="${st}"} ${n}`);
+  for (const [k, v] of outbound) for (const [st, n] of Object.entries(v.byStatus)) out.push(`smsf_outbound_total{peer="${k}",status="${st}"} ${n}`);
+  return out.join('\n') + '\n';
+}
+
 module.exports = {
   init() {
     const tick = () => {

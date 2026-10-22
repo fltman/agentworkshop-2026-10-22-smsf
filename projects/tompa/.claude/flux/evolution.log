@@ -1,2 +1,9 @@
 # FLUX Evolution Log
 2026-10-22 10:03 EXPLORE: b859479f "AMF + UE simulator" (3 timelines: α thin interop-first plugin, β spec-strict schema-validated, γ UE state machine + demo tile)
+2026-10-22 10:11 EVOLVE: b859479f-α gen-001 → gen-002 (68 provisional, +defensive 0.3, testing 0.6)
+2026-10-22 10:11 EVOLVE: b859479f-β gen-001 → gen-002 (66 provisional, scope cut: validate only own messages)
+2026-10-22 10:11 EVOLVE: b859479f-γ gen-001 → gen-002 (59 provisional, state machine first, tile deferred)
+2026-10-22 10:23 EVOLVE: b859479f-α gen-002 → gen-003 (68 → 83, defensive 0.4, testing 0.7)
+2026-10-22 10:23 EVOLVE: b859479f-β gen-002 → gen-003 (66 → 62, validator scoped to inbound peer payloads)
+2026-10-22 10:23 EVOLVE: b859479f-γ gen-002 → gen-003 (59 → 68, scenario runner on the tile)
+2026-10-22 10:24 SELECT: b859479f-α wins (fitness 83 vs γ 68, β 62), β and γ to the graveyard

@@ -17,6 +17,11 @@ const MISSED_HEARTBEATS_BEFORE_SUSPEND = 3;
 const DEFAULT_HEARTBEAT_TIMER = 30;
 const LOG_MAX = 300;
 const BODY_MAX = 1024 * 1024;
+// The board's own bots mention @smsf-hao when they report a release. Answering them is pure noise.
+const SYSTEM_SENDERS = ['release', 'colony', 'evolution', 'spore', 'lead', 'hub', 'news', 'radio'];
+// A test registration is not news. smoke.sh uses smoke-<epoch> ids.
+const TEST_ID = /^(smoke|test)-/i;
+const REPLY_COOLDOWN_MS = 10 * 60 * 1000;
 
 const st = {
   profiles: new Map(),   // nfInstanceId -> { profile, lastSeen, announced }
@@ -26,6 +31,7 @@ const st = {
   board: null,
   team: 'smsf-hao',
   started: new Date().toISOString(),
+  lastReply: 0,
   counters: { register: 0, update: 0, deregister: 0, discover: 0, rejected: 0 },
 };
 
@@ -314,6 +320,7 @@ function announce(entry) {
   entry.announced = true;
   save();
   const p = entry.profile;
+  if (TEST_ID.test(String(p.nfInstanceId))) return;   // smoke tests are not news
   const svc = (p.nfServices || []).map(s => s.serviceName).join(', ') || 'no nfServices listed';
   try {
     st.board.post(
@@ -379,8 +386,12 @@ module.exports = {
 
   onMessage(m, { board, team }) {
     if (m.from === team) return;
+    if (SYSTEM_SENDERS.includes(String(m.from).toLowerCase())) return;   // bots do not want an answer
     if (!new RegExp(`@${team}\\b`, 'i').test(m.text)) return;
-    const registered = [...st.profiles.values()].filter(e => e.profile.nfStatus === 'REGISTERED');
+    if (nowMs() - st.lastReply < REPLY_COOLDOWN_MS) return;              // one answer per 10 minutes, not per mention
+    st.lastReply = nowMs();
+    const registered = [...st.profiles.values()]
+      .filter(e => e.profile.nfStatus === 'REGISTERED' && !TEST_ID.test(String(e.profile.nfInstanceId)));
     const list = registered.map(e => normaliseType(e.profile.nfType)).sort().join(', ') || 'nobody yet';
     try {
       board.post(

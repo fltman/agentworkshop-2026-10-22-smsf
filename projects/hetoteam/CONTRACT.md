@@ -14,7 +14,7 @@ The UDM holds subscriber data, stores which SMSF serves a UE, and answers the SM
 
 ## Base URL and discovery
 
-- API root: `https://smsf.torget.bjarby.com/t/hetoteam` (this is the `apiPrefix` in our NRF profile).
+- API root: `https://smsf.torget.bjarby.com/t/hetoteam` (`apiRoot` in our NRF profile; `fqdn` + `apiPrefix` give the same).
 - Do not hardcode it: discover us through the NRF with `target-nf-type=UDM`.
 - HTTP/JSON. Success bodies are `application/json`. Errors are `application/problem+json` (`ProblemDetails`,
   TS 29.571): `{ "status": 404, "title": "...", "cause": "USER_NOT_FOUND", "detail": "..." }`.
@@ -196,14 +196,16 @@ MWD. Agreed with holminator in #build:
 
 ## 5. NRF registration (UDM → NRF)
 
-At startup the UDM registers with `PUT {nrf}/nnrf-nfm/v1/nf-instances/{nfInstanceId}` and sends heartbeats as the
-NRF tells it to. The NRF (smsf-hao) is found from the board, not hardcoded in other teams' code.
+At startup the UDM registers with `PUT {nrf}/nnrf-nfm/v1/nf-instances/{nfInstanceId}`. Heartbeat: `PATCH` with an
+empty JSON Patch `[]` (`application/json-patch+json`) at 80% of the `heartBeatTimer` the NRF returns. A 404 on the
+heartbeat triggers a new PUT. The NRF (smsf-hao) is found from the board, not hardcoded in other teams' code.
 
 ```json
 {
-  "nfInstanceId": "<uuid, stable across restarts>",
+  "nfInstanceId": "a1b2c3d4-0000-4000-8000-000068657465",
   "nfType": "UDM",
   "nfStatus": "REGISTERED",
+  "fqdn": "smsf.torget.bjarby.com",
   "plmnList": [{ "mcc": "001", "mnc": "01" }],
   "udmInfo": {
     "supiRanges": [{ "start": "001010000000000", "end": "001019999999999" }],
@@ -211,17 +213,21 @@ NRF tells it to. The NRF (smsf-hao) is found from the board, not hardcoded in ot
   },
   "nfServices": [
     { "serviceInstanceId": "nudm-uecm-1", "serviceName": "nudm-uecm", "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.0.0" }],
-      "scheme": "https", "nfServiceStatus": "REGISTERED", "apiPrefix": "https://smsf.torget.bjarby.com/t/hetoteam" },
+      "scheme": "https", "nfServiceStatus": "REGISTERED", "apiPrefix": "/t/hetoteam", "apiRoot": "https://smsf.torget.bjarby.com/t/hetoteam" },
     { "serviceInstanceId": "nudm-sdm-1", "serviceName": "nudm-sdm", "versions": [{ "apiVersionInUri": "v2", "apiFullVersion": "2.0.0" }],
-      "scheme": "https", "nfServiceStatus": "REGISTERED", "apiPrefix": "https://smsf.torget.bjarby.com/t/hetoteam" },
+      "scheme": "https", "nfServiceStatus": "REGISTERED", "apiPrefix": "/t/hetoteam", "apiRoot": "https://smsf.torget.bjarby.com/t/hetoteam" },
     { "serviceInstanceId": "sms-routing-1", "serviceName": "sms-routing", "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.0.0" }],
-      "scheme": "https", "nfServiceStatus": "REGISTERED", "apiPrefix": "https://smsf.torget.bjarby.com/t/hetoteam" }
+      "scheme": "https", "nfServiceStatus": "REGISTERED", "apiPrefix": "/t/hetoteam", "apiRoot": "https://smsf.torget.bjarby.com/t/hetoteam" }
   ]
 }
 ```
 
-`sms-routing` is a workshop-only service name for section 3 (not in TS 29.510). Every service has the same
-`apiPrefix`, so consumers that read `nfServices[0].apiPrefix` (as krilju does) get the right root.
+`sms-routing` is a workshop-only service name for section 3 (not in TS 29.510). As agreed with smsf-hao in #build:
+`fqdn` + path-style `apiPrefix` per TS 29.510, plus the explicit `apiRoot` on every service. Consumers should use
+`nfServices[0].apiRoot`.
+
+When the UDM discovers others (CUSTOM_SMSC) it takes `apiRoot`, then an absolute `apiPrefix`, then
+`scheme://fqdn[:port]apiPrefix`.
 
 ---
 
@@ -229,9 +235,27 @@ NRF tells it to. The NRF (smsf-hao) is found from the board, not hardcoded in ot
 
 | Method and path | What |
 | --- | --- |
+| `GET /t/hetoteam/status` | NF instance id, NRF registration state, counts |
+| `GET /t/hetoteam/metrics` | KPIs since plugin start (see below). `?format=prometheus` gives the Prometheus text format |
 | `GET /t/hetoteam/subscribers` | All provisioned subscribers and their SMS data |
 | `GET /t/hetoteam/registrations` | Current SMSF registrations and MWD lists |
-| `GET /t/hetoteam/log?since=<n>` | Incoming and outgoing messages, newest last: `{ id, ts, dir, peer, method, path, status, body }` |
+| `GET /t/hetoteam/log?since=<n>` | Incoming and outgoing messages, newest last: `{ id, ts, dir, peer, method, path, status, ms, request, response }` |
 | `POST /t/hetoteam/admin/reset` | Clear registrations and MWD (subscribers stay) |
 
-Tile with the live message log: `https://smsf.torget.bjarby.com/colony/hetoteam/`.
+`/metrics` returns `{ uptimeSec, since, kpi, ops, causes }`:
+- `kpi`:
+  - Subscribers and NRF: `provisionedSubscribers`, `activeRegistrations`, `mwdPending`, `nrfRegistered`,
+    `nrfHeartbeatAgeSec`.
+  - Traffic: `requestsIn`, `requestsOut`, `errorRateInPct`, `avgLatencyInMs`, `messagesLastMinute`.
+  - Success rates: `uecmRegisterSuccessPct`, `sdmSuccessPct`, `sriForSmSuccessPct`.
+  - SMS routing and alerts: `sriAbsentSubscriber`, `alertsSent`, `alertsOk`.
+- `ops`: per operation, `{ dir, total, ok, fail, successPct, avgMs, maxMs, lastStatus, lastTs, results }`.
+  - Incoming: `uecm_register`, `uecm_get`, `uecm_deregister`, `sdm_get`, `sri_for_sm`, `report_sm_delivery_status`.
+  - Outgoing: `nrf_register`, `nrf_heartbeat`, `nrf_discovery`, `alert_service_centre`.
+- `causes`: counts of `ProblemDetails.cause` or MAP `result` on every non-2xx answer.
+
+Tile with KPIs, operations, registrations, MWD and the latest log entries (expand a row to see request and response):
+`https://smsf.torget.bjarby.com/colony/hetoteam/`.
+
+Implementation: `board/plugins/hetoteam/index.js`. Local test with a fake NRF and SMSC, from the repo root:
+`node projects/hetoteam/test/udm.test.js`.

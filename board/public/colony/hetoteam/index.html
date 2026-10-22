@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hetoteam · UDM</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>hetoteam &middot; UDM <small>Nudm_UECM + Nudm_SDM (TS 29.503), SMS routing towards the SMSC</small></h1>
+  <div class="badges">
+    <span id="nrf" class="badge">NRF …</span>
+    <span id="uptime" class="badge dim">uptime …</span>
+    <span id="conn" class="badge dim">connecting…</span>
+  </div>
+</header>
+
+<section>
+  <h2>KPIs</h2>
+  <div class="kpis" id="kpis"></div>
+</section>
+
+<main>
+  <div class="col">
+    <section>
+      <h2>Operations</h2>
+      <table>
+        <thead><tr><th>operation</th><th>dir</th><th>total</th><th>ok</th><th>fail</th><th>success</th><th>avg ms</th><th>max ms</th><th>last</th></tr></thead>
+        <tbody id="ops"></tbody>
+      </table>
+      <div class="empty" id="ops-empty">No traffic yet.</div>
+    </section>
+
+    <section>
+      <h2>Error causes</h2>
+      <div class="chips" id="causes"></div>
+    </section>
+
+    <section>
+      <h2>SMSF registrations</h2>
+      <table>
+        <thead><tr><th>SUPI</th><th>SMSF</th><th>MAP address</th><th>registered</th></tr></thead>
+        <tbody id="regs"></tbody>
+      </table>
+      <div class="empty" id="regs-empty">No SMSF registered.</div>
+    </section>
+
+    <section>
+      <h2>Message waiting data</h2>
+      <table>
+        <thead><tr><th>SUPI</th><th>SC addresses</th><th>MNRF</th><th>MCEF</th></tr></thead>
+        <tbody id="mwd"></tbody>
+      </table>
+      <div class="empty" id="mwd-empty">No messages waiting.</div>
+    </section>
+  </div>
+
+  <section class="col">
+    <h2>Latest log entries <small id="logcount"></small></h2>
+    <div class="filters">
+      <label><input type="checkbox" id="f-in" checked> in</label>
+      <label><input type="checkbox" id="f-out" checked> out</label>
+      <label><input type="checkbox" id="f-note" checked> note</label>
+      <label><input type="checkbox" id="f-err"> errors only</label>
+    </div>
+    <ol class="log" id="log"></ol>
+    <div class="empty" id="log-empty">Nothing logged yet.</div>
+  </section>
+</main>
+
+<footer>
+  JSON: <a href="/t/hetoteam/metrics">/metrics</a> ·
+  <a href="/t/hetoteam/metrics?format=prometheus">prometheus</a> ·
+  <a href="/t/hetoteam/status">/status</a> ·
+  <a href="/t/hetoteam/registrations">/registrations</a> ·
+  <a href="/t/hetoteam/log">/log</a> ·
+  <a href="/t/hetoteam/subscribers">/subscribers</a>
+</footer>
+<script src="app.js"></script>
+</body>
+</html>

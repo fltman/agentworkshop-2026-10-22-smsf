@@ -144,7 +144,7 @@ await t('MO: valid SMS-SUBMIT is accepted, stored and answered with an RP-ACK SU
   const m = (await j('GET', '/api/messages')).body.find(x => x.id === r.body.messageId);
   assert.ok(m, 'not stored');
   assert.equal(m.direction, 'MO'); assert.equal(m.from, '46700000001'); assert.equal(m.to, '46700000002');
-  assert.equal(m.text, 'Hello'); assert.equal(m.mr, 10); assert.equal(m.history[0].event, 'ACCEPTED'); assert.ok(['PENDING', 'DELIVERING', 'WAITING'].includes(m.status), m.status); assert.equal(m.smsRecordId, 'r1');
+  assert.equal(m.text, 'Hello'); assert.equal(m.mr, 10); assert.equal(m.history[0].event, 'ACCEPTED'); assert.equal(m.status, 'FORWARDED'); assert.equal(m.history.at(-1).detail, 'simulated onward delivery to 46700000002'); assert.equal(m.smsRecordId, 'r1');
   const store = JSON.parse(fs.readFileSync(path.join(dataDir, 'store.json'), 'utf8'));
   assert.ok(store.messages.some(x => x.id === m.id), 'not persisted');
 });
@@ -268,6 +268,7 @@ await t('metrics count MO accepted/rejected, results per cause, per-peer traffic
   const m = (await j('GET', '/api/metrics')).body;
   const d = k => (m.counters[k] || 0) - (before.counters[k] || 0);
   assert.equal(d('mo_received'), 2); assert.equal(d('mo_accepted'), 1); assert.equal(d('mo_rejected'), 1);
+  assert.equal(d('mo_forwarded'), 1); assert.equal(d('mt_originated'), 0, 'an MO without SRR originates no MT');
   assert.equal(d('nrf_heartbeats_ok'), 1);
   const res = m.results['MO-Forward-Short-Message'];
   assert.ok(res.SUCCESS >= 1); assert.ok(res['SM_DELIVERY_FAILURE/UNKNOWN_SERVICE_CENTRE'] >= 1);
@@ -314,6 +315,35 @@ await t('codec: RP-ERROR cause is read, anything else gives null', () => {
   assert.equal(tpdu.rpErrorCause('04050116'), 22);
   assert.equal(tpdu.rpErrorCause('0305'), null);
   assert.equal(tpdu.rpErrorCause('zz'), null);
+});
+await t('codec: decodeAny reads RP-ACK/RP-ERROR and SUBMIT-/DELIVER-REPORT (live samples)', () => {
+  const sr = tpdu.decodeAny('010062012280055500').tpdu; // SMSC deliveryReport.hex, bare SUBMIT-REPORT for RP-ACK
+  assert.deepEqual([sr.type, sr.variant, sr.pi, sr.scts, sr.fcs], ['SMS-SUBMIT-REPORT', 'RP-ACK', 0, '2026-10-22T08:50:55.000Z', undefined]);
+  const ack = tpdu.decodeAny('03014109010062012280055500'); // SMSF->UE smsPayload: RP-ACK N->MS, MR 1, RP-User-Data
+  assert.deepEqual(ack.rp, { rpMessage: 'RP-ACK (N->MS)', rpRef: 1 });
+  assert.equal(ack.tpdu.type, 'SMS-SUBMIT-REPORT'); assert.equal(ack.tpdu.hex, '010062012280055500');
+  assert.deepEqual(tpdu.decodeAny('0301'), { rp: { rpMessage: 'RP-ACK (N->MS)', rpRef: 1 }, tpdu: null });
+  const date = new Date('2026-10-22T08:50:55Z');
+  const se = tpdu.decodeAny(tpdu.bytesToHex(tpdu.encodeSubmitReportError(tpdu.FCS.SC_BUSY, date))).tpdu;
+  assert.deepEqual([se.type, se.variant, se.fcs, se.fcsName, se.scts], ['SMS-SUBMIT-REPORT', 'RP-ERROR', 0xc0, 'SC_BUSY', date.toISOString()]);
+  assert.equal(tpdu.decodeAny(tpdu.bytesToHex(tpdu.encodeSubmitReportAck(date))).tpdu.variant, 'RP-ACK');
+  // RP-ERROR MS->N, MR 5, cause 22 + DELIVER-REPORT for RP-ERROR with FCS D0 and TP-PI=0.
+  const de = tpdu.decodeAny('04050116410300D000');
+  assert.deepEqual(de.rp, { rpMessage: 'RP-ERROR (MS->N)', rpRef: 5, rpCause: 22, rpCauseName: 'Memory capacity exceeded' });
+  assert.deepEqual([de.tpdu.type, de.tpdu.variant, de.tpdu.fcs, de.tpdu.pi], ['SMS-DELIVER-REPORT', 'RP-ERROR', 0xd0, 0]);
+  // RP-ERROR N->MS with diagnostic, no user data.
+  assert.deepEqual(tpdu.decodeAny('05090229FF').rp, { rpMessage: 'RP-ERROR (N->MS)', rpRef: 9, rpCause: 41, rpCauseName: 'Temporary failure', rpDiagnostic: 0xff });
+  // DELIVER-REPORT for RP-ACK with PID, DCS and 7-bit UD (TP-PI=07).
+  const dr = tpdu.decodeAny('0207410A0007000005C8329BFD06').tpdu;
+  assert.deepEqual([dr.type, dr.variant, dr.pid, dr.dcs, dr.udl, dr.text], ['SMS-DELIVER-REPORT', 'RP-ACK', 0, 0, 5, 'Hello']);
+  // Hints: kind forces the report reading, direction orders the attempts; plain SUBMIT/DELIVER still win without one.
+  assert.equal(tpdu.decodeAny('0000', { kind: 'deliver-report' }).tpdu.type, 'SMS-DELIVER-REPORT');
+  assert.equal(tpdu.decodeAny('010062012280055500', { direction: 'SC->MS' }).tpdu.type, 'SMS-SUBMIT-REPORT');
+  assert.equal(tpdu.decodeAny('01010B916407000000F2000005C8329BFD06').tpdu.type, 'SMS-SUBMIT');
+  const dl = tpdu.bytesToHex(tpdu.encodeDeliver({ from: '46700000001', text: 'Hi', date }));
+  assert.equal(dl.slice(0, 2), '04', 'DELIVER FO 0x04 looks like RP-ERROR MS->N by its low bits');
+  assert.equal(tpdu.decodeAny(dl).tpdu.type, 'SMS-DELIVER');
+  assert.throws(() => tpdu.decodeAny('0401'), /./);
 });
 
 const udmRules = {}; // msisdn -> [status, body] for SRI-for-SM
@@ -371,14 +401,14 @@ await t('MT: missing to or text is 400, text over one SM is 400', async () => {
   assert.equal((await j('POST', '/api/mt', { to: '46700000113' })).status, 400);
   assert.equal((await j('POST', '/api/mt', { to: '46700000113', text: 'x'.repeat(161) })).status, 400);
 });
-await t('MO is delivered as MT; TP-SRR gives a status report back with TP-ST 00, same MR, RA and SCTS as the SUBMIT-REPORT', async () => {
+await t('MO terminates at the SMSC (FORWARDED, no MT to TP-DA); TP-SRR gives a status report back with TP-ST 00, same MR, RA and SCTS as the SUBMIT-REPORT', async () => {
   const hex = tpdu.bytesToHex(tpdu.encodeSubmit({ mr: 77, to: '46700000114', text: 'with report', srr: true }));
   const mo = await j('POST', '/smsc/mo-forward-short-message', { msisdn: '46700000115', scAddress: '46700000100', sms: { hex } });
   assert.equal(mo.status, 200);
-  const m = await waitFor(async () => { const x = await msg(mo.body.messageId); return x.status === 'DELIVERED' && x.statusReportId && x; });
-  const deliver = tpdu.decodeDeliver(tpdu.hexToBytes(callsFor('46700000114', 'mt-forward')[0].body.sms.hex));
-  assert.deepEqual([deliver.oa, deliver.text, deliver.sri], ['46700000115', 'with report', true]);
+  const m = await waitFor(async () => { const x = await msg(mo.body.messageId); return x.status === 'FORWARDED' && x.statusReportId && x; });
+  assert.equal(callsFor('46700000114', '').length, 0, 'no SRI and no MT-Forward towards TP-DA');
   const sr = await waitFor(async () => { const x = await msg(m.statusReportId); return x.status === 'DELIVERED' && x; });
+  assert.deepEqual([sr.direction, sr.kind], ['MT', 'STATUS_REPORT']);
   const fwd = callsFor('46700000115', 'mt-forward');
   assert.equal(fwd.length, 1, 'the status report goes to the originator');
   assert.equal(callsFor('46700000115', 'send-routing-info')[0].body.smRpMti, 1, 'SRI for a status report has SM-RP-MTI 1');
@@ -412,7 +442,7 @@ await t('MT: UE answers RP-ERROR memory capacity exceeded -> MEMORY_CAPACITY_EXC
   assert.equal((await waitFor(() => callsFor('46700000118', 'report-sm-delivery-status')[0])).body.deliveryOutcome, 'MEMORY_CAPACITY_EXCEEDED');
 });
 await t('MT: other RP-ERROR -> FAILED; unknown, barred and not provisioned subscribers -> FAILED', async () => {
-  smsfRules['46700000119'] = [502, { result: 'FAILURE', deliveryReport: { hex: '0405016F' } }];
+  smsfRules['46700000119'] = [502, { result: 'FAILURE', deliveryReport: { hex: '04050115' } }]; // cause 21: permanent
   assert.equal((await j('POST', '/api/mt?wait=1', { to: '46700000119', text: 'x' })).body.result, 'FAILED');
   for (const [n, res, st] of [['46700000120', 'UNKNOWN_SUBSCRIBER', 404], ['46700000121', 'CALL_BARRED', 403], ['46700000122', 'TELESERVICE_NOT_PROVISIONED', 403]]) {
     udmRules[n] = [st, { result: res }];
@@ -421,14 +451,16 @@ await t('MT: other RP-ERROR -> FAILED; unknown, barred and not provisioned subsc
     assert.equal(callsFor(n, 'mt-forward').length, 0);
   }
 });
-await t('MO with TP-SRR to an unknown subscriber -> status report TP-ST 43 (not obtainable) to the originator', async () => {
+await t('MO with TP-SRR to an unknown subscriber: no SRI for TP-DA, FORWARDED, status report TP-ST 00 to the originator', async () => {
   udmRules['46799999999'] = [404, { result: 'UNKNOWN_SUBSCRIBER' }];
   const hex = tpdu.bytesToHex(tpdu.encodeSubmit({ mr: 5, to: '46799999999', text: 'nobody', srr: true }));
   const mo = await j('POST', '/smsc/mo-forward-short-message', { msisdn: '46700000123', sms: { hex } });
-  const m = await waitFor(async () => { const x = await msg(mo.body.messageId); return x.status === 'FAILED' && x.statusReportId && x; });
+  const m = await waitFor(async () => { const x = await msg(mo.body.messageId); return x.status === 'FORWARDED' && x.statusReportId && x; });
   await waitFor(async () => (await msg(m.statusReportId)).status === 'DELIVERED');
+  delete udmRules['46799999999'];
+  assert.equal(callsFor('46799999999', '').length, 0, 'the MO never looks up TP-DA');
   const rep = tpdu.decodeStatusReport(tpdu.hexToBytes(callsFor('46700000123', 'mt-forward')[0].body.sms.hex));
-  assert.deepEqual([rep.st, rep.mr, rep.ra], [0x43, 5, '46799999999']);
+  assert.deepEqual([rep.st, rep.mr, rep.ra], [0x00, 5, '46799999999']);
 });
 await t('MT: only one SMS-DELIVER outstanding per MS; TP-MMS says more are waiting; SCTS unique per MS', async () => {
   smsfRules['46700000124'] = async () => { await new Promise(r => setTimeout(r, 200)); return [200, { result: 'SUCCESS' }]; };
@@ -497,6 +529,485 @@ await t('GET /log: shared call-flow shape, newest first, paths without origin', 
   assert.ok(ans && !ans.path.startsWith('answer'), 'answers carry the operation as path');
   assert.equal((await j('GET', '/log?limit=2')).body.length, 2);
 });
+// ---------- observability: /kpi, /api/messages?limit&since, tile-marked /test/decode ----------
+await t('GET /kpi: common shape, requests and errors derived from answers and peer errors, extra from counters and store', async () => {
+  const k0 = (await j('GET', '/kpi')).body;
+  for (const f of ['nf', 'up', 'requests', 'errors', 'latencyMs', 'extra']) assert.ok(f in k0, `field ${f}`);
+  assert.equal(k0.nf, 'SMSC'); assert.equal(k0.up, true);
+  for (const f of ['requests', 'errors', 'latencyMs']) assert.equal(typeof k0[f], 'number', f);
+  assert.deepEqual(Object.keys(k0.extra).sort(), ['alerts_received', 'mo_accepted', 'mt_delivered', 'mt_failed', 'registeredInNrf', 'status_reports_sent', 'waiting']);
+  const m = (await j('GET', '/api/metrics')).body;
+  for (const f of ['mo_accepted', 'mt_delivered', 'mt_failed', 'status_reports_sent', 'alerts_received']) assert.equal(k0.extra[f], m.counters[f] || 0, f);
+  assert.equal(k0.extra.registeredInNrf, m.nrf.registered);
+  assert.equal(k0.extra.waiting, plugin._st.messages.filter(x => x.status === 'WAITING').length);
+  const ps = Object.values(m.peers);
+  const calls = ps.reduce((s, p) => s + p.calls, 0);
+  assert.ok(calls > 0);
+  assert.ok(Math.abs(k0.latencyMs - ps.reduce((s, p) => s + p.latencyMsSum, 0) / calls) <= 1, 'average outbound latency');
+  assert.ok(k0.errors >= ps.reduce((s, p) => s + p.errors, 0), 'outbound peer errors are included');
+  // one 200 answer and one 403 answer: requests +2, errors +1 (at least: background MT may add peer errors)
+  assert.equal((await j('POST', '/smsc/alert-service-centre', { msisdn: '46700000198', scAddress: SC })).status, 200);
+  assert.equal((await j('POST', '/smsc/mo-forward-short-message', moBody({ scAddress: '46799999999' }))).status, 403);
+  const k1 = (await j('GET', '/kpi')).body;
+  assert.equal(k1.requests - k0.requests, 2, 'inbound requests');
+  assert.ok(k1.errors - k0.errors >= 1, 'a 403 answer is an error');
+  const c1 = (await j('GET', '/api/metrics')).body.counters;
+  assert.equal(c1.answers_error - (m.counters.answers_error || 0), 1, 'only the 403 is an answer error');
+});
+await t('GET /api/messages: ?limit=N newest N oldest first, ?since=id and ?since=ISO, bad values are 400', async () => {
+  const ids = xs => xs.map(x => x.id);
+  const T = new Date().toISOString();
+  await new Promise(r => setTimeout(r, 5));
+  const mo = await j('POST', '/smsc/mo-forward-short-message', moBody({ sms: { hex: subHex({ mr: 77, to: '46700000197' }) } }));
+  assert.equal(mo.status, 200);
+  const all = await j('GET', '/api/messages');
+  assert.equal(all.status, 200); assert.ok(all.body.length >= 3);
+  assert.deepEqual(ids(all.body), ids(plugin._st.messages), 'no params: the whole store, oldest first');
+  const two = (await j('GET', '/api/messages?limit=2')).body;
+  assert.deepEqual(ids(two), ids(plugin._st.messages.slice(-2)), 'newest 2, oldest first');
+  const pivot = plugin._st.messages[plugin._st.messages.length - 3].id;
+  const after = (await j('GET', `/api/messages?since=${pivot}`)).body;
+  const seq = id => Number(id.replace('smsc-', ''));
+  assert.ok(after.length >= 2 && after.every(x => seq(x.id) > seq(pivot)), 'since=id: only newer ids');
+  assert.deepEqual(ids((await j('GET', `/api/messages?since=${seq(pivot)}`)).body), ids(after), 'bare number works too');
+  const upd = (await j('GET', `/api/messages?since=${encodeURIComponent(T)}`)).body;
+  assert.ok(upd.some(x => x.id === mo.body.messageId), 'the message accepted after T');
+  assert.ok(upd.every(x => x.history[x.history.length - 1].ts > T), 'every one updated after T');
+  assert.ok(upd.length < all.body.length, 'older untouched messages are left out');
+  assert.deepEqual((await j('GET', '/api/messages?since=2999-01-01T00:00:00Z')).body, []);
+  const comb = (await j('GET', '/api/messages?since=1970-01-01T00:00:00Z&limit=1')).body;
+  assert.deepEqual(ids(comb), ids(plugin._st.messages.slice(-1)));
+  for (const q of ['limit=0', 'limit=abc', 'limit=1.5', 'since=yesterday']) {
+    const r = await j('GET', `/api/messages?${q}`);
+    assert.equal(r.status, 400, q); assert.ok(r.body.error, q);
+  }
+});
+await t('POST /test/decode: tile calls (x-holminator-tile: 1) are not counted in test_requests, others are', async () => {
+  const count = async () => (await j('GET', '/api/metrics')).body.counters.test_requests || 0;
+  const hex = subHex();
+  const dec = headers => fetch(`${base}/test/decode`, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify({ hex }) });
+  const c0 = await count();
+  assert.equal((await dec({ 'x-holminator-tile': '1' })).status, 200);
+  assert.equal(await count(), c0, 'tile call not counted');
+  assert.equal((await dec({})).status, 200);
+  assert.equal(await count(), c0 + 1, 'external call counted');
+});
+await t('GET /test lists /kpi and the /api/messages params; the tile polls with ?limit= and marks its calls', async () => {
+  const c = (await j('GET', '/test')).body;
+  const kp = c.endpoints.find(e => e.path.endsWith('/kpi'));
+  assert.ok(kp && kp.method === 'GET');
+  assert.equal((await j('GET', kp.path.replace('/t/holminator', ''))).body.nf, 'SMSC');
+  const ms = c.endpoints.find(e => /\/api\/messages\?limit=/.test(e.path));
+  assert.ok(ms && /since/.test(ms.what));
+  assert.equal((await j('GET', ms.path.replace('/t/holminator', ''))).status, 200);
+  const app = fs.readFileSync(path.join(root, 'board/public/colony/holminator/app.js'), 'utf8');
+  assert.ok(/\/api\/messages\?limit=/.test(app), 'tile poll is bounded');
+  assert.ok(/'x-holminator-tile': '1'/.test(app), 'tile marks its calls');
+  assert.ok(!/innerHTML/.test(app.replace(/^\/\/.*$/gm, '')), 'no innerHTML in the tile');
+});
+// The tile's flow model and KPI cards are a pure block in app.js (between two marker comments): evaluate it alone.
+await t('tile: MO flow ends at the SMSC, MT flow runs SMSC->UDM->SMSF->AMF->UE with the absent path, KPIs split MO/MT', async () => {
+  const vm = await import('node:vm');
+  const app = fs.readFileSync(path.join(root, 'board/public/colony/holminator/app.js'), 'utf8');
+  const a = app.indexOf('// ---------- flow model (pure'), b = app.indexOf('// ---------- end flow model');
+  assert.ok(a >= 0 && b > a, 'pure flow model block present');
+  const ctx = vm.createContext({});
+  vm.runInContext(`${app.slice(a, b)};this.api={flowModel,kpiCards,srIdOf,flowKind};`, ctx);
+  const { flowModel, kpiCards, srIdOf } = ctx.api;
+  const names = f => f.nodes.map(n => n.nm).join('>');
+  const labels = f => f.nodes.map(n => `${n.edge || ''}|${n.back || ''}`).join(' ');
+
+  const mo = flowModel({ id: 'smsc-1', direction: 'MO', kind: 'SMS', status: 'FORWARDED', from: '46700000001', to: '46700000002', statusReportId: 'smsc-2', history: [{ event: 'ACCEPTED' }, { event: 'FORWARDED' }] });
+  assert.equal(mo.kind, 'MO');
+  assert.equal(names(mo), 'UE>AMF>SMSF>SMSC>onward', 'MO stops at the SMSC, no UDM/SRI');
+  assert.ok(!/SRI|MT-Forward/.test(labels(mo)), 'no SRI or MT-Forward on an MO');
+  assert.ok(/MO-Forward-SM/.test(labels(mo)) && /RP-ACK/.test(labels(mo)) && /SUBMIT-REPORT/.test(labels(mo)));
+  const end = mo.nodes[mo.nodes.length - 1];
+  assert.equal(end.end, true); assert.equal(end.st, 'done'); assert.match(end.edge, /simulated onward/);
+  assert.equal(mo.side, null);
+  assert.equal(flowModel({ direction: 'MO', kind: 'SMS', status: 'ACCEPTED' }).nodes.at(-1).st, 'active');
+  const moExp = flowModel({ direction: 'MO', kind: 'SMS', status: 'EXPIRED' }).nodes.at(-1);
+  assert.equal(moExp.st, 'fail'); assert.match(moExp.sub, /expired/);
+  assert.equal(srIdOf({ direction: 'MO', statusReportId: 'smsc-2' }), 'smsc-2');
+  assert.equal(srIdOf({ direction: 'MO', sr: { id: 'smsc-9' } }), 'smsc-9');
+
+  const h = (...ev) => ev.map(([event, detail]) => ({ event, detail }));
+  const ok = flowModel({ direction: 'MT', kind: 'SMS', status: 'DELIVERED', to: '46700000002',
+    history: h(['ACCEPTED'], ['DELIVERING'], ['SRI-for-SM', '200, imsi-1, serving SMSF x'], ['MT-Forward-Short-Message', '200 SUCCESS'], ['DELIVERED']) });
+  assert.equal(ok.kind, 'MT');
+  assert.equal(names(ok), 'SMSC>NRF>UDM>SMSF>AMF>UE');
+  assert.ok(ok.nodes.every(n => n.st === 'done'));
+  assert.equal(ok.nodes.at(-1).edge, 'SMS-DELIVER'); assert.match(ok.nodes.at(-1).back, /RP-ACK/);
+  assert.equal(ok.side.taken, false);
+
+  const rpErr = flowModel({ direction: 'MT', kind: 'SMS', status: 'FAILED', deliveryReportHex: '04', history: h(['DELIVERING'], ['SRI-for-SM', '200, x'], ['MT-Forward-Short-Message', '502 RP_ERROR'], ['FAILED']) });
+  assert.equal(rpErr.nodes.at(-1).back, 'RP-ERROR'); assert.equal(rpErr.nodes.at(-1).backSt, 'fail'); assert.equal(rpErr.nodes.at(-1).st, 'fail');
+
+  const absent = flowModel({ direction: 'MT', kind: 'SMS', status: 'PENDING', mwd: true,
+    history: h(['DELIVERING'], ['SRI-for-SM', '200, x'], ['MT-Forward-Short-Message', '404 ABSENT_SUBSCRIBER'], ['Report-SM-Delivery-Status', 'ABSENT_SUBSCRIBER: 200'], ['WAITING'], ['ALERT', 'Alert-Service-Centre UE_PRESENT'], ['PENDING']) });
+  assert.equal(absent.side.taken, true);
+  assert.equal(absent.side.nodes.slice(1).map(n => n.edge.split(' ')[0]).join(), 'ReportSM-DeliveryStatus,Alert-SC');
+  assert.equal(absent.side.nodes[2].est, 'done', 'Alert-SC received');
+  assert.equal(absent.side.nodes[2].st, 'active', 'redelivery due');
+
+  const sr = flowModel({ direction: 'MT', kind: 'STATUS_REPORT', status: 'PENDING', reportFor: 'smsc-1', history: [] });
+  assert.equal(sr.kind, 'MT'); assert.equal(sr.nodes.at(-1).edge, 'SMS-STATUS-REPORT');
+
+  const card = (cards, label) => cards.find(c => c.label === label);
+  const msgs = [{ direction: 'MO', kind: 'SMS', status: 'FORWARDED' }, { direction: 'MO', kind: 'SMS', status: 'FORWARDED' }, { direction: 'MT', kind: 'STATUS_REPORT', status: 'DELIVERED' }];
+  const old = kpiCards({ counters: { mo_accepted: 3, mt_originated: 5 } }, msgs);
+  assert.equal(card(old, 'MO received').v, 3, 'falls back to mo_accepted'); assert.ok(card(old, 'MO received').est);
+  assert.equal(card(old, 'MO forwarded').v, 2, 'falls back to the message window'); assert.ok(card(old, 'MO forwarded').est);
+  const cur = kpiCards({ counters: { mo_received: 4, mo_forwarded: 7, mt_originated: 1 }, messages: { total: 3 } }, msgs);
+  assert.equal(card(cur, 'MO received').v, 4); assert.equal(card(cur, 'MO forwarded').v, 7); assert.ok(!card(cur, 'MO forwarded').est);
+  assert.equal(card(cur, 'MT originated').v, 1); assert.equal(card(cur, 'MT originated').grp, 'MT');
+  assert.ok(cur.filter(c => c.grp === 'MT').every(c => !/^MO/.test(c.label)) && cur.filter(c => c.grp === 'MO').length === 2);
+  assert.doesNotThrow(() => kpiCards({}, null), 'missing metrics do not throw');
+  const subOf = (cards, label, what) => card(cards, label).subs.find(s => s[1] === what)[0];
+  const exact = kpiCards({ counters: { mo_received: 1, mo_forwarded: 1, mo_expired: 2, mt_attempts_exhausted: 3, mt_alert_fast_retries: 4 } }, []);
+  assert.equal(subOf(exact, 'MO forwarded', 'expired'), 2, 'mo_expired shown with MO');
+  assert.equal(subOf(exact, 'MT failed', 'attempts exhausted'), 3);
+  assert.equal(subOf(exact, 'MT waiting', 'fast retries'), 4);
+  const html = fs.readFileSync(path.join(root, 'board/public/colony/holminator/index.html'), 'utf8');
+  assert.match(html, /<form id="mtform"[\s\S]*name="singleShot"[\s\S]*<\/form>/, 'MT form offers singleShot');
+  assert.match(app, /singleShot: f\.singleShot\.checked/, 'POST /api/mt sends singleShot');
+});
+await t('POST /test/decode decodes RP-ACK with SUBMIT-REPORT and honours kind/direction hints', async () => {
+  const r = await j('POST', '/test/decode', { hex: '03014109010062012280055500' });
+  assert.equal(r.status, 200); assert.equal(r.body.rp.rpMessage, 'RP-ACK (N->MS)'); assert.equal(r.body.rp.rpRef, 1);
+  assert.equal(r.body.tpdu.type, 'SMS-SUBMIT-REPORT'); assert.equal(r.body.tpdu.scts, '2026-10-22T08:50:55.000Z');
+  const k = await j('POST', '/test/decode', { hex: '00D000', kind: 'SMS-DELIVER-REPORT' });
+  assert.equal(k.status, 200); assert.equal(k.body.tpdu.type, 'SMS-DELIVER-REPORT'); assert.equal(k.body.tpdu.fcs, 0xd0);
+  const e = await j('POST', '/test/decode', { hex: '0501011B' });
+  assert.equal(e.body.rp.rpCause, 27); assert.equal(e.body.rp.rpCauseName, 'Destination out of order'); assert.equal(e.body.tpdu, null);
+});
+// ---------- TP-VP absolute and enhanced (TS 23.040 9.2.3.12.2-3), stored submitHex ----------
+await t('codec: absolute TP-VP round trip with time zone, invalid digits give vpError', () => {
+  const time = '2030-01-02T03:04:05.000Z';
+  for (const tzMinutes of [0, 120, -180, 345]) {
+    const b = tpdu.encodeSubmit({ to: '1', text: 'x', vp: { type: 'absolute', time, tzMinutes } });
+    assert.equal((b[0] >> 3) & 3, 3, 'TP-VPF 11');
+    const s = tpdu.decodeSubmit(b);
+    assert.deepEqual([s.vpFormat, s.validUntil, s.vpError], ['absolute', time, undefined], `tz ${tzMinutes}`);
+  }
+  // 2030-01-02 03:04:05 at +02:00 is 01:04:05 UTC; TZ octet 0x80 = 8 quarter hours
+  assert.equal(tpdu.decodeSubmit(tpdu.encodeSubmit({ to: '1', text: 'x', vp: { type: 'raw', vpf: 3, hex: '03102030405080' } })).validUntil, '2030-01-02T01:04:05.000Z');
+  assert.ok(tpdu.decodeSubmit(tpdu.encodeSubmit({ to: '1', text: 'x', vp: { type: 'raw', vpf: 3, hex: '03F02030405000' } })).vpError, 'month F0');
+  assert.ok(tpdu.decodeSubmit(tpdu.encodeSubmit({ to: '1', text: 'x', vp: { type: 'raw', vpf: 3, hex: '03201330405000' } })).vpError, '31 Feb');
+});
+await t('codec: enhanced TP-VP formats, single-shot and extension bits; reserved values give vpError', () => {
+  const dec = vp => tpdu.decodeSubmit(tpdu.encodeSubmit({ to: '1', text: 'x', vp }));
+  assert.equal((tpdu.encodeSubmit({ to: '1', text: 'x', vp: { type: 'enhanced', format: 'seconds', value: 1 } })[0] >> 3) & 3, 1, 'TP-VPF 01');
+  assert.equal(dec({ type: 'enhanced', format: 'none' }).validityMs, null);
+  assert.equal(dec({ type: 'enhanced', format: 'relative', value: 0xa7 }).validityMs, 24 * 3600 * 1000);
+  assert.equal(dec({ type: 'enhanced', format: 'seconds', value: 30 }).validityMs, 30000);
+  assert.equal(dec({ type: 'enhanced', format: 'hhmmss', value: '01:02:03' }).validityMs, 3723000);
+  const ss = dec({ type: 'enhanced', format: 'seconds', value: 5, singleShot: true });
+  assert.deepEqual([ss.singleShot, ss.vpFormat, ss.vpError], [true, 'enhanced-seconds', undefined]);
+  assert.equal(dec({ type: 'enhanced', format: 'seconds', value: 5 }).singleShot, false);
+  for (const f of [4, 5, 6, 7]) assert.match(dec({ type: 'enhanced', format: f }).vpError, /reserved/, `format ${f}`);
+  assert.match(dec({ type: 'enhanced', format: 'seconds', value: 0 }).vpError, /0 seconds/);
+  assert.match(dec({ type: 'raw', vpf: 1, hex: '03109900000000' }).vpError, /HH:MM:SS/, '99 minutes');
+  // b7 extension: an all-zero extension octet is skipped, the value follows it; a set bit in it is reserved
+  assert.equal(dec({ type: 'raw', vpf: 1, hex: '82001E00000000' }).validityMs, 30000);
+  assert.match(dec({ type: 'raw', vpf: 1, hex: '82011E00000000' }).vpError, /extension/);
+});
+await t('MO: absolute TP-VP in the future sets expiresAt; submitHex is the original SMS-SUBMIT (bare and RP-wrapped)', async () => {
+  const time = new Date(Date.now() + 3 * 3600 * 1000); time.setUTCMilliseconds(0);
+  const hex = subHex({ mr: 150, to: '46700000250', vp: { type: 'absolute', time: time.toISOString(), tzMinutes: 60 } });
+  const r = await j('POST', '/smsc/mo-forward-short-message', moBody({ sms: { hex } }));
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  const m = await msg(r.body.messageId);
+  assert.equal(m.expiresAt, time.toISOString()); assert.equal(m.submitHex, hex); assert.equal(m.vpFormat, 'absolute');
+  const sub = tpdu.encodeSubmit({ mr: 151, to: '46700000250', text: 'wrapped' });
+  const r2 = await j('POST', '/smsc/mo-forward-short-message', moBody({ scAddress: undefined, sms: { hex: tpdu.bytesToHex(tpdu.wrapRpDataToNetwork({ ref: 9, scAddress: SC, tpdu: sub })) } }));
+  assert.equal((await msg(r2.body.messageId)).submitHex, tpdu.bytesToHex(sub), 'TPDU only, not the RP-DATA');
+});
+await t('MO: absolute TP-VP in the past and reserved enhanced TP-VP are 5555 + SUBMIT-REPORT FCS C7, nothing stored', async () => {
+  const before = (await j('GET', '/api/messages')).body.length;
+  const past = subHex({ mr: 152, to: '46700000251', vp: { type: 'absolute', time: new Date(Date.now() - 60000).toISOString() } });
+  const reserved = subHex({ mr: 153, to: '46700000251', vp: { type: 'enhanced', format: 5 } });
+  const zeroSecs = subHex({ mr: 154, to: '46700000251', vp: { type: 'enhanced', format: 'seconds', value: 0 } });
+  for (const hex of [past, reserved, zeroSecs]) {
+    for (const q of ['', '?dryRun=1']) {
+      const r = await j('POST', `/smsc/mo-forward-short-message${q}`, moBody({ sms: { hex } }));
+      assert.equal(r.status, 403, `${hex}${q}`); assert.equal(r.body.diameterResultCode, 5555);
+      assert.equal(r.body.smDeliveryFailureCause.smEnumeratedDeliveryFailureCause, 'EQUIPMENT_PROTOCOL_ERROR');
+      const rep = report(r.body.deliveryReport.hex);
+      assert.equal(rep[0], 0x01); assert.equal(rep[1], 0xc7, 'TP-FCS TP-VP not supported');
+      assert.match(r.body.detail, /TP-VP not supported/);
+    }
+  }
+  assert.equal((await j('GET', '/api/messages')).body.length, before);
+});
+await t('MO: enhanced TP-VP seconds sets expiresAt on the FORWARDED MO; an /api/mt with that validity expires on the next attempt', async () => {
+  const hex = subHex({ mr: 155, to: '46700000252', vp: { type: 'enhanced', format: 'seconds', value: 1 } });
+  const r0 = await j('POST', '/smsc/mo-forward-short-message', moBody({ sms: { hex } }));
+  assert.equal(r0.status, 200, JSON.stringify(r0.body));
+  const mo = await msg(r0.body.messageId);
+  assert.equal(mo.status, 'FORWARDED'); assert.equal(Date.parse(mo.expiresAt) - Date.parse(mo.submittedAt), 1000);
+  udmRules['46700000252'] = [404, { result: 'ABSENT_SUBSCRIBER_SM', diameterResultCode: 5550 }];
+  const r = await j('POST', '/api/mt?wait=1', { to: '46700000252', text: 'x', validitySeconds: 1 });
+  const m = await waitFor(async () => { const x = await msg(r.body.messageId); return x.status === 'WAITING' && x; });
+  assert.equal(Date.parse(m.expiresAt) - Date.parse(m.submittedAt), 1000);
+  delete udmRules['46700000252'];
+  await new Promise(res => setTimeout(res, 1100));
+  await j('POST', '/smsc/alert-service-centre', { msisdn: '46700000252', scAddress: SC, alertReason: 'UE_PRESENT' });
+  await waitFor(async () => (await msg(r.body.messageId)).status === 'EXPIRED');
+  assert.equal(callsFor('46700000252', 'mt-forward').length, 0, 'never forwarded after expiry');
+});
+await t('single-shot: the MO keeps the TP-VP b6 flag; an /api/mt with singleShot gets one attempt, then FAILED instead of WAITING', async () => {
+  const hex = subHex({ mr: 156, to: '46700000253', vp: { type: 'enhanced', format: 'hhmmss', value: '01:00:00', singleShot: true } });
+  const r0 = await j('POST', '/smsc/mo-forward-short-message', moBody({ sms: { hex } }));
+  assert.equal(r0.status, 200, JSON.stringify(r0.body));
+  const mo = await msg(r0.body.messageId);
+  assert.equal(mo.singleShot, true); assert.equal(mo.status, 'FORWARDED');
+  assert.equal(Date.parse(mo.expiresAt) - Date.parse(mo.submittedAt), 3600 * 1000);
+  udmRules['46700000253'] = [404, { result: 'ABSENT_SUBSCRIBER_SM', diameterResultCode: 5550 }];
+  const r = await j('POST', '/api/mt?wait=1', { to: '46700000253', text: 'x', singleShot: true });
+  const m = await waitFor(async () => { const x = await msg(r.body.messageId); return ['FAILED', 'WAITING'].includes(x.status) && x; });
+  delete udmRules['46700000253'];
+  assert.equal(m.status, 'FAILED'); assert.equal(m.singleShot, true); assert.equal(m.attempts, 1);
+  assert.match(m.failure, /single-shot/);
+});
+await t('POST /test/encode builds SMS-SUBMIT with absolute and enhanced TP-VP; bad vp is 400', async () => {
+  const time = '2031-05-06T07:08:09.000Z';
+  const a = await j('POST', '/test/encode', { type: 'SUBMIT', to: '46700000002', text: 'Hi', vp: { type: 'absolute', time, tzMinutes: -60 } });
+  assert.equal(a.status, 200, JSON.stringify(a.body));
+  assert.equal(tpdu.decodeSubmit(tpdu.hexToBytes(a.body.tpduHex)).validUntil, time);
+  const e = await j('POST', '/test/encode', { type: 'SUBMIT', to: '46700000002', text: 'Hi', vp: { type: 'enhanced', format: 'seconds', value: 90, singleShot: true } });
+  const s = tpdu.decodeSubmit(tpdu.hexToBytes(e.body.tpduHex));
+  assert.deepEqual([s.vpf, s.validityMs, s.singleShot], [1, 90000, true]);
+  assert.equal((await j('POST', '/test/encode', { type: 'SUBMIT', to: '1', text: 'x', vp: 167 })).status, 200);
+  assert.equal((await j('POST', '/test/encode', { type: 'SUBMIT', to: '1', text: 'x', vp: { type: 'weird' } })).status, 400);
+});
+
+// ---------- Alert grace delay and one fast retry (alert raced the SMSF's UECM registration) ----------
+{
+  const T = plugin._internals.TIMING;
+  const saved = { ...T };
+  T.ALERT_GRACE_MS = 300; T.ALERT_FAST_RETRY_MS = 400;
+  const parkWaiting = async to => {
+    udmRules[to] = [404, { result: 'ABSENT_SUBSCRIBER_SM', diameterResultCode: 5550 }];
+    const r = await j('POST', '/api/mt?wait=1', { to, text: 'after alert' });
+    assert.equal(r.body.result, 'WAITING');
+    delete udmRules[to];
+    return r.body.messageId;
+  };
+  await t('alert: redelivery waits for the grace delay, the 200 comes right away', async () => {
+    const to = '46700000261', id = await parkWaiting(to);
+    const t0 = Date.now();
+    const a = await j('POST', '/smsc/alert-service-centre', { msisdn: to, scAddress: SC, alertReason: 'UE_PRESENT' });
+    assert.equal(a.status, 200); assert.deepEqual(a.body.redelivering, [id]);
+    assert.ok(Date.now() - t0 < 250, 'alert answer must not wait for the grace delay');
+    assert.equal((await msg(id)).status, 'WAITING');
+    await waitFor(async () => (await msg(id)).status === 'DELIVERED');
+    const fwd = callsFor(to, 'mt-forward');
+    assert.equal(fwd.length, 1);
+    assert.ok(fwd[0].at - t0 >= 300, `MT-Forward ${fwd[0].at - t0} ms after the alert, grace is 300 ms`);
+  });
+  await t('alert: SMSF 404 UNKNOWN_SUBSCRIBER once, then 200 -> DELIVERED via one fast retry', async () => {
+    const to = '46700000262', id = await parkWaiting(to);
+    let n = 0;
+    smsfRules[to] = async () => (++n === 1 ? [404, { result: 'UNKNOWN_SUBSCRIBER' }] : [200, { result: 'SUCCESS' }]);
+    await j('POST', '/smsc/alert-service-centre', { msisdn: to, scAddress: SC, alertReason: 'UE_PRESENT' });
+    const m = await waitFor(async () => { const x = await msg(id); return x.status === 'DELIVERED' && x; });
+    delete smsfRules[to];
+    const fwd = callsFor(to, 'mt-forward');
+    assert.equal(fwd.length, 2);
+    assert.ok(fwd[1].at - fwd[0].at >= 400, 'the fast retry waits ALERT_FAST_RETRY_MS');
+    assert.ok(m.history.some(h => /fast retry/.test(h.detail || '')), 'history must say why');
+    const reps = callsFor(to, 'report-sm-delivery-status').map(c => c.body.deliveryOutcome);
+    assert.ok(!reps.includes('ABSENT_SUBSCRIBER'), 'no ABSENT_SUBSCRIBER report when the fast retry succeeds');
+  });
+  await t('alert: SMSF stays absent -> exactly one fast retry, then ABSENT_SUBSCRIBER and WAITING, no loop', async () => {
+    const to = '46700000263', id = await parkWaiting(to);
+    smsfRules[to] = [504, { result: 'ABSENT_SUBSCRIBER' }];
+    await j('POST', '/smsc/alert-service-centre', { msisdn: to, scAddress: SC, alertReason: 'UE_PRESENT' });
+    await waitFor(() => callsFor(to, 'report-sm-delivery-status').some(c => c.body.deliveryOutcome === 'ABSENT_SUBSCRIBER'));
+    await new Promise(r => setTimeout(r, 1200)); // three more fast-retry periods: a loop would show here
+    const m = await msg(id);
+    delete smsfRules[to];
+    assert.equal(m.status, 'WAITING');
+    assert.equal(callsFor(to, 'mt-forward').length, 2, 'one alert-triggered attempt plus exactly one fast retry');
+    assert.equal(callsFor(to, 'report-sm-delivery-status').filter(c => c.body.deliveryOutcome === 'ABSENT_SUBSCRIBER').length, 1);
+    assert.ok(Date.parse(m.nextRetryAt) - Date.now() > 60000, 'back to the slow fallback, waiting for the next alert');
+  });
+  await t('non-alert attempt: SMSF absent reports ABSENT_SUBSCRIBER at once, no fast retry', async () => {
+    const to = '46700000264';
+    smsfRules[to] = [404, { result: 'UNKNOWN_SUBSCRIBER' }];
+    const r = await j('POST', '/api/mt?wait=1', { to, text: 'x' });
+    await new Promise(res => setTimeout(res, 600));
+    delete smsfRules[to];
+    assert.equal(r.body.result, 'WAITING');
+    assert.equal(callsFor(to, 'mt-forward').length, 1);
+    assert.equal(callsFor(to, 'report-sm-delivery-status')[0].body.deliveryOutcome, 'ABSENT_SUBSCRIBER');
+  });
+  Object.assign(T, saved);
+}
+
+// ---------- Store-and-forward: restart requeue, temporary RP-ERROR causes, attempt cap ----------
+{
+  const forceDue = id => {
+    const m = plugin._st.messages.find(x => x.id === id);
+    m.nextRetryAt = new Date(Date.now() - 1).toISOString();
+    plugin._internals.sweep();
+  };
+  const rpErr = cause => [502, { result: 'FAILURE', cause: 'UE answered RP-ERROR', deliveryReport: { hex: `040501${cause.toString(16).padStart(2, '0')}` } }];
+
+  await t('RP-ERROR temporary causes 41, 42, 47, 111 -> WAITING with backoff, not FAILED; then delivered on retry', async () => {
+    for (const [i, cause] of [[1, 41], [2, 42], [3, 47], [4, 111]]) {
+      const to = `4670000028${i}`;
+      smsfRules[to] = rpErr(cause);
+      const r = await j('POST', '/api/mt?wait=1', { to, text: 'x' });
+      assert.equal(r.body.result, 'WAITING', `cause ${cause}`);
+      const m = await msg(r.body.messageId);
+      assert.ok(Date.parse(m.nextRetryAt) - Date.now() > 20000, `cause ${cause}: backoff, not immediate`);
+      assert.match(m.history.at(-1).detail, new RegExp(`cause ${cause} \\(temporary\\)`));
+      delete smsfRules[to];
+      forceDue(r.body.messageId);
+      await waitFor(async () => (await msg(r.body.messageId)).status === 'DELIVERED');
+    }
+  });
+  await t('RP-ERROR permanent causes 21, 95, 96, 97, 98, 99 -> FAILED at once', async () => {
+    for (const cause of [21, 95, 96, 97, 98, 99]) {
+      const to = `467000002${90 + (cause % 10)}`;
+      smsfRules[to] = rpErr(cause);
+      const r = await j('POST', '/api/mt?wait=1', { to, text: 'x' });
+      delete smsfRules[to];
+      assert.equal(r.body.result, 'FAILED', `cause ${cause}`);
+      assert.equal(callsFor(to, 'mt-forward').length, 1);
+    }
+  });
+  await t('attempt cap: temporary RP-ERROR forever -> FAILED after MAX_ATTEMPTS', async () => {
+    const L = plugin._internals.MT_LIMITS, saved = L.MAX_ATTEMPTS;
+    L.MAX_ATTEMPTS = 3;
+    try {
+      const to = '46700000301';
+      smsfRules[to] = rpErr(111);
+      const id = (await j('POST', '/api/mt', { to, text: 'garbled' })).body.messageId;
+      for (let n = 1; n < 3; n++) {
+        await waitFor(async () => { const x = await msg(id); return x.status === 'WAITING' && x.attempts === n; });
+        forceDue(id);
+      }
+      const m = await waitFor(async () => { const x = await msg(id); return x.status === 'FAILED' && x; });
+      delete smsfRules[to];
+      assert.equal(m.attempts, 3); assert.equal(callsFor(to, 'mt-forward').length, 3);
+      assert.match(m.failure, /giving up after 3 attempts/);
+      assert.equal(m.statusReportId, undefined, 'an /api/mt has no originator to report to');
+    } finally { L.MAX_ATTEMPTS = saved; }
+  });
+  await t('502 FAILURE without a deliveryReport keeps the backoff, even after an earlier RP-ERROR 22', async () => {
+    const to = '46700000302';
+    let n = 0;
+    smsfRules[to] = async () => (++n === 1 ? rpErr(22) : [502, { result: 'FAILURE', cause: 'no answer from the UE' }]);
+    const r = await j('POST', '/api/mt?wait=1', { to, text: 'x' });
+    assert.equal(r.body.result, 'WAITING');
+    forceDue(r.body.messageId);
+    const m = await waitFor(async () => { const x = await msg(r.body.messageId); return x.status === 'WAITING' && x.attempts === 2 && x; });
+    delete smsfRules[to];
+    assert.match(m.history.at(-1).detail, /MT-Forward failed \(502 FAILURE\); retry in/);
+    assert.equal(callsFor(to, 'report-sm-delivery-status').filter(c => c.body.deliveryOutcome === 'MEMORY_CAPACITY_EXCEEDED').length, 1);
+  });
+
+  await t('restart: MO ACCEPTED -> FORWARDED (+ status report if SRR), never MT; MT ACCEPTED/PENDING delivered once; expired EXPIRE; WAITING waits', async () => {
+    const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'holminator-restart-'));
+    const now = Date.now(), iso = ms => new Date(now + ms).toISOString();
+    const base = (id, direction, status, to, extra = {}) => ({
+      id, direction, kind: 'SMS', status, from: direction === 'MO' ? '46700000310' : SC, to, text: `restart ${id}`, mr: 40 + Number(id.slice(5)),
+      srr: false, submittedAt: iso(-60000), expiresAt: iso(3600000), history: [{ ts: iso(-60000), event: status }], ...extra,
+    });
+    fs.writeFileSync(path.join(dir2, 'store.json'), JSON.stringify({ msgSeq: 8, messages: [
+      base('smsc-1', 'MO', 'ACCEPTED', '46700000311'),
+      base('smsc-2', 'MT', 'PENDING', '46700000312'),
+      base('smsc-3', 'MO', 'ACCEPTED', '46700000313', { from: '46700000314', srr: true, expiresAt: iso(-1000) }),
+      base('smsc-4', 'MT', 'WAITING', '46700000315', { attempts: 1, nextRetryAt: iso(600000), mwd: true }),
+      base('smsc-5', 'MT', 'WAITING', '46700000316', { attempts: 1, nextRetryAt: iso(-1000) }),
+      base('smsc-6', 'MO', 'ACCEPTED', '46700000318', { from: '46700000317', srr: true }),
+      base('smsc-7', 'MO', 'WAITING', '46700000319', { attempts: 1, nextRetryAt: iso(-1000) }), // left by the old MO-to-MT relay
+      base('smsc-8', 'MT', 'ACCEPTED', '46700000320'),
+    ] }));
+    const modPath = path.join(root, 'board/plugins/holminator/index.js');
+    const cached = require.cache[require.resolve(modPath)];
+    delete require.cache[require.resolve(modPath)];
+    const p2 = require(modPath); // a fresh instance with its own state, like a restarted process
+    require.cache[require.resolve(modPath)] = cached;
+    try {
+      p2.init({ dataDir: dir2 });
+      const get = id => p2._st.messages.find(m => m.id === id);
+      assert.equal(get('smsc-1').status, 'FORWARDED'); assert.equal(get('smsc-1').history.at(-1).detail, 'simulated onward delivery to 46700000311');
+      assert.equal(get('smsc-7').status, 'FORWARDED', 'an old relay MO is not delivered as MT');
+      await waitFor(() => get('smsc-2').status === 'DELIVERED' && get('smsc-8').status === 'DELIVERED');
+      assert.equal(get('smsc-3').status, 'EXPIRED');
+      const sr = await waitFor(() => { const x = get(get('smsc-3').statusReportId || ''); return x && x.status === 'DELIVERED' && x; });
+      assert.equal(tpdu.decodeStatusReport(tpdu.hexToBytes(callsFor('46700000314', 'mt-forward')[0].body.sms.hex)).st, 0x46);
+      assert.equal(sr.to, '46700000314');
+      const sr6 = await waitFor(() => { const x = get(get('smsc-6').statusReportId || ''); return x && x.status === 'DELIVERED' && x; });
+      assert.deepEqual([sr6.direction, sr6.kind, sr6.to, sr6.st], ['MT', 'STATUS_REPORT', '46700000317', 0x00]);
+      await new Promise(r => setTimeout(r, 300));
+      for (const to of ['46700000311', '46700000313', '46700000318', '46700000319']) assert.equal(callsFor(to, '').length, 0, `MO to ${to}: no SRI, no MT-Forward`);
+      assert.equal(callsFor('46700000317', 'mt-forward').length, 1, 'exactly one status report');
+      assert.equal(callsFor('46700000312', 'mt-forward').length, 1, 'PENDING MT: exactly one MT-Forward');
+      assert.equal(callsFor('46700000320', 'mt-forward').length, 1, 'ACCEPTED MT: exactly one MT-Forward');
+      assert.equal(get('smsc-4').status, 'WAITING'); assert.equal(callsFor('46700000315', '').length, 0, 'WAITING waits for the alert');
+      assert.equal(get('smsc-5').status, 'WAITING', 'due fallback goes on the sweep, not at init');
+      p2._internals.sweep();
+      await waitFor(() => get('smsc-5').status === 'DELIVERED');
+      assert.equal(get('smsc-4').status, 'WAITING', 'fallback not yet due');
+      const saved = JSON.parse(fs.readFileSync(path.join(dir2, 'store.json'), 'utf8'));
+      assert.equal(saved.messages.find(m => m.id === 'smsc-4').nextRetryAt, get('smsc-4').nextRetryAt, 'fallback timer is in the store');
+      assert.ok(p2._st.messages.every(m => m.direction === 'MO' || m.direction === 'MT'), 'every record has a direction');
+    } finally {
+      for (const tm of p2._st.timers) clearInterval(tm);
+      fs.rmSync(dir2, { recursive: true, force: true });
+    }
+  });
+}
+
+// ---------- MO terminates at the SMSC; MT only from /api/mt and status reports ----------
+await t('MO: no SRI and no MT-Forward for any MO, status FORWARDED with direction MO', async () => {
+  const before = peerCalls.length;
+  const r = await j('POST', '/smsc/mo-forward-short-message', moBody({ msisdn: '46700000330', sms: { hex: subHex({ mr: 201, to: '46700000331' }) } }));
+  assert.equal(r.status, 200); assert.equal(r.body.result, 'SUCCESS');
+  assert.equal(report(r.body.deliveryReport.hex)[0], 0x01, 'RP-ACK SUBMIT-REPORT');
+  await new Promise(res => setTimeout(res, 300));
+  const m = await msg(r.body.messageId);
+  assert.deepEqual([m.direction, m.kind, m.status], ['MO', 'SMS', 'FORWARDED']);
+  assert.ok(m.forwardedAt);
+  assert.equal(m.history.at(-1).detail, 'simulated onward delivery to 46700000331');
+  const mine = peerCalls.slice(before).filter(c => ['46700000330', '46700000331'].includes(c.body.msisdn));
+  assert.deepEqual(mine.map(c => c.path), [], 'no UDM or SMSF call for an MO without SRR');
+  assert.equal(m.attempts, undefined, 'never attempted as MT');
+});
+await t('MO + TP-SRR: exactly one STATUS_REPORT MT record, delivered over SRI + MT-Forward to the originator', async () => {
+  const r = await j('POST', '/smsc/mo-forward-short-message', moBody({ msisdn: '46700000332', sms: { hex: subHex({ mr: 202, to: '46700000333', srr: true }) } }));
+  const m = await waitFor(async () => { const x = await msg(r.body.messageId); return x.statusReportId && x; });
+  await waitFor(async () => (await msg(m.statusReportId)).status === 'DELIVERED');
+  await new Promise(res => setTimeout(res, 300));
+  const srs = plugin._st.messages.filter(x => x.reportFor === m.id);
+  assert.equal(srs.length, 1, 'one status report record');
+  assert.deepEqual([srs[0].direction, srs[0].kind, srs[0].to, srs[0].st], ['MT', 'STATUS_REPORT', '46700000332', 0x00]);
+  assert.equal(callsFor('46700000332', 'send-routing-info').length, 1);
+  assert.equal(callsFor('46700000332', 'mt-forward').length, 1);
+  assert.equal(callsFor('46700000333', '').length, 0, 'nothing towards TP-DA');
+});
+await t('metrics: MO counted as mo_received/mo_accepted/mo_forwarded; mt_originated only for /api/mt and status reports', async () => {
+  const c0 = (await j('GET', '/api/metrics')).body.counters;
+  await j('POST', '/smsc/mo-forward-short-message', moBody({ sms: { hex: subHex({ mr: 203, to: '46700000334' }) } }));
+  await j('POST', '/smsc/mo-forward-short-message', moBody({ msisdn: '46700000335', sms: { hex: subHex({ mr: 204, to: '46700000336', srr: true }) } }));
+  await j('POST', '/api/mt?wait=1', { to: '46700000337', text: 'generator' });
+  await waitFor(() => callsFor('46700000335', 'mt-forward').length === 1);
+  const c1 = (await j('GET', '/api/metrics')).body.counters;
+  const d = k => (c1[k] || 0) - (c0[k] || 0);
+  assert.deepEqual([d('mo_received'), d('mo_accepted'), d('mo_forwarded')], [2, 2, 2]);
+  assert.equal(d('status_reports_generated'), 1);
+  assert.equal(d('mt_originated'), 2, 'one /api/mt plus one status report, no MT for the MOs');
+  const all = (await j('GET', '/api/messages')).body;
+  assert.ok(all.every(x => x.direction === 'MO' || x.direction === 'MT'), 'every record has an explicit direction');
+  assert.ok(all.filter(x => x.direction === 'MT').every(x => x.kind === 'STATUS_REPORT' || x.history[0].detail.startsWith('originated by the SC API')), 'MT only from /api/mt or status reports');
+  assert.ok(all.filter(x => x.direction === 'MO').every(x => !x.attempts), 'no MO was ever attempted as MT');
+});
+
 srv.close(); fake.close();
 for (const tm of plugin._st.timers) clearInterval(tm);
 fs.rmSync(dataDir, { recursive: true, force: true });

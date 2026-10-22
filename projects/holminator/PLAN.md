@@ -52,10 +52,10 @@ CALL_BARRED, FAILURE (5555). The Diameter code goes in `diameterResultCode` wher
 
 ## Flows
 
-1. **MO:** SMSF sends MO forward with the SMS-SUBMIT. We store it and answer 2001. If the recipient is one of
-   our test subscribers, we originate it as MT to them (UE to UE).
-2. **MT:** trigger or MO, then SRI-for-SM to UDM (found via NRF), then MT forward to the SMSF it returned. We get the
-   delivery result back in the answer, set the message status, and send a status report to the originator if it asked for one.
+1. **MO:** SMSF sends MO forward with the SMS-SUBMIT. We store it, answer 2001 with RP-ACK, and the MO terminates
+   here as FORWARDED (simulated onward delivery, no MT). With TP-SRR we send a status report MT back to the originator.
+2. **MT:** generator (`POST /api/mt`) or a status report, then SRI-for-SM to UDM (found via NRF), then MT forward to the SMSF it returned. We get the
+   delivery result back in the answer and set the message status.
 3. **Errors:** UDM unknown subscriber gives 5001; SMS not allowed gives 5556/5557; UE not reachable from SMSF gives 5550.
    All are visible in the log and the tile.
 4. **Stretch:** on 5550 we keep the message, tell UDM (Report-SM-Delivery-Status, message waiting), and redeliver
@@ -77,7 +77,7 @@ CALL_BARRED, FAILURE (5555). The Diameter code goes in `diameterResultCode` wher
 | 2 ✅ code, interop pending | MO forward endpoint: validation, SC address, TP-RD duplicates, TP-VP expiry, SUBMIT-REPORT on ACK and error | smsc-sgd-service, sms-tpdu-codec | krilju's SMSF gets 2001 from us |
 | 2a ✅ | Metrics (/api/metrics, /metrics), test surface (/test, ?dryRun, ?scenario, /test/encode, /test/decode), tile with metrics, store, log, test console | smsc-sgd-service | other teams can test against us without us |
 | 3 ✅ code, interop pending | MT: trigger, SRI to UDM, MT forward to SMSF, status reports, one in flight per MS | smsc-sgd-service | an MT SMS reaches tompa's UE |
-| 4 | Error cases, mapped result codes; absolute and enhanced TP-VP (C6/C7, SPEC-NOTES 7-9) | smsc-sgd-service | unknown, not allowed, absent all shown |
+| 4 ✅ | Error cases, mapped result codes; absolute and enhanced TP-VP (C6/C7, SPEC-NOTES 7-9), single-shot, submitHex on MO records | smsc-sgd-service | unknown, not allowed, absent all shown |
 | 5 ✅ | Tile (store, log, send form; textContent only) | smsc-sgd-service | usable in demo |
 | 6 ✅ | Stretch: store-and-forward plus alert, retry backoff, expiry | smsc-sgd-service | redelivery after re-register (seen locally with all five plugins) |
 | 7 | Demo script end to end | smsc-interop-contract | runs registration, MO, MT across all NFs |

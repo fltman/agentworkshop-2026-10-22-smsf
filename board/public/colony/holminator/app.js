@@ -12,15 +12,16 @@ const hhmmss = ts => { const d = new Date(ts); return isNaN(d) ? String(ts || ''
 const secs = ms => { const s = Math.round(Math.abs(ms) / 1000); return s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 60)}m` : `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m`; };
 const ago = ts => ts ? `${secs(Date.now() - Date.parse(ts))} ago` : 'never';
 const until = ts => { const ms = Date.parse(ts) - Date.now(); return ms > 0 ? `in ${secs(ms)}` : 'due'; };
-const short = (s, n = 8) => { s = String(s || ''); return s.length > n + 1 ? s.slice(0, n) + '…' : s; };
 const getJson = p => fetch(API + p, { cache: 'no-store' }).then(r => r.json());
+// Marks the tile's own calls so /test/decode does not count them as external test requests.
+const TILE_HEADERS = { 'content-type': 'application/json', 'x-holminator-tile': '1' };
+const MSG_LIMIT = 200; // the poll fetches only the newest MSG_LIMIT messages (GET /api/messages?limit=)
 async function post(p, body) {
-  const r = await fetch(API + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const r = await fetch(API + p, { method: 'POST', headers: TILE_HEADERS, body: JSON.stringify(body) });
   const t = await r.text();
   let j; try { j = JSON.parse(t); } catch { j = t; }
   return { status: r.status, body: j };
 }
-const isSR = m => m.kind === 'STATUS_REPORT';
 const stBadge = s => el('span', `st ${s}`, s);
 const dirTags = m => {
   const f = document.createDocumentFragment();
@@ -48,24 +49,11 @@ function renderHeader(m) {
 }
 
 function renderKpis(m) {
-  const c = k => m.counters[k] || 0;
-  const bs = m.messages.byStatus || {};
-  const bd = m.messages.byDirection || {};
-  const mwd = messages.filter(x => x.mwd && x.status === 'WAITING').length;
-  const cards = [
-    ['MO accepted', c('mo_accepted'), 'mo', [[c('mo_received'), 'received'], [c('mo_rejected'), 'rejected'], [c('mo_dry_runs'), 'dry'], [c('mo_duplicates_accepted'), 'dup']]],
-    ['MT delivered', c('mt_delivered'), 'ok', [[c('mt_originated'), 'originated'], [c('mt_attempts'), 'attempts']]],
-    ['waiting now', bs.WAITING || 0, 'warn', [[c('mt_absent'), 'absent'], [c('mt_retries_scheduled'), 'retries'], [mwd, 'in MWD']]],
-    ['MT failed', c('mt_failed'), 'bad', [[c('mt_expired'), 'expired'], [bs.FAILED || 0, 'stored failed']]],
-    ['status reports', c('status_reports_sent'), 'sr', [[c('status_reports_generated'), 'generated'], [c('status_reports_failed'), 'failed']]],
-    ['SRI-for-SM', c('sri_requests'), '', [[c('udm_delivery_reports'), 'delivery reports to UDM']]],
-    ['alerts', c('alerts_received'), 'mt', [[c('alerts_redelivering'), 'SMs redelivered']]],
-    ['in store', m.messages.total, '', [[bd.MO || 0, 'MO'], [bd.MT || 0, 'MT'], [c('test_requests'), 'test calls']]],
-  ];
   const k = $('kpis'); k.replaceChildren();
-  for (const [label, v, cls, subs] of cards) {
-    const d = el('div', `kpi ${cls}${v ? '' : ' zero'}`);
+  for (const { grp, label, v, cls, subs, est } of kpiCards(m, messages)) {
+    const d = el('div', `kpi ${cls} g-${grp || 'none'}${v ? '' : ' zero'}`);
     d.append(el('span', 'v', v), el('span', 'l', label));
+    if (est) { const e = el('span', 'est'); e.title = est; d.append(' ', e); d.title = est; }
     const s = el('span', 's');
     subs.forEach(([n, what], i) => { if (i) s.append(' · '); s.append(el('b', null, n), ` ${what}`); });
     d.append(s);
@@ -74,7 +62,7 @@ function renderKpis(m) {
 }
 
 function resultClass(r) {
-  if (/^(SUCCESS|DELIVERED|2\d\d)$/.test(r)) return 'ok';
+  if (/^(SUCCESS|DELIVERED|FORWARDED|2\d\d)$/.test(r)) return 'ok';
   if (/^(ACCEPTED|PENDING|DELIVERING)$/.test(r)) return 'info';
   if (/ABSENT|WAITING|BUSY|CONGESTION|SLOW|MEMORY/.test(r)) return 'warn';
   return 'bad';
@@ -112,9 +100,37 @@ function renderPeersResults(m) {
   }
 }
 
-// ---------- flow of one message ----------
-// Works out how far the latest delivery attempt got, from the message history the backend keeps.
-function flowModel(m) {
+// ---------- flow model (pure, no DOM: test/run.mjs evaluates this block on its own) ----------
+const isSR = m => m.kind === 'STATUS_REPORT';
+const short = (s, n = 8) => { s = String(s || ''); return s.length > n + 1 ? s.slice(0, n) + '…' : s; };
+// An MO (SMS-SUBMIT) terminates at the SMSC; everything the SMSC sends towards a UE (SMS, status report) is an MT.
+const flowKind = m => (m && m.direction === 'MO' && !isSR(m) ? 'MO' : 'MT');
+const srIdOf = m => (m && (m.statusReportId || (m.sr && (m.sr.id || m.sr.messageId)))) || null;
+const flowHint = m => (flowKind(m) === 'MO' ? 'UE → AMF → SMSF → SMSC (ends here, onward simulated)' : 'SMSC → NRF → UDM → SMSF → AMF → UE');
+
+// MO: UE -> AMF -> SMSF -> SMSC (MO-Forward-SM), RP-ACK with SMS-SUBMIT-REPORT back the same way. The SMSC stores
+// the SM and marks it FORWARDED: onward delivery is simulated, there is no SRI or MT-Forward for an MO.
+function moFlow(m) {
+  const s = m.status;
+  const end = s === 'FORWARDED' ? 'done' : s === 'ACCEPTED' ? 'active' : /^(FAILED|EXPIRED)$/.test(s) ? 'fail' : 'off';
+  const endSub = s === 'FORWARDED' ? 'simulated' : s === 'ACCEPTED' ? 'forwarding…' : s === 'EXPIRED' ? 'expired, not forwarded' : end === 'fail' ? (m.failure || s) : `legacy ${s || ''}`.trim();
+  return {
+    kind: 'MO',
+    nodes: [
+      { nm: 'UE', glyph: '▯', sub: m.from || short(m.supi, 12), st: 'done' },
+      { nm: 'AMF', glyph: '◇', sub: 'NAS', st: 'done', edge: 'RP-DATA · SMS-SUBMIT', back: 'RP-ACK · SUBMIT-REPORT', backSt: 'done' },
+      { nm: 'SMSF', glyph: '⇄', sub: '', st: 'done', edge: 'UplinkSMS', back: 'RP-ACK', backSt: 'done' },
+      { nm: 'SMSC', glyph: '✉', sub: 'stored', st: 'done', edge: 'MO-Forward-SM (RP-DATA/SMS-SUBMIT)', back: '2001 · RP-ACK (SUBMIT-REPORT)', backSt: 'done' },
+      { nm: 'onward', glyph: '⇢', sub: endSub, st: end, end: true, edge: 'simulated onward delivery' },
+    ],
+    side: null,
+  };
+}
+
+// MT: SMSC -> (NRF) -> UDM (SRI-for-SM) -> SMSF (MT-Forward-SM) -> AMF -> UE (SMS-DELIVER or SMS-STATUS-REPORT), RP-ACK or
+// RP-ERROR back. How far the latest attempt got comes from the history the backend keeps. The side chain is the
+// absent path: ReportSM-DeliveryStatus to the UDM (MWD), then Alert-SC from the UDM and a new attempt.
+function mtFlow(m) {
   const h = m.history || [];
   let lastDel = -1;
   h.forEach((e, i) => { if (e.event === 'DELIVERING') lastDel = i; });
@@ -127,40 +143,163 @@ function flowModel(m) {
   const stopCls = s === 'FAILED' || s === 'EXPIRED' ? 'fail' : s === 'DELIVERING' ? 'active' : 'wait';
   const ok = e => /^200\b/.test(e.detail || '');
   const result = e => String(e.detail || '').replace(/^\d+\s*,?\s*/, '');
+  // The SMSF answers 502 with the UE's RP-ERROR as deliveryReport: the UE was reached and refused.
+  const rpErr = !!(fwd && /^502\b/.test(fwd.detail || '') && m.deliveryReportHex);
+  const delivered = s === 'DELIVERED';
 
-  let smsc = 'done', udm = '', smsf = '', ue = '';
-  let udmSub = '', smsfSub = m.servingSmsf ? short(m.servingSmsf) : '';
+  let smsc = 'done', nrf = '', udm = '', smsf = '', amf = '', ue = '';
+  let udmSub = '', smsfSub = m.servingSmsf ? short(m.servingSmsf) : '', ueSub = m.to || '';
   if (s === 'PENDING' || s === 'ACCEPTED') smsc = 'active';
   if (sri) {
+    nrf = 'done';
     udm = ok(sri) ? 'done' : stopCls;
     udmSub = ok(sri) ? 'routing ok' : result(sri);
     if (ok(sri)) {
-      if (fwd) { smsf = ok(fwd) ? 'done' : stopCls; if (!ok(fwd)) smsfSub = result(fwd) || smsfSub; }
-      else smsf = s === 'DELIVERING' ? 'active' : (s === 'PENDING' ? '' : stopCls);
+      if (fwd) {
+        smsf = ok(fwd) || rpErr ? 'done' : stopCls;
+        if (!ok(fwd) && !rpErr) smsfSub = result(fwd) || smsfSub;
+        if (rpErr) { amf = 'done'; ue = stopCls; ueSub = 'RP-ERROR'; }
+      } else smsf = s === 'DELIVERING' ? 'active' : (s === 'PENDING' ? '' : stopCls);
     }
   } else if (lastDel >= 0) {
-    udm = s === 'PENDING' ? '' : stopCls;
+    nrf = s === 'PENDING' ? '' : stopCls;
   } else if (s === 'EXPIRED' || s === 'FAILED') smsc = 'fail';
-  if (s === 'DELIVERED') { udm = udm || 'done'; smsf = smsf || 'done'; ue = 'done'; }
+  if (delivered) { nrf = nrf || 'done'; udm = udm || 'done'; smsf = smsf || 'done'; amf = 'done'; ue = 'done'; }
   if (m.mwd) udmSub = udmSub ? `${udmSub}, MWD` : 'MWD set';
-  if (s === 'EXPIRED') { if (udm === 'wait') udm = 'fail'; if (smsf === 'wait') smsf = 'fail'; }
+  if (s === 'EXPIRED') { if (nrf === 'wait') nrf = 'fail'; if (udm === 'wait') udm = 'fail'; if (smsf === 'wait') smsf = 'fail'; }
 
-  const origin = isSR(m)
-    ? [{ nm: 'report', glyph: '↺', sub: m.reportFor || '', st: 'done' }]
-    : m.direction === 'MO'
-      ? [{ nm: 'UE', glyph: '▯', sub: m.from || short(m.supi, 12), st: 'done' }, { nm: 'SMSF', glyph: '⇄', sub: 'MO', st: 'done', edge: 'MO SMS' }]
-      : [{ nm: 'SC API', glyph: '⚙', sub: m.from || '', st: 'done' }];
-  const nodes = [
-    ...origin,
-    { nm: 'SMSC', glyph: '✉', sub: s === 'PENDING' ? 'queued' : 'stored', st: smsc, edge: m.direction === 'MO' && !isSR(m) ? 'MO-Forward' : 'submit' },
-    { nm: 'UDM', glyph: '⌂', sub: udmSub, st: udm, edge: 'SRI-for-SM' },
-    { nm: 'SMSF', glyph: '⇄', sub: smsfSub, st: smsf, edge: 'MT-Forward' },
-    { nm: 'UE', glyph: '▯', sub: m.to || '', st: ue, edge: isSR(m) ? 'STATUS-REPORT' : 'SMS-DELIVER' },
-  ];
-  return nodes;
+  const ansLabel = delivered ? 'RP-ACK' : rpErr ? 'RP-ERROR' : 'RP-ACK / RP-ERROR';
+  const ansSt = delivered ? 'done' : rpErr ? 'fail' : 'off';
+  const fwdBack = delivered ? '200 · RP-ACK' : rpErr ? '502 · RP-ERROR' : fwd && !ok(fwd) ? result(fwd) || 'error' : 'answer';
+  const fwdBackSt = delivered ? 'done' : rpErr ? 'fail' : fwd && !ok(fwd) ? stopCls : 'off';
+  const smscSub = s === 'PENDING' ? 'queued' : isSR(m) ? `report for ${short(m.reportFor, 10)}` : m.from ? `from ${m.from}` : 'stored';
+
+  // Absent path. MWD is set by a ReportSM-DeliveryStatus (absent at the SMSF, memory full) or by the UDM itself
+  // when SRI-for-SM answers ABSENT_SUBSCRIBER_SM.
+  const reportedTo = h.some(e => e.event === 'Report-SM-Delivery-Status' && !/^SUCCESSFUL/.test(e.detail || ''));
+  const absentSri = h.some(e => e.event === 'SRI-for-SM' && /ABSENT/.test(e.detail || ''));
+  const reported = reportedTo || absentSri || !!m.mwd;
+  let alertAt = -1;
+  h.forEach((e, i) => { if (e.event === 'ALERT') alertAt = i; });
+  const alerted = alertAt >= 0;
+  const redelivered = alerted && h.slice(alertAt + 1).some(e => e.event === 'DELIVERING');
+  const off = st => (reported ? st : 'off');
+  const side = {
+    label: 'absent path',
+    taken: reported,
+    nodes: [
+      { nm: 'SMSC', glyph: '✉', sub: reported ? 'UE absent' : '', st: off('done') },
+      { nm: 'UDM', glyph: '⌂', sub: reported ? (alerted ? 'MWD → alert' : 'MWD set') : 'MWD', st: off(alerted ? 'done' : 'wait'),
+        edge: reportedTo || !absentSri ? 'ReportSM-DeliveryStatus' : 'ReportSM-DeliveryStatus (MWD set by SRI)', est: off('done') },
+      { nm: 'SMSC', glyph: '↻', sub: redelivered ? 'redelivered' : alerted ? 'redelivery due' : reported ? 'waits for alert' : 'redeliver',
+        st: off(redelivered ? 'done' : alerted ? 'active' : 'wait'), edge: 'Alert-SC', est: off(alerted ? 'done' : 'wait') },
+    ],
+  };
+
+  return {
+    kind: 'MT',
+    nodes: [
+      { nm: 'SMSC', glyph: '✉', sub: smscSub, st: smsc },
+      { nm: 'NRF', glyph: '⌕', sub: 'discovery', st: nrf, aux: true, edge: 'NFDiscover' },
+      { nm: 'UDM', glyph: '⌂', sub: udmSub, st: udm, edge: 'SRI-for-SM',
+        back: sri ? (ok(sri) ? 'serving SMSF' : result(sri) || 'error') : 'routing info', backSt: sri ? (ok(sri) ? 'done' : udm) : 'off' },
+      { nm: 'SMSF', glyph: '⇄', sub: smsfSub, st: smsf, edge: 'MT-Forward-SM', back: fwdBack, backSt: fwdBackSt },
+      { nm: 'AMF', glyph: '◇', sub: 'NAS', st: amf, edge: 'N1N2 transfer', back: ansLabel, backSt: ansSt },
+      { nm: 'UE', glyph: '▯', sub: ueSub, st: ue, edge: isSR(m) ? 'SMS-STATUS-REPORT' : 'SMS-DELIVER',
+        back: delivered ? 'RP-ACK · DELIVER-REPORT' : ansLabel, backSt: ansSt },
+    ],
+    side,
+  };
 }
 
+const flowModel = m => (flowKind(m) === 'MO' ? moFlow(m) : mtFlow(m));
+
+// KPI cards, MO and MT counted apart. Counters the backend does not have yet fall back to the polled message window.
+function kpiCards(m, msgs) {
+  const cs = (m && m.counters) || {};
+  const has = k => typeof cs[k] === 'number';
+  const c = k => cs[k] || 0;
+  const ms = (m && m.messages) || {};
+  const bs = ms.byStatus || {}, bd = ms.byDirection || {};
+  const list = Array.isArray(msgs) ? msgs : [];
+  const mo = status => list.filter(x => flowKind(x) === 'MO' && (!status || x.status === status)).length;
+  const mwd = list.filter(x => x.mwd && x.status === 'WAITING').length;
+  const newBackend = has('mo_forwarded');
+  return [
+    { grp: 'MO', label: 'MO received', v: has('mo_received') ? c('mo_received') : c('mo_accepted'), cls: 'mo',
+      est: has('mo_received') ? '' : 'no mo_received counter: showing mo_accepted',
+      subs: [[c('mo_accepted'), 'accepted (RP-ACK)'], [c('mo_rejected'), 'rejected'], [c('mo_duplicates_accepted'), 'dup'], [c('mo_dry_runs'), 'dry']] },
+    { grp: 'MO', label: 'MO forwarded', v: newBackend ? c('mo_forwarded') : mo('FORWARDED'), cls: 'mo',
+      est: newBackend ? '' : 'no mo_forwarded counter: counted in the message window',
+      subs: [[mo('ACCEPTED'), 'not yet forwarded'], [c('mo_expired'), 'expired'], [mo(), 'MO in window']] },
+    { grp: 'MT', label: 'MT originated', v: c('mt_originated'), cls: 'mt',
+      est: newBackend ? '' : 'older backend: includes MOs it delivered as MT',
+      subs: [[c('mt_attempts'), 'attempts'], [c('sri_requests'), 'SRI-for-SM']] },
+    { grp: 'MT', label: 'MT delivered', v: c('mt_delivered'), cls: 'ok', subs: [[c('mt_rp_error_temporary'), 'RP-ERROR temp']] },
+    { grp: 'MT', label: 'MT waiting', v: bs.WAITING || 0, cls: 'warn', subs: [[c('mt_absent'), 'absent'], [c('mt_retries_scheduled'), 'retries'], [c('mt_alert_fast_retries'), 'fast retries'], [mwd, 'in MWD']] },
+    { grp: 'MT', label: 'MT failed', v: c('mt_failed'), cls: 'bad', subs: [[c('mt_expired'), 'expired'], [c('mt_attempts_exhausted'), 'attempts exhausted'], [bs.FAILED || 0, 'stored failed']] },
+    { grp: 'MT', label: 'MT status reports', v: c('status_reports_sent'), cls: 'sr', subs: [[c('status_reports_generated'), 'generated'], [c('status_reports_failed'), 'failed']] },
+    { grp: 'MT', label: 'Alert-SC received', v: c('alerts_received'), cls: 'mt', subs: [[c('udm_delivery_reports'), 'ReportSM-DeliveryStatus'], [c('alerts_redelivering'), 'redelivered']] },
+    { grp: '', label: 'in store', v: ms.total || 0, cls: '', subs: [[bd.MO || 0, 'MO'], [bd.MT || 0, 'MT'], [c('test_requests'), 'test calls']] },
+  ];
+}
+// ---------- end flow model ----------
+
+// ---------- flow rendering ----------
 const GLYPH_BY_STATE = { fail: '✕', wait: '⏸' };
+function chainEl(model, cls = '') {
+  const box = el('div', `flow ${cls}`.trim());
+  model.nodes.forEach((n, i) => {
+    if (i) {
+      const e = el('div', `edge ${n.est || n.st || ''}`.trim());
+      e.append(el('div', 'ln'), el('div', 'lb', n.edge || ''));
+      if (n.back) { const b = el('div', `back ${n.backSt || 'off'}`); b.append(el('div', 'ln'), el('div', 'lb', n.back)); e.append(b); }
+      box.append(e);
+    }
+    const d = el('div', `node ${n.st || ''}${n.end ? ' end' : ''}${n.aux ? ' aux' : ''}`);
+    const sub = el('div', 'sub', n.sub); sub.title = n.sub || '';
+    d.append(el('div', 'dot', GLYPH_BY_STATE[n.st] || n.glyph), el('div', 'nm', n.nm), sub);
+    box.append(d);
+  });
+  return box;
+}
+function flowHead(m, title) {
+  const h = el('div', 'fh');
+  h.append(el('span', `tag ${flowKind(m)}`, flowKind(m)));
+  if (isSR(m)) h.append(el('span', 'tag SR', 'SR'));
+  h.append(el('span', null, title));
+  return h;
+}
+function flowTitle(m) {
+  if (flowKind(m) === 'MO') return 'mobile originated: terminates at the SMSC (stored, RP-ACK, onward delivery simulated)';
+  return isSR(m) ? `status report to the originator of ${m.reportFor || '?'}` : 'mobile terminated: SMSC to the UE';
+}
+// One message's flow (plus its absent path), and for an MO its status report as a separate MT.
+function flowBlock(m, { compact = false } = {}) {
+  const wrap = el('div', 'flowblock');
+  const model = flowModel(m);
+  wrap.append(flowHead(m, flowTitle(m)), chainEl(model, model.kind));
+  if (model.side) {
+    const sh = el('div', `fh side${model.side.taken ? ' taken' : ''}`, `${model.side.label}${model.side.taken ? '' : ' (not taken)'}`);
+    wrap.append(sh, chainEl(model.side, `side${compact ? ' compact' : ''}`));
+  }
+  return wrap;
+}
+function linkedSrBlock(m) {
+  const srId = flowKind(m) === 'MO' ? srIdOf(m) : null;
+  if (!srId) return null;
+  const sr = messages.find(x => x.id === srId);
+  const wrap = el('div', 'flowblock linked');
+  const h = el('div', 'fh');
+  h.append(el('span', 'tag MT', 'MT'), el('span', 'tag SR', 'SR'), 'status report for this MO, a separate MT: ', refLink(srId));
+  const status = (sr && sr.status) || (m.sr && m.sr.status);
+  if (status) h.append(' ', stBadge(status));
+  wrap.append(h);
+  if (sr) wrap.append(chainEl(flowModel(sr), 'MT'));
+  else wrap.append(el('div', 'dim', 'not in the polled window: open it to see its flow'));
+  return wrap;
+}
+
 function renderFlow() {
   const m = messages.find(x => x.id === selectedId) || messages[messages.length - 1];
   const box = $('flow'); box.replaceChildren();
@@ -168,17 +307,9 @@ function renderFlow() {
   const note = $('flownote'); note.replaceChildren();
   if (!m) { box.append(el('div', 'empty', 'no messages yet: send one below')); $('flowwhat').textContent = ''; return; }
   $('flowwhat').textContent = `${selectedId ? 'selected' : 'latest'}: ${m.id}`;
-  flowModel(m).forEach((n, i) => {
-    if (i) {
-      const e = el('div', `edge ${n.st === 'active' ? 'active' : n.st}`);
-      e.append(el('div', 'ln'), el('div', 'lb', n.edge || ''));
-      box.append(e);
-    }
-    const d = el('div', `node ${n.st}`);
-    const sub = el('div', 'sub', n.sub); sub.title = n.sub || '';
-    d.append(el('div', 'dot', GLYPH_BY_STATE[n.st] || n.glyph), el('div', 'nm', n.nm), sub);
-    box.append(d);
-  });
+  box.append(flowBlock(m));
+  const linked = linkedSrBlock(m);
+  if (linked) box.append(linked);
   note.append(stBadge(m.status), ' ');
   note.append(dirTags(m), ' ');
   const hist = m.history || [];
@@ -213,16 +344,18 @@ function renderMessages() {
     sel.value = statuses.includes(keep) ? keep : '';
   }
   const rows = messages.filter(m => (!dir || m.direction === dir) && (!kind || m.kind === kind) && (!status || m.status === status)).slice().reverse();
-  $('msgcount').textContent = `${rows.length} of ${messages.length}`;
+  const total = lastMetrics && lastMetrics.messages ? lastMetrics.messages.total : 0;
+  $('msgcount').textContent = `${rows.length} of ${messages.length}${total > messages.length ? ` (newest; ${total} stored)` : ''}`;
   const tb = $('msgs'); tb.replaceChildren();
   for (const m of rows.slice(0, 150)) {
     const tr = el('tr', `click${m.id === selectedId ? ' sel' : ''}${isSR(m) ? ' sr' : ''}`);
-    const dirTd = el('td'); dirTd.append(dirTags(m));
+    const dirTd = el('td'); dirTd.append(dirTags(m)); dirTd.title = flowHint(m);
     const txt = el('td', 'txt');
     if (isSR(m)) { txt.append(`↳ report for `, refLink(m.reportFor), ` · TP-ST ${fmtSt(m.st)}`); }
     else {
       txt.append(m.text || '');
-      if (m.statusReportId) { txt.append(' '); const s = el('span', 'tag SR'); s.append(refLink(m.statusReportId, `SR ${m.statusReportId}`)); txt.append(s); }
+      const srId = flowKind(m) === 'MO' ? srIdOf(m) : null;
+      if (srId) { txt.append(' '); const s = el('span', 'tag SR'); s.append(refLink(srId, `MT SR ${srId}`)); txt.append(s); }
     }
     const stTd = el('td'); stTd.append(stBadge(m.status));
     if (m.mwd && m.status === 'WAITING') stTd.append(el('span', 'dim', ' MWD'));
@@ -255,10 +388,12 @@ function renderDetail() {
 
   const facts = el('dl', 'facts');
   const fact = (k, v) => { if (v === undefined || v === null || v === '') return; facts.append(el('dt', null, k)); const dd = el('dd'); dd.append(v instanceof Node ? v : String(v)); facts.append(dd); };
+  fact('flow', flowHint(m));
   fact('from', m.from); fact('supi', m.supi); fact('to', m.to); fact('text', m.text);
   if (m.reportFor) fact('report for', refLink(m.reportFor));
-  if (m.statusReportId) fact('status report', refLink(m.statusReportId));
-  if (isSR(m)) fact('TP-ST', fmtSt(m.st));
+  if (srIdOf(m)) fact('status report', refLink(srIdOf(m)));
+  if (m.forwardedAt) fact('forwarded', `${hhmmss(m.forwardedAt)} (simulated onward delivery)`);
+  if (isSR(m)) { fact('TP-ST', fmtSt(m.st)); fact('TP-RA', m.ra); }
   fact('TP-MR', m.mr); fact('TP-SRR', m.srr === undefined ? undefined : String(!!m.srr));
   fact('attempts', m.attempts);
   if (m.nextRetryAt) fact('next retry', `${hhmmss(m.nextRetryAt)} (${until(m.nextRetryAt)})`);
@@ -271,13 +406,17 @@ function renderDetail() {
   fact('smsRecordId', m.smsRecordId);
   det.append(facts);
 
+  det.append(el('h3', null, `${flowKind(m)} flow`), flowBlock(m, { compact: true }));
+  const linked = linkedSrBlock(m);
+  if (linked) det.append(linked);
   det.append(el('h3', null, 'history'), timeline(m.history || []));
-  if (m.tpduHex) det.append(decodedBox('SMS-DELIVER sent to the SMSF', m.tpduHex));
+  if (m.submitHex) det.append(decodedBox('SMS-SUBMIT received from the SMSF', m.submitHex));
+  if (m.tpduHex) det.append(decodedBox(isSR(m) ? 'SMS-STATUS-REPORT sent to the SMSF' : 'SMS-DELIVER sent to the SMSF', m.tpduHex));
   if (m.deliveryReportHex) det.append(decodedBox('delivery report from the UE', m.deliveryReportHex));
 }
 
 function eventClass(e) {
-  if (e.event === 'DELIVERED') return 'ok';
+  if (e.event === 'DELIVERED' || e.event === 'FORWARDED') return 'ok';
   if (e.event === 'FAILED' || e.event === 'EXPIRED') return 'bad';
   if (e.event === 'WAITING') return 'warn';
   if (e.event === 'SRI-for-SM' || e.event === 'MT-Forward-Short-Message') return /^200\b/.test(e.detail || '') ? 'ok' : 'warn';
@@ -368,7 +507,7 @@ $('alertform').onsubmit = ev => {
 // ---------- MT ----------
 function mtBody(form) {
   const f = form.elements;
-  return { from: f.from.value.trim() || undefined, to: f.to.value.trim(), text: f.text.value, validitySeconds: Number(f.validitySeconds.value) };
+  return { from: f.from.value.trim() || undefined, to: f.to.value.trim(), text: f.text.value, validitySeconds: Number(f.validitySeconds.value), singleShot: f.singleShot.checked || undefined };
 }
 function httpHead(r, label) {
   const head = el('div', 'head');
@@ -504,10 +643,15 @@ async function tick() {
   if (ticking) return;
   ticking = true;
   try {
-    const [m, msgs] = await Promise.all([getJson('/api/metrics'), getJson('/api/messages')]);
+    const [m, msgs] = await Promise.all([getJson('/api/metrics'), getJson(`/api/messages?limit=${MSG_LIMIT}`)]);
     lastMetrics = m;
     messages = Array.isArray(msgs) ? msgs : [];
-    if (selectedId && !messages.some(x => x.id === selectedId)) selectedId = null;
+    // A pinned message older than the polled window is fetched on its own so the detail view keeps it.
+    if (selectedId && !messages.some(x => x.id === selectedId)) {
+      const one = await fetch(`${API}/api/messages/${encodeURIComponent(selectedId)}`, { cache: 'no-store' })
+        .then(r => (r.ok ? r.json() : null)).catch(() => null);
+      if (one && one.id === selectedId) messages.unshift(one); else selectedId = null;
+    }
     renderHeader(m); renderKpis(m); renderPeersResults(m);
     renderMessages(); renderFlow();
     await pollLog();

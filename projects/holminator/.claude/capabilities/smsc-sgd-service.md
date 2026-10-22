@@ -4,7 +4,7 @@ type: capability
 domain: backend
 tools: Read, Write, Edit, Bash, Grep, Glob
 model: inherit
-energy: 90
+energy: 100
 spawned: 2026-10-22
 can-merge-with: [sms-tpdu-codec]
 ---
@@ -19,6 +19,7 @@ Builds and runs the SMSC network function: board/plugins/holminator/index.js (mo
 - Message store with delivery reports, retry and store-and-forward when UE not reachable (stretch: Alert-Service-Centre triggers redelivery).
 - NRF registration (NF type SMSC as custom NF profile), heartbeat, discovery of UDM/SMSF. No hardcoded addresses.
 - Trigger API for other teams (send MT SMS, list messages) and a message log.
+- TP-VP handling for all formats with C7 rejection, stored submitHex, single-shot. VP/FCS work is shared with sms-tpdu-codec (can-merge-with).
 
 ## Activation Triggers
 - Writing or changing plugin code, endpoints, store, NRF registration.

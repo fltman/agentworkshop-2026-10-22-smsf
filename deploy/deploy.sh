@@ -36,7 +36,7 @@ DELAD="${DELAD_DATAKATALOG:-/var/www/torget-data}"; case "$DELAD"         in /*)
 echo "-> $HOST  ($DOMAN, port $PORT, service $TJANST)"
 # The qr code is gitignored and therefore missing from a fresh clone. Without the exclusion below, --delete
 # would remove it from the server on the first release deploy of the day, and the big screen would lose it.
-rsync -az --delete --exclude data --exclude qr.png --exclude qr.svg board/ "$HOST:$SERVERKATALOG/"
+rsync -az --delete --exclude /data --exclude qr.png --exclude qr.svg board/ "$HOST:$SERVERKATALOG/"
 # The unit file is already stamped. Do not sed it here: a placeholder once stood as a search pattern on this
 # line, got stamped itself, and then overwrote the port with another value.
 scp -q deploy/torget.service "$HOST:/etc/systemd/system/$TJANST.service"

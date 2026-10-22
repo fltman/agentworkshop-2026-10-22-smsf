@@ -91,8 +91,14 @@ if git fetch -q origin main 2>/dev/null; then
 fi
 
 # 4. push
+# git pushes over https with gh's login. Without a credential helper (common in a fresh WSL) git asks for a
+# password it cannot read and stops with "unable to get password". gh auth setup-git wires gh in, once.
+gh auth setup-git >/dev/null 2>&1 || true
 echo "→ pushing to $remote"
-git push -q -u "$remote" "$branch"
+if ! git push -q -u "$remote" "$branch"; then
+  echo "Push to $remote failed. If git asked for a password: run  gh auth setup-git  and then this command again." >&2
+  exit 1
+fi
 
 # 5. pull request (if it already exists, the push updated it)
 head="$me:$branch"; [ "$remote" = origin ] && head="$branch"

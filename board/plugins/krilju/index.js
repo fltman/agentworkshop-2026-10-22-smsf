@@ -18,10 +18,23 @@ const log = [];
 const disc = new Map(); // nfType -> { base, ts }
 let registered = false;
 
+let logSeq = 0;
 function rec(dir, peer, what, data) {
-  log.push({ ts: new Date().toISOString(), dir, peer, what, data });
-  if (log.length > 300) log.shift();
+  log.push({ id: ++logSeq, ts: new Date().toISOString(), dir, peer, what, data });
+  if (log.length > 500) log.shift();
 }
+
+const startedAt = Date.now();
+const inbound = new Map();  // route -> { count, byStatus, ms }
+const outbound = new Map(); // peer  -> { count, errors, byStatus, ms }
+function bump(map, key, status, ms) {
+  const m = map.get(key) || { count: 0, errors: 0, byStatus: {}, ms: 0 };
+  m.count++; m.ms += ms;
+  if (status === 0 || status >= 400) m.errors++;
+  m.byStatus[status] = (m.byStatus[status] || 0) + 1;
+  map.set(key, m);
+}
+const table = map => Object.fromEntries([...map].map(([k, v]) => [k, { ...v, avgMs: v.count ? Math.round(v.ms / v.count) : 0 }]));
 
 function send(res, status, body) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
@@ -40,6 +53,13 @@ async function readJson(req) {
 
 async function call(peer, method, url, body) {
   rec('out', peer, `${method} ${url}`, body);
+  const t0 = Date.now();
+  const r = await rawCall(peer, method, url, body);
+  bump(outbound, peer, r.status, Date.now() - t0);
+  return r;
+}
+
+async function rawCall(peer, method, url, body) {
   try {
     const r = await fetch(url, {
       method,
@@ -216,6 +236,22 @@ async function mtForward(req, res) {
   return send(res, 200, { result: 'SUCCESS', deliveryReport: { hex: rep.hex } });
 }
 
+function routeOf(method, path) {
+  if (/^\/nsmsf-sms\/v2\/ue-contexts\/[^/]+\/sendsms$/.test(path) && method === 'POST') return { name: 'UplinkSMS', peer: 'amf' };
+  if (/^\/nsmsf-sms\/v2\/ue-contexts\/[^/]+$/.test(path) && method === 'PUT') return { name: 'Activate', peer: 'amf' };
+  if (/^\/nsmsf-sms\/v2\/ue-contexts\/[^/]+$/.test(path) && method === 'DELETE') return { name: 'Deactivate', peer: 'amf' };
+  if (method === 'POST' && path === '/smsc/mt-forward-short-message') return { name: 'MT-Forward-Short-Message', peer: 'smsc' };
+  return null;
+}
+
+function prometheus() {
+  const out = [`smsf_uptime_seconds ${Math.round((Date.now() - startedAt) / 1000)}`,
+    `smsf_ue_contexts ${contexts.size}`, `smsf_registered_in_nrf ${registered ? 1 : 0}`, `smsf_pending_mt ${pendingMt.size}`];
+  for (const [k, v] of inbound) for (const [st, n] of Object.entries(v.byStatus)) out.push(`smsf_inbound_total{route="${k}",status="${st}"} ${n}`);
+  for (const [k, v] of outbound) for (const [st, n] of Object.entries(v.byStatus)) out.push(`smsf_outbound_total{peer="${k}",status="${st}"} ${n}`);
+  return out.join('\n') + '\n';
+}
+
 module.exports = {
   init() {
     const tick = () => {
@@ -231,6 +267,14 @@ module.exports = {
   },
 
   async handle(req, res, { path }) {
+    const route = routeOf(req.method, path);
+    if (route) {
+      const t0 = Date.now();
+      res.on('finish', () => {
+        bump(inbound, route.name, res.statusCode, Date.now() - t0);
+        rec('out', route.peer, `${res.statusCode} ${route.name}`);
+      });
+    }
     const m = path.match(/^\/nsmsf-sms\/v2\/ue-contexts\/([^/]+)(\/sendsms)?$/);
     if (m) {
       const supi = decodeURIComponent(m[1]);
@@ -240,7 +284,21 @@ module.exports = {
       return problem(res, 405, 'METHOD_NOT_ALLOWED', 'see CONTRACT.md');
     }
     if (req.method === 'POST' && path === '/smsc/mt-forward-short-message') return mtForward(req, res);
-    if (req.method === 'GET' && path === '/log') return send(res, 200, log.slice(-100));
+    if (req.method === 'GET' && path === '/log') {
+      const lim = Math.min(500, Number(new URL(req.url, 'http://x').searchParams.get('limit')) || 100);
+      return send(res, 200, log.slice(-lim));
+    }
+    if (req.method === 'GET' && path === '/metrics') {
+      return send(res, 200, {
+        uptimeSeconds: Math.round((Date.now() - startedAt) / 1000), nfInstanceId: NF_ID, registeredInNrf: registered,
+        ueContexts: contexts.size, pendingMt: pendingMt.size, inbound: table(inbound), outbound: table(outbound),
+      });
+    }
+    if (req.method === 'GET' && path === '/metrics.prom') {
+      res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4' });
+      res.end(prometheus());
+      return true;
+    }
     if (req.method === 'GET' && path === '/contexts') return send(res, 200, [...contexts.values()]);
     if (req.method === 'GET' && path === '/status') return send(res, 200, { nfInstanceId: NF_ID, registeredInNrf: registered, contexts: contexts.size });
     return false;

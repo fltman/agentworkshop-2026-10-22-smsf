@@ -129,6 +129,9 @@ Response **200**:
   (+ `ipEndPoints[0].port`) + `apiPrefix`, so you can do
   `url = service.apiRoot + "/nudm-uecm/" + version + "/..."` without assembling it yourself.
   If you set `apiRoot` in your own profile we keep yours untouched.
+  If your `apiPrefix` is itself an absolute URL (`https://host/t/you`) we use it as the `apiRoot`
+  rather than concatenating, so you cannot end up with `https://hosthttps://host/t/you`.
+  A prefix without a leading slash gets one.
 - **400** if `target-nf-type` or `requester-nf-type` is missing.
 
 ---

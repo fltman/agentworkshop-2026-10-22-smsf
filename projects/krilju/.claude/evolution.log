@@ -14,3 +14,4 @@
 2026-10-22 13:25 SPAWN: smsf-spec-conformance (conformance gaps against TS 23.540/24.011/29.540 need their own owner; first job RP timers TR1M)
 2026-10-22 13:30 MUTATE: smsf-spec-conformance (first closed gap after TR1M: UDM SDM-subscription and dereg callbacks; rule: a new peer-facing call must degrade when the peer lacks it)
 2026-10-22 13:31 NO-CHANGE: evolve round (smsf-spec-conformance just spawned and mutated; energies stable)
+2026-10-22 13:36 MUTATE: smsf-service (spore backend-13: node --check and tests before every delivery; callback degrade rule)

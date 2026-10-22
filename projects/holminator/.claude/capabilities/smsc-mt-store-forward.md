@@ -29,3 +29,8 @@ The mobile-terminated half of the SMSC in board/plugins/holminator/index.js, plu
 - Not MO handling (smsc-mo-service), not TPDU encoding (sms-tpdu-codec), not the tile.
 - Shares index.js with smsc-mo-service: small surgical edits, never reformat the other half.
 - Plain Node, no npm deps; every behaviour change gets a test in projects/holminator/test/run.mjs that is shown to fail.
+
+## Learned (MUTATE 2026-10-22 13:05)
+- The store holds only non-final records; setStatus moves DELIVERED/FAILED/EXPIRED to history (HISTORY_MAX 500). Only the store drives delivery (kick, alert, sweep, retries, restart requeue); iterate over a copy when records may move.
+- Save after every final counter increment, or the increment is lost on restart.
+- /api/mt srr defaults to true; status-report MTs never request one.

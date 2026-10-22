@@ -34,3 +34,4 @@ test surface (`GET /test`, `?dryRun=1`, `?scenario=`, `/test/encode`, `/test/dec
 - TP-SRR both ways: MO status reports go to the UE as real MTs; MT status reports go to the originating SME, simulated (message.statusReport.tpSt). Hide the backend's pre-seeded zero rows in breakdown tables.
 - Operator actions (e.g. Reset metrics) belong on the tile: confirm dialog, low-key button, inline note for success or "not supported".
 - Pitfall: a status-check test needs a non-2xx reply whose body still says ok:true, otherwise removing the check goes unnoticed.
+- MT form sends srr explicitly (true/false); request bodies built in a pure tested function (MUTATE 13:15)

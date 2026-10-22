@@ -290,7 +290,7 @@ function mtReportStep(m) {
 const flowModel = m => (flowKind(m) === 'MO' ? moFlow(m) : mtFlow(m));
 
 // KPI cards, MO and MT counted apart. Counters the backend does not have yet fall back to the polled message window.
-function kpiCards(m, msgs) {
+function kpiCards(m, msgs, now) {
   const cs = (m && m.counters) || {};
   const has = k => typeof cs[k] === 'number';
   const c = k => cs[k] || 0;
@@ -321,7 +321,32 @@ function kpiCards(m, msgs) {
       title: 'SMS-STATUS-REPORT for MTs with TP-SRR, returned to the originating SME (simulated)',
       subs: [[num(cs.mt_srr_requested), 'requested']] },
     { grp: 'MT', label: 'Alert-SC received', v: c('alerts_received'), cls: 'mt', subs: [[c('udm_delivery_reports'), 'ReportSM-DeliveryStatus'], [c('alerts_redelivering'), 'redelivered']] },
-    { grp: '', label: 'in store', v: ms.total || 0, cls: '', subs: [[bd.MO || 0, 'MO'], [bd.MT || 0, 'MT'], [c('test_requests'), 'test calls']] },
+    ...storeCards(m, now),
+  ];
+}
+// The store holds only messages not yet final; finished ones move to the history (both capped, see /api/metrics).
+const STORE_STATUSES = ['ACCEPTED', 'PENDING', 'DELIVERING', 'WAITING'];
+const inStore = m => !!m && STORE_STATUSES.includes(m.status);
+const ageShort = (ts, now) => {
+  const ms = (now ?? Date.now()) - Date.parse(ts);
+  if (!(ms >= 0)) return DASH;
+  const s = Math.floor(ms / 1000);
+  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86400 ? `${Math.floor(s / 3600)}h` : `${Math.floor(s / 86400)}d`;
+};
+function storeCards(m, now) {
+  const o = k => (m && m[k] && typeof m[k] === 'object' ? m[k] : null);
+  const s = o('store'), h = o('history'), cs = (m && m.counters) || {}, bd = (m && m.messages && m.messages.byDirection) || {};
+  const bs = (s && s.byStatus) || {};
+  const storeSubs = s ? STORE_STATUSES.map(k => [num(bs[k]), k.toLowerCase()]) : [];
+  if (s && s.oldestAt) storeSubs.push([ageShort(s.oldestAt, now), 'oldest']);
+  return [
+    { grp: '', label: 'in store', v: s ? num(s.held) : DASH, cls: 'store',
+      title: s ? `messages not yet final (max ${num(s.max)}); finished ones move to the history` : 'older backend: no store section in /api/metrics',
+      subs: storeSubs },
+    { grp: '', label: 'history', v: h ? num(h.kept) : DASH, cls: '',
+      title: 'finished messages kept for the message list; the oldest are dropped beyond max',
+      subs: h ? [[num(h.max), 'max'], [num(cs.history_evicted), 'evicted'], [bd.MO ?? DASH, 'MO listed'], [bd.MT ?? DASH, 'MT listed']]
+        : [[bd.MO ?? DASH, 'MO listed'], [bd.MT ?? DASH, 'MT listed']] },
   ];
 }
 // ---------- metrics panels (pure): PDUs, RP-Causes, status reports, SGd operations, consistency ----------
@@ -441,6 +466,13 @@ function resetNote(res) {
   const n = Number(res.body.clearedMessages) || 0;
   return { ok: true, text: `reset at ${at} (${n} message${n === 1 ? '' : 's'} cleared)` };
 }
+// POST /api/mt body from the MT form (pure: reads form.elements only). srr is always sent explicitly: the backend
+// defaults it to true, so an unchecked box must say srr:false.
+function mtBody(form) {
+  const f = form.elements;
+  return { from: f.from.value.trim() || undefined, to: f.to.value.trim(), text: f.text.value, validitySeconds: Number(f.validitySeconds.value),
+    singleShot: f.singleShot.checked || undefined, srr: !!(f.srr && f.srr.checked) };
+}
 // ---------- end flow model ----------
 
 // ---------- flow rendering ----------
@@ -543,7 +575,7 @@ function renderMessages() {
   }
   const rows = messages.filter(m => (!dir || m.direction === dir) && (!kind || m.kind === kind) && (!status || m.status === status)).slice().reverse();
   const total = lastMetrics && lastMetrics.messages ? lastMetrics.messages.total : 0;
-  $('msgcount').textContent = `${rows.length} of ${messages.length}${total > messages.length ? ` (newest; ${total} stored)` : ''}`;
+  $('msgcount').textContent = `${rows.length} of ${messages.length}${total > messages.length ? ` (newest; ${total} known)` : ''} · ${messages.filter(inStore).length} in store`;
   const tb = $('msgs'); tb.replaceChildren();
   for (const m of rows.slice(0, 150)) {
     const tr = el('tr', `click${m.id === selectedId ? ' sel' : ''}${isSR(m) ? ' sr' : ''}`);
@@ -561,6 +593,7 @@ function renderMessages() {
       } else if (srId) { txt.append(' '); const s = el('span', 'tag SR'); s.append(refLink(srId, `MT SR ${srId}`)); txt.append(s); }
     }
     const stTd = el('td'); stTd.append(stBadge(m.status));
+    if (inStore(m)) { const t = el('span', 'tag store', 'in store'); t.title = 'not final yet: held in the SMSC store'; stTd.append(' ', t); }
     if (m.mwd && m.status === 'WAITING') stTd.append(el('span', 'dim', ' MWD'));
     const when = m.status === 'WAITING' && m.nextRetryAt ? `retry ${until(m.nextRetryAt)}` : hhmmss(m.submittedAt);
     tr.append(el('td', 'dim', m.id), dirTd, el('td', null, `${m.from || short(m.supi, 12) || '—'} → ${m.to || '—'}`), txt, stTd,
@@ -708,10 +741,6 @@ $('alertform').onsubmit = ev => {
 };
 
 // ---------- MT ----------
-function mtBody(form) {
-  const f = form.elements;
-  return { from: f.from.value.trim() || undefined, to: f.to.value.trim(), text: f.text.value, validitySeconds: Number(f.validitySeconds.value), singleShot: f.singleShot.checked || undefined };
-}
 function httpHead(r, label) {
   const head = el('div', 'head');
   const ok = r.status >= 200 && r.status < 300;

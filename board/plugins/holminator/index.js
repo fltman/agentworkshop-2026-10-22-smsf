@@ -18,14 +18,18 @@ const NF_ID = '6f1c2c1e-0000-4000-8000-0000686f6c6d'; // stable across restarts,
 const SC_ADDRESS = '46700000100';
 const HEARTBEAT_S = 30;
 const LOG_MAX = 500;
-const STORE_MAX = 500;
+const STORE_MAX = 500; // the store holds only messages not yet final; this cap is a safety net (store_evicted)
+const HISTORY_MAX = 500; // finished messages, newest last; the oldest is dropped beyond this (history_evicted)
+// A message in one of these states is done: it leaves the store (st.messages) for the history (st.history).
+const FINAL = ['DELIVERED', 'FAILED', 'EXPIRED', 'FORWARDED', 'REJECTED'];
 const DEFAULT_VALIDITY_MS = 24 * 60 * 60 * 1000;
 
 const st = {
   registered: false,
   log: [],
   logSeq: 0,
-  messages: [],
+  messages: [], // the store: only messages not yet final (ACCEPTED, PENDING, DELIVERING, WAITING)
+  history: [], // finished messages (FINAL), ring buffer of HISTORY_MAX, newest last
   msgSeq: 0,
   disc: new Map(), // nfType or nfType/instanceId -> { base, ts }
   dataDir: null,
@@ -38,7 +42,7 @@ const st = {
 // Every known counter, PDU, RP-Cause, TP-ST and SGd operation key starts at 0, so a missing key is never a silent 0.
 // Counters are persisted in store.json with the messages (saveStore/loadStore); since is when they started counting.
 const COUNTERS = [
-  'requests_in', 'answers_error', 'test_requests', 'store_evicted',
+  'requests_in', 'answers_error', 'test_requests', 'store_evicted', 'history_evicted',
   'mo_received', 'mo_accepted', 'mo_rejected', 'mo_dry_runs', 'mo_duplicates_accepted', 'mo_forwarded', 'mo_expired',
   'mt_originated', 'mt_attempts', 'mt_forward_not_sent', 'mt_delivered', 'mt_failed', 'mt_expired', 'mt_absent',
   'mt_retries_scheduled', 'mt_rp_error_temporary', 'mt_attempts_exhausted', 'mt_alert_fast_retries',
@@ -117,15 +121,18 @@ function loadStore() {
   try {
     const s = JSON.parse(fs.readFileSync(f, 'utf8'));
     st.messages = Array.isArray(s.messages) ? s.messages : [];
-    st.msgSeq = s.msgSeq || st.messages.length;
+    st.history = Array.isArray(s.history) ? s.history : [];
+    st.msgSeq = s.msgSeq || st.messages.length + st.history.length;
     if (s.metrics) st.metrics = { ...restoreMetrics(s.metrics), startedAt: st.metrics.startedAt, nrf: st.metrics.nrf };
+    // Migration: older files kept finished messages in the store; they belong in the history.
+    for (const m of st.messages.filter(x => FINAL.includes(x.status))) retire(m);
   } catch (e) { console.error(`[${TEAM}] store:`, e.message); }
 }
 function saveStore() {
   const f = storeFile();
   if (!f) return;
   const metrics = Object.fromEntries(PERSISTED.map(k => [k, st.metrics[k]]));
-  try { fs.writeFileSync(f, JSON.stringify({ msgSeq: st.msgSeq, messages: st.messages, metrics })); }
+  try { fs.writeFileSync(f, JSON.stringify({ msgSeq: st.msgSeq, messages: st.messages, history: st.history, metrics })); }
   catch (e) { console.error(`[${TEAM}] store:`, e.message); }
 }
 
@@ -286,6 +293,18 @@ function saveMessage(m) {
   return m;
 }
 
+// A final message leaves the store for the history (same object, so later notes such as statusReportId still land).
+function retire(m) {
+  const i = st.messages.indexOf(m);
+  if (i >= 0) st.messages.splice(i, 1);
+  if (!st.history.includes(m)) st.history.push(m);
+  while (st.history.length > HISTORY_MAX) { st.history.shift(); inc('history_evicted'); }
+}
+const idNum = m => Number(String(m.id).replace(/^smsc-/, '')) || 0;
+// Store and history together, ordered by id (oldest first): what GET /api/messages has always listed.
+function allMessages() { return [...st.history, ...st.messages].sort((a, b) => idNum(a) - idNum(b)); }
+function findMessage(id) { return st.messages.find(x => x.id === id) || st.history.find(x => x.id === id) || null; }
+
 // TS 29.338 6.3.3.6, values shared with MAP SM-EnumeratedDeliveryFailureCause.
 const SM_FAILURE = {
   MEMORY_CAPACITY_EXCEEDED: 0, EQUIPMENT_PROTOCOL_ERROR: 1, EQUIPMENT_NOT_SM_EQUIPPED: 2,
@@ -409,7 +428,7 @@ async function moForward(req, res, url) {
   // TS 23.040 9.2.3.25: TP-RD=1 tells the SC to reject an SMS-SUBMIT with the same TP-MR and TP-DA from the same OA
   // as one it still holds; TP-RD=0 tells it to accept. A FORWARDED MO counts as held only for DUP_WINDOW_MS after it
   // was forwarded (RP TR1M retransmissions): UEs wrap TP-MR at 256, so a longer window flags normal traffic.
-  const dup = st.messages.find(m => m.direction === 'MO' && m.mr === s.mr && m.to === to
+  const dup = allMessages().find(m => m.direction === 'MO' && m.mr === s.mr && m.to === to
     && ((from && m.from === from) || (supi && m.supi === supi))
     && (['ACCEPTED', ...ACTIVE].includes(m.status)
       || (m.status === 'FORWARDED' && !expired(m) && Date.now() - Date.parse(m.forwardedAt || m.submittedAt) < MO_LIMITS.DUP_WINDOW_MS)));
@@ -495,7 +514,11 @@ function redeliverAfter(ms, to, ids, reason) {
 }
 
 function hist(m, event, detail) { m.history.push({ ts: new Date().toISOString(), event, detail }); }
-function setStatus(m, status, detail) { m.status = status; hist(m, status, detail); saveStore(); }
+function setStatus(m, status, detail) {
+  m.status = status; hist(m, status, detail);
+  if (FINAL.includes(status)) retire(m);
+  saveStore();
+}
 
 // TP-SCTS is the SC arrival time, nudged forward so no two SMs to the same MS share one (TS 23.040 6.2 (1)).
 function sctsFor(m) {
@@ -665,6 +688,7 @@ async function delivered(m) {
   inc(m.kind === 'STATUS_REPORT' ? 'status_reports_sent' : 'mt_delivered');
   if (m.mwd) { m.mwd = false; await reportDeliveryStatus(m, 'SUCCESSFUL_TRANSFER'); }
   statusReport(m, tpdu.ST.RECEIVED_BY_SME);
+  saveStore(); // the counters above changed after setStatus saved
 }
 
 // Alert-driven redelivery, with a slow autonomous retry in case the alert never comes (TS 23.040 3.2.7 note 5).
@@ -698,12 +722,14 @@ function fail(m, stValue, detail) {
   setStatus(m, 'FAILED', detail);
   inc(m.kind === 'STATUS_REPORT' ? 'status_reports_failed' : 'mt_failed');
   statusReport(m, stValue);
+  saveStore();
 }
 
 function expire(m) {
   setStatus(m, 'EXPIRED', `validity period ended ${m.expiresAt}`);
   inc(m.direction === 'MO' ? 'mo_expired' : m.kind === 'STATUS_REPORT' ? 'status_reports_expired' : 'mt_expired');
   statusReport(m, tpdu.ST.VALIDITY_PERIOD_EXPIRED);
+  saveStore();
 }
 
 // TS 23.040 3.2.9: when the SUBMIT had TP-SRR=1 the SC returns an SMS-STATUS-REPORT to the originating MS once the
@@ -751,13 +777,14 @@ function onMoAccepted(msg) {
   setStatus(msg, 'FORWARDED', `simulated onward delivery to ${msg.to}`);
   inc('mo_forwarded');
   statusReport(msg, tpdu.ST.RECEIVED_BY_SME);
+  saveStore();
 }
 
 // Expire, and move due WAITING messages back to PENDING. Also picks up PENDING ones after a restart.
 function sweep() {
   const now = Date.now();
   const touched = new Set();
-  for (const m of st.messages) {
+  for (const m of [...st.messages]) { // a copy: expire() moves the message to the history
     if (!ACTIVE.includes(m.status)) continue;
     if (m.status !== 'DELIVERING' && expired(m)) { expire(m); continue; }
     if (m.status === 'WAITING' && m.nextRetryAt && Date.parse(m.nextRetryAt) <= now) {
@@ -837,9 +864,20 @@ async function apiMt(req, res, url) {
   return reply(res, 'api', what, 200, { result: m.status, messageId: m.id, message: m });
 }
 
+// The store holds only messages not yet final; finished ones are in the history.
+function storeStats() {
+  const byStatus = { ACCEPTED: 0, PENDING: 0, DELIVERING: 0, WAITING: 0 };
+  let oldest = null;
+  for (const m of st.messages) {
+    byStatus[m.status] = (byStatus[m.status] || 0) + 1;
+    if (m.submittedAt && (!oldest || m.submittedAt < oldest)) oldest = m.submittedAt;
+  }
+  return { held: st.messages.length, max: STORE_MAX, byStatus, oldestAt: oldest };
+}
+
 function metricsSnapshot() {
   const byStatus = {}, byDirection = {};
-  for (const m of st.messages) {
+  for (const m of allMessages()) { // store + history: every record we still know about
     byStatus[m.status] = (byStatus[m.status] || 0) + 1;
     byDirection[m.direction] = (byDirection[m.direction] || 0) + 1;
   }
@@ -856,7 +894,9 @@ function metricsSnapshot() {
     counters: { ...st.metrics.counters },
     results: st.metrics.results,
     peers,
-    messages: { total: st.messages.length, byStatus, byDirection },
+    messages: { total: st.messages.length + st.history.length, byStatus, byDirection },
+    store: storeStats(),
+    history: { kept: st.history.length, max: HISTORY_MAX },
     pdus: { in: { ...st.metrics.pdus.in }, out: { ...st.metrics.pdus.out } },
     rpCauses: { in: { ...st.metrics.rpCauses.in }, out: { ...st.metrics.rpCauses.out } },
     statusReports: statusReportStats(),
@@ -901,23 +941,29 @@ function consistency() {
     `generated == delivered + failed + expired + waiting (${srWaiting} generated since ${st.metrics.since})`);
   // Every accepted MO with TP-SRR gets exactly one status report from onMoAccepted/expire via statusReport(), unless
   // it has no originating MSISDN (supi only); a record still ACCEPTED has none yet either.
-  const moNoReport = st.messages.filter(m => m.direction === 'MO' && m.srr && !m.statusReportId && sinceCounting(m)).length;
-  const mtSrrOpen = st.messages.filter(m => m.direction === 'MT' && m.kind !== 'STATUS_REPORT' && m.srr && !m.statusReport && sinceCounting(m)).length;
-  if (c.store_evicted) out.push({ name: 'mo_status_reports', ok: true, detail: `not checked: ${c.store_evicted} message(s) evicted from the store` });
+  const known = allMessages(); // store + history
+  const evicted = (c.store_evicted || 0) + (c.history_evicted || 0);
+  const skipped = `not checked: ${evicted} message(s) evicted (store_evicted ${c.store_evicted}, history_evicted ${c.history_evicted})`;
+  const moNoReport = known.filter(m => m.direction === 'MO' && m.srr && !m.statusReportId && sinceCounting(m)).length;
+  const mtSrrOpen = known.filter(m => m.direction === 'MT' && m.kind !== 'STATUS_REPORT' && m.srr && !m.statusReport && sinceCounting(m)).length;
+  if (evicted) out.push({ name: 'mo_status_reports', ok: true, detail: skipped });
   else chk('mo_status_reports', c.mo_srr_requested, c.status_reports_generated + moNoReport,
     `mo_srr_requested == status_reports_generated (${c.status_reports_generated}) + MOs with TP-SRR and no report (no originator or not forwarded yet) since ${st.metrics.since} (${moNoReport})`);
-  if (c.store_evicted) out.push({ name: 'mt_status_reports', ok: true, detail: `not checked: ${c.store_evicted} message(s) evicted from the store` });
+  if (evicted) out.push({ name: 'mt_status_reports', ok: true, detail: skipped });
   else chk('mt_status_reports', c.mt_srr_requested, c.mt_status_reports_simulated + mtSrrOpen,
     `mt_srr_requested == mt_status_reports_simulated (${c.mt_status_reports_simulated}) + MTs with srr not final yet since ${st.metrics.since} (${mtSrrOpen})`);
-  const moStored = st.messages.filter(m => m.direction === 'MO' && sinceCounting(m)).length;
-  if (c.store_evicted) out.push({ name: 'mo_store', ok: true, detail: `not checked: ${c.store_evicted} message(s) evicted from the store (max ${STORE_MAX})` });
+  const moStored = known.filter(m => m.direction === 'MO' && sinceCounting(m)).length;
+  if (evicted) out.push({ name: 'mo_store', ok: true, detail: `${skipped} (store max ${STORE_MAX}, history max ${HISTORY_MAX})` });
   else chk('mo_store', c.mo_received, moStored + c.mo_rejected + c.mo_dry_runs,
-    `mo_received == MO records stored since ${st.metrics.since} (${moStored}) + mo_rejected (${c.mo_rejected}) + mo_dry_runs (${c.mo_dry_runs})`);
+    `mo_received == MO records in store + history since ${st.metrics.since} (${moStored}) + mo_rejected (${c.mo_rejected}) + mo_dry_runs (${c.mo_dry_runs})`);
+  const finalHeld = st.messages.filter(m => FINAL.includes(m.status));
+  chk('store_only_pending', finalHeld.length, 0,
+    `final records in the store (should be in the history)${finalHeld.length ? `: ${finalHeld.slice(0, 5).map(m => `${m.id} ${m.status}`).join(', ')}` : ''}`);
   return out;
 }
 
 // POST /api/metrics/reset {clearMessages?}: every metric back to its pre-seeded 0 and since=now. startedAt (this
-// process) and the NRF health stay. clearMessages also drops the store and cancels pending redelivery timers, so no
+// process) and the NRF health stay. clearMessages also drops the store and the history and cancels pending redelivery timers, so no
 // message from before since can skew the consistency checks. An MT attempt already in flight still finishes.
 async function metricsReset(req, res) {
   let b = {};
@@ -926,9 +972,10 @@ async function metricsReset(req, res) {
   st.metrics = { ...newMetrics(), startedAt: st.metrics.startedAt, nrf: st.metrics.nrf };
   let cleared = 0;
   if (clear) {
-    cleared = st.messages.length;
+    cleared = st.messages.length + st.history.length;
     for (const m of st.messages) { m.nextRetryAt = null; m.viaAlert = false; }
     st.messages = [];
+    st.history = [];
     for (const tm of st.timers.filter(x => x.redeliver)) { clearTimeout(tm); st.timers.splice(st.timers.indexOf(tm), 1); }
   }
   saveStore();
@@ -963,17 +1010,23 @@ function kpi() {
       consistent: consistency().every(x => x.ok),
       mo_srr_requested: c.mo_srr_requested || 0,
       mt_status_reports_simulated: c.mt_status_reports_simulated || 0,
+      store_held: st.messages.length,
     },
   };
 }
 
-// GET /api/messages[?limit=N][&since=X]. The store is an array in arrival order (ids smsc-<seq> ascending), so:
+// GET /api/messages[?scope=store|history][&limit=N][&since=X]. Without scope: the history and the store together
+// (everything we still know about), ordered by id (smsc-<seq> ascending). scope=store: only messages not yet final;
+// scope=history: only finished ones. Then:
 // since=smsc-<n> (or <n>) keeps messages created after that id; since=<ISO time> keeps messages whose updatedAt (the
 // ts of their last history entry) is later. limit=N then keeps the newest N. The answer is always oldest first.
 function updatedAt(m) { const h = m.history || []; return (h.length && h[h.length - 1].ts) || m.submittedAt; }
 function listMessages(url) {
   const qs = url ? url.searchParams : new URLSearchParams();
-  let list = st.messages;
+  const scope = qs.get('scope');
+  if (scope !== null && scope !== '' && !['store', 'history', 'all'].includes(scope)) return { error: 'scope must be store, history or all' };
+  let list = scope === 'store' ? [...st.messages].sort((a, b) => idNum(a) - idNum(b))
+    : scope === 'history' ? [...st.history].sort((a, b) => idNum(a) - idNum(b)) : allMessages();
   const since = qs.get('since');
   if (since !== null && since !== '') {
     const idm = /^(?:smsc-)?(\d+)$/.exec(since);
@@ -1017,6 +1070,9 @@ function metricsText() {
     line('peer_latency_ms_sum', { peer }, p.latencyMsSum);
   }
   for (const [s, v] of Object.entries(m.messages.byStatus)) line('messages', { status: s }, v);
+  line('store_held', {}, m.store.held);
+  for (const [s, v] of Object.entries(m.store.byStatus)) line('store_held_by_status', { status: s }, v);
+  line('history_kept', {}, m.history.kept);
   for (const dir of ['in', 'out']) {
     for (const [type, v] of Object.entries(m.pdus[dir])) line('pdus_total', { dir, type }, v);
     for (const [cause, v] of Object.entries(m.rpCauses[dir])) line('rp_causes_total', { dir, cause }, v);
@@ -1052,7 +1108,7 @@ function testCatalogue() {
       { method: 'GET', path: `${base}/api/messages/smsc-1`, what: 'One message with its full history: SRI answer, MT-Forward answer, MWD reports, status report.' },
       { method: 'POST', path: `${base}/test/encode`, what: 'Build a TPDU: type SUBMIT or DELIVER; rp=true wraps it in RP-DATA. SUBMIT vp: a relative octet, or {type:"absolute",time,tzMinutes}, {type:"enhanced",format:"none|relative|seconds|hhmmss",value,singleShot}, {type:"raw",vpf,hex}.', example: { type: 'SUBMIT', to: '46700000002', text: 'Hello', mr: 1, srr: false, rd: false, rp: false } },
       { method: 'POST', path: `${base}/test/decode`, what: 'Decode RP-DATA, RP-ACK, RP-ERROR, SMS-SUBMIT, SMS-DELIVER, SMS-STATUS-REPORT, SMS-SUBMIT-REPORT or SMS-DELIVER-REPORT hex. Optional kind (e.g. "submit-report") or direction ("MO"/"MT") picks between TPDUs sharing a TP-MTI.', example: { hex: submitHex } },
-      { method: 'GET', path: `${base}/api/messages?limit=50`, what: 'Messages the SMSC holds, with history, oldest first. ?limit=N keeps the newest N; ?since=smsc-<n> only those created after that id; ?since=<ISO time> only those updated (last history entry) after it.' },
+      { method: 'GET', path: `${base}/api/messages?limit=50`, what: 'Messages the SMSC holds, with history, oldest first. ?limit=N keeps the newest N; ?since=smsc-<n> only those created after that id; ?since=<ISO time> only those updated (last history entry) after it. ?scope=store: only messages not yet final (the store); ?scope=history: only finished ones (newest 500); no scope: both.' },
       { method: 'GET', path: `${base}/kpi`, what: 'Common KPI summary: {nf, up, requests, errors, latencyMs, extra:{mo_accepted, mt_delivered, mt_failed, waiting, status_reports_sent, alerts_received, registeredInNrf}}.' },
       { method: 'GET', path: `${base}/api/log?since=0`, what: 'Every request and answer, in and out.' },
       { method: 'GET', path: `${base}/api/metrics`, what: 'Counters, results per operation, per-peer traffic and latency (JSON).' },
@@ -1104,7 +1160,7 @@ async function handle(req, res, { path: p, url }) {
   if (req.method === 'POST' && p === '/smsc/alert-service-centre') return alertServiceCentre(req, res);
   if (req.method === 'POST' && p === '/api/mt') return apiMt(req, res, url);
   if (req.method === 'GET' && p.startsWith('/api/messages/')) {
-    const m = st.messages.find(x => x.id === decodeURIComponent(p.slice('/api/messages/'.length)));
+    const m = findMessage(decodeURIComponent(p.slice('/api/messages/'.length)));
     return m ? send(res, 200, m) : send(res, 404, { error: 'no such message' });
   }
   if (req.method === 'GET' && p === '/api/messages') {
@@ -1130,7 +1186,7 @@ async function handle(req, res, { path: p, url }) {
   if (req.method === 'GET' && (p === '/status' || p === '/')) {
     return send(res, 200, {
       nf: 'SMSC', nfType: NF_TYPE, nfInstanceId: NF_ID, scAddress: SC_ADDRESS, apiPrefix: SELF_BASE,
-      registeredInNrf: st.registered, messages: st.messages.length,
+      registeredInNrf: st.registered, messages: st.messages.length, storeHeld: st.messages.length, historyKept: st.history.length,
     });
   }
   return false;
@@ -1146,7 +1202,7 @@ module.exports = {
     // go out now, expired ones end with a status report if SRR was set. WAITING keeps waiting for the alert; its
     // fallback nextRetryAt is in the store and sweep() picks it up when due.
     const requeue = new Set();
-    for (const m of st.messages) {
+    for (const m of [...st.messages]) { // a copy: FORWARDED and EXPIRED move to the history
       // Every record has an explicit direction; MTs come only from /api/mt and status reports.
       if (!m.direction) m.direction = m.kind === 'STATUS_REPORT' || m.from === SC_ADDRESS ? 'MT' : 'MO';
       // MO terminates at the SMSC: one an older deploy left ACCEPTED (or in the old MO-to-MT relay) is FORWARDED now.
@@ -1167,5 +1223,5 @@ module.exports = {
   handle,
   // For tests.
   _st: st,
-  _internals: { sweep, kick, nfProfile, resolve, registerInNrf, heartbeat, baseOf, saveStore, metricsSnapshot, metricsText, newMetrics, SC_ADDRESS, NF_ID, NF_TYPE, TIMING, MT_LIMITS, MO_LIMITS },
+  _internals: { allMessages, findMessage, retire, FINAL, HISTORY_MAX, sweep, kick, nfProfile, resolve, registerInNrf, heartbeat, baseOf, saveStore, metricsSnapshot, metricsText, newMetrics, SC_ADDRESS, NF_ID, NF_TYPE, TIMING, MT_LIMITS, MO_LIMITS },
 };

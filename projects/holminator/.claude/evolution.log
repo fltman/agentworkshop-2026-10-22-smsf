@@ -1,0 +1,4 @@
+# HIVE Evolution Log
+2026-10-22 10:06 SPAWN: smsc-sgd-service (need: the SMSC NF itself, SGd-style MO/MT/alert endpoints, store-and-forward, NRF registration)
+2026-10-22 10:06 SPAWN: smsc-interop-contract (need: CONTRACT.md and alignment with four other teams' NFs)
+2026-10-22 10:06 SPAWN: sms-tpdu-codec (need: TS 23.040 SMS-SUBMIT/DELIVER/STATUS-REPORT encoding; may merge if group picks JSON-only)

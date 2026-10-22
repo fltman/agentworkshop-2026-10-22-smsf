@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tompa · Scenario conformance</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .bar { display: flex; gap: 10px; align-items: center; font-size: 12px; margin-bottom: 8px; }
+  td.d-skip { color: var(--warn); }
+  td.wrap { white-space: normal; }
+  tr.rep td { white-space: pre-wrap; color: var(--dim); font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Scenario conformance <small>the 6-step interop script, run through our UE simulator against the live peers</small></h1>
+  <span><a class="pill" href="core.html">Core KPIs →</a> <a class="pill" href="amf.html">← AMF + UE tile</a></span>
+</header>
+<div class="bar">
+  <button id="run">Run scenarios</button>
+  <select id="step"><option value="">all steps</option></select>
+  <span class="meta" id="ts"></span>
+</div>
+<div class="kpis" id="totals"></div>
+<div class="card">
+  <table>
+    <thead><tr><th>#</th><th>Step</th><th>Expected</th><th>Got</th><th>Verdict</th><th>Hop</th><th>Owner</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+<p class="meta">Running registers test UEs and sends SMS through other teams' NFs. Fault reports are drafts: copy one to #build yourself.</p>
+<script src="scenario.js"></script>
+</body>
+</html>

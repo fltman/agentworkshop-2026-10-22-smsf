@@ -14,7 +14,7 @@ function mtRpData(rpMr, from, text) {
 
 test('parseMt reads RP-DATA carrying SMS-DELIVER', () => {
   const { rp } = mtRpData(7, '46700000001', 'Hi UE2 @£');
-  assert.deepStrictEqual(sms.parseMt(rp), { rpMr: 7, scAddress: '46700000100', from: '46700000001', text: 'Hi UE2 @£' });
+  assert.deepStrictEqual(sms.parseMt(rp), { rpMr: 7, scAddress: '46700000100', kind: 'deliver', from: '46700000001', text: 'Hi UE2 @£' });
 });
 
 test('parseMt rejects a bare TPDU without the RP layer', () => {
@@ -44,4 +44,11 @@ test('pack7/unpack7 round-trip, including an 8-septet boundary', () => {
 test('rpAck and rpError echo the RP message reference', () => {
   assert.strictEqual(sms.rpAck(0x2a), '022A41020000');
   assert.strictEqual(sms.rpError(0x2a, 22), '042A0116');
+});
+
+test('parseMt reads an SMS-STATUS-REPORT (holminator #build 174 bytes) and moSubmit sets TP-SRR on request', () => {
+  const r = sms.parseMt('011A07916407000001F00019' + '064D0B916407000000F2620122808503006201228085130000');
+  assert.deepStrictEqual([r.kind, r.rpMr, r.mr, r.from, r.st, r.outcome], ['status-report', 0x1a, 0x4d, '46700000002', 0, 'delivered']);
+  const first = srr => sms.moSubmit({ rpMr: 1, tpMr: 1, scAddress: '46700000100', to: '46700000002', text: 'hi', srr }).slice(24, 26);
+  assert.deepStrictEqual([first(true), first(false)], ['21', '01']);
 });

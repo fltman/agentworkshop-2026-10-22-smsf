@@ -16,7 +16,7 @@ Error bodies are ProblemDetails (TS 29.571): `{"status","cause","detail"}`.
     "n1MessageClass": "SMS",
     "n1MessageContent": { "contentId": "sms" }
   },
-  "smsPayload": { "contentType": "application/vnd.3gpp.sms", "hex": "<RP-DATA carrying SMS-DELIVER TPDU, hex>", "text": "hello" },
+  "smsPayload": { "contentType": "application/vnd.3gpp.sms", "hex": "<RP-DATA carrying an SMS-DELIVER or SMS-STATUS-REPORT TPDU, hex>", "text": "hello" },
   "smsRecordId": "mt-0001"
 }
 ```
@@ -60,9 +60,17 @@ Activate body we send: `{"supi","gpsi","amfId","accessType":"3GPP_ACCESS","guami
 | List UEs | `GET /ue` | every simulated UE with state (`DEREGISTERED`/`REGISTERED`), `reachable`, inbox |
 | Register | `POST /ue/{supi}/register` | UE context in AMF, then SMSF Activate. Returns the SMSF answer. |
 | Deregister | `POST /ue/{supi}/deregister` | SMSF Deactivate, then UE context removed |
-| Send MO SMS | `POST /ue/{supi}/sms` body `{"to":"msisdn-46700000002","text":"hello"}` | UplinkSMS to SMSF, returns the result |
+| Send MO SMS | `POST /ue/{supi}/sms` body `{"to":"msisdn-46700000002","text":"hello","srr":true}` | UplinkSMS to SMSF, returns the result. `srr` (optional) sets TP-SRR to request a status report; it arrives in the inbox with `kind: "status-report"` |
 | Reachability | `POST /ue/{supi}/reachable` body `{"reachable":false}` | next MT SMS gets 504 `UE_NOT_REACHABLE`. Setting it back to true triggers the stretch-goal alert path. |
 | Inbox | `GET /ue/{supi}/inbox` | MT SMS the UE has received |
+| MT failure | `POST /ue/{supi}/mt-error` body `{"cause":22,"count":1}` (both optional, defaults shown) | the next `count` MT SMS to this UE are answered with RP-ERROR and this RP cause (TS 24.011 8.2.5.4) and not put in the inbox; `count` 0 clears it |
+
+Registrations survive a restart of our plugin (every deploy): the registered set is saved, and after a restart
+each of those UEs is re-registered at the AMF and re-activated at the SMSF (a fresh PUT ue-contexts) once our NRF
+registration is back, a few seconds after start. Inbox, reachability and KPIs still reset.
+
+Request bodies to any of our POST endpoints are capped at 64 KB: larger gives 413 `PAYLOAD_TOO_LARGE`,
+malformed JSON gives 400 `INVALID_JSON` (problem+json).
 
 ## Test subscribers
 
@@ -85,6 +93,22 @@ the same identities and holds only UE state (registered, reachable, inbox). SMS 
 
 `GET /faults` lists the peer faults seen, de-duplicated: `{owner, hop, finding, expected, count, firstTs, lastTs, lastLogId, report}`.
 `report` is a drafted #build fault report. `GET /kpi` returns the AMF/UE KPIs shown on the tile.
+
+## Scenario runner
+
+Runs the 6-step interop script through the UE simulator against the live peers (registers test UEs, sends SMS):
+1 happy path (UE1+UE2 activate, MO UE1→UE2, MT RP-DATA to UE2), 2 UE3 `SMS_NOT_ALLOWED`, 3 UE5 `MO_SMS_BARRED`,
+4 MO to MT-barred UE4 (cause, no delivery), 5 MWD + alert (UE2 unreachable, then back: later delivery), 6 unknown
+SUPI `USER_UNKNOWN`. MT is polled in the UE inbox for up to 5 s (8 s after the alert in step 5).
+
+| What | Call | Result |
+|---|---|---|
+| Run | `POST /scenario/run` or `POST /scenario/run?step=N` | the run: `{startedAt, finishedAt, only, summary:{pass,fail,skip}, steps:[...]}`. 409 `SCENARIO_RUNNING` if a run is in progress, 400 `INVALID_STEP`. |
+| Last run | `GET /scenario` | the last run (`startedAt: null` before the first) plus `running` and `available` steps |
+
+Each step: `{step, name, expected, got, verdict: "pass"|"fail"|"skip", hop, owner, report}`. `report` is a drafted
+#build fault report for failing steps (never posted automatically). `skip` means inconclusive or not supported yet
+(for example MWD/alert pending). Tile: `/colony/tompa/scenario.html`.
 
 ## NRF profile
 

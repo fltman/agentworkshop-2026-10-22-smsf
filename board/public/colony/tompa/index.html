@@ -3,53 +3,65 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>tompa · AMF + UE simulator</title>
+<meta name="colony" content="group-app">
+<title>5G Core Light · SMS over NAS</title>
 <link rel="stylesheet" href="style.css">
+<style>
+  #chain { display: flex; gap: 8px; align-items: stretch; flex-wrap: wrap; margin-bottom: 12px; }
+  #chain .node { flex: 1; min-width: 140px; text-decoration: none; color: var(--fg); border-left: 4px solid var(--dim); }
+  #chain .node.ok { border-color: var(--ok); } #chain .node.warn { border-color: var(--warn); } #chain .node.bad { border-color: var(--bad); }
+  #chain .arrow { align-self: center; color: var(--dim); }
+  #chain .nf { font-size: 18px; font-weight: 600; } #chain .team { color: var(--dim); font-size: 11px; }
+  #e2e-steps { list-style: none; padding: 0; margin: 8px 0 0; font-size: 12px; }
+  #e2e-steps li { padding: 3px 0; } .s-ok { color: var(--ok); } .s-bad { color: var(--bad); } .s-warn { color: var(--warn); }
+  iframe { width: 100%; height: 460px; border: 0; border-radius: 8px; background: var(--card); }
+  .links a { margin: 0 4px 4px 0; display: inline-block; color: var(--acc); }
+</style>
 </head>
 <body>
 <header>
-  <h1>AMF + UE simulator <small>team tompa · 5G Core Light</small></h1>
-  <a class="pill" href="core.html">Core KPIs →</a> <a class="pill" href="flow.html">Call flow →</a>
-  <div id="nrf" class="pill">NRF …</div>
+  <h1>5G Core Light <small>SMS over NAS · the whole group's network, live</small></h1>
+  <span class="meta" id="ts"></span>
 </header>
 
-<section class="kpis" id="kpis"></section>
+<div id="chain"></div>
 
-<section class="grid">
+<div class="grid">
   <div class="card">
-    <h2>Simulated UEs</h2>
-    <table id="ues">
-      <thead><tr><th>SUPI</th><th>GPSI</th><th>State</th><th>SMS</th><th>Reachable</th><th>Actions</th></tr></thead>
-      <tbody></tbody>
-    </table>
-    <form id="mo">
-      <h3>Send MO SMS</h3>
-      <select id="mo-from"></select>
-      <input id="mo-to" placeholder="to, e.g. msisdn-46700000002" value="msisdn-46700000002">
-      <input id="mo-text" placeholder="text" value="Hello from tompa UE" maxlength="160">
-      <button type="submit">Send</button>
-    </form>
-    <pre id="result" class="result"></pre>
+    <h2>Send an SMS end to end <small>UE → AMF → SMSF → SMSC → SMSF → AMF → UE</small></h2>
+    <label>from <select id="from"></select></label>
+    <label>to <select id="to"></select></label>
+    <input id="text" value="hello from the group app">
+    <button id="send">Send</button>
+    <ul id="e2e-steps"></ul>
   </div>
-
   <div class="card">
-    <h2>Peer faults <small>boundary decoder</small></h2>
-    <div id="faults"></div>
-    <h2>Failure causes</h2>
-    <div id="causes"></div>
-    <h2>Latest MT inbox</h2>
-    <ul id="inbox"></ul>
+    <h2>Test tools <small>team tompa</small></h2>
+    <div class="links">
+      <a href="bench.html">Test bench (9 cases, OK/NOK)</a>
+      <a href="scenario.html">Interop scenarios</a>
+      <a href="load.html">Load generator</a>
+      <a href="core.html">Core KPIs</a>
+      <a href="flow.html">Call flow</a>
+      <a href="amf.html">AMF + UE simulator</a>
+    </div>
+    <h3>Every team's own tile</h3>
+    <div class="links" id="tiles"></div>
   </div>
-</section>
+</div>
 
-<section class="card">
-  <h2>Message log <small>newest first</small></h2>
-  <table id="log">
-    <thead><tr><th>Time</th><th>Dir</th><th>Peer</th><th>Request</th><th>Status</th><th>Diagnosis</th></tr></thead>
-    <tbody></tbody>
-  </table>
-</section>
+<div class="grid">
+  <div class="card">
+    <h2>Messages in the SMSC <small>latest 12, from holminator</small></h2>
+    <table><thead><tr><th>Time</th><th>Dir</th><th>From</th><th>To</th><th>Text</th><th>Status</th></tr></thead><tbody id="msgs"></tbody></table>
+  </div>
+  <div class="card"><h2>Totals</h2><div class="kpis" id="totals"></div></div>
+</div>
 
-<script src="app.js"></script>
+<h2>Call flow <small>signalling seen by the AMF</small></h2>
+<iframe src="flow.html" title="call flow"></iframe>
+
+<script src="core.js"></script>
+<script src="group.js"></script>
 </body>
 </html>

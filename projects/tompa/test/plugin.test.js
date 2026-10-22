@@ -153,3 +153,63 @@ test('reachable again re-activates SMS at the SMSF (MWD alert trigger); deregist
   assert.strictEqual(d.body.smsf.status, 204);
   assert.strictEqual(d.body.state, 'DEREGISTERED');
 });
+
+test('traffic generator: start registers senders, sends MO load at the capped rate, stop halts it', async () => {
+  const started = await api('POST', '/traffic/start', { rate: 50, durationS: 30 });
+  assert.strictEqual(started.status, 200);
+  assert.strictEqual(started.body.rate, 5);
+  assert.ok(started.body.running);
+  await sleep(1100);
+  const mid = await api('GET', '/traffic');
+  assert.ok(mid.body.totals.sent >= 3, `sent ${mid.body.totals.sent}`);
+  assert.ok(mid.body.totals.ok >= 1);
+  const stopped = await api('POST', '/traffic/stop');
+  assert.strictEqual(stopped.body.running, false);
+  const n = stopped.body.totals.sent;
+  await sleep(500);
+  assert.strictEqual((await api('GET', '/traffic')).body.totals.sent, n);
+});
+
+test('registered UEs survive a restart: init re-registers the UEs saved in ctx.dataDir', async () => {
+  const fs = require('node:fs'); const os = require('node:os'); const p = require('node:path');
+  const dir = fs.mkdtempSync(p.join(os.tmpdir(), 'tompa-'));
+  const UE4 = 'imsi-001010000000004';
+  fs.writeFileSync(p.join(dir, 'ues.json'), JSON.stringify({ registered: [UE4, 'imsi-not-ours'] }));
+  plugin.init({ dataDir: dir });
+  let ue;
+  for (let i = 0; i < 40 && !(ue && ue.state === 'REGISTERED'); i++) {
+    await new Promise(r => setTimeout(r, 200));
+    ue = (await api('GET', `/ue/${UE4}`)).body;
+  }
+  assert.strictEqual(ue.state, 'REGISTERED');
+  assert.strictEqual(ue.smsActive, true);
+  await api('POST', `/ue/${UE4}/deregister`);
+  assert.ok(!JSON.parse(fs.readFileSync(p.join(dir, 'ues.json'), 'utf8')).registered.includes(UE4));
+  fs.rmSync(dir, { recursive: true });
+});
+
+test('POST bodies are capped at 64 KB (413), malformed JSON is 400 (spore backend-6)', async () => {
+  const big = await api('POST', `/ue/${UE1}/sms`, { to: 'msisdn-46700000002', text: 'x'.repeat(70 * 1024) });
+  assert.strictEqual(big.status, 413);
+  assert.strictEqual(big.body.cause, 'PAYLOAD_TOO_LARGE');
+  const r = await fetch(`http://127.0.0.1:${amf.address().port}/t/tompa/ue/${UE1}/sms`, { method: 'POST', body: '{nope' });
+  assert.strictEqual(r.status, 400);
+});
+
+test('mt-error: the next MT is answered with RP-ERROR and the injected cause, then RP-ACK again', async () => {
+  await api('POST', `/ue/${UE1}/register`);
+  const set = await api('POST', `/ue/${UE1}/mt-error`, { cause: 22 });
+  assert.deepStrictEqual(set.body.mtError, { cause: 22, left: 1 });
+  const uplinks = () => seen.filter(x => x.url.endsWith(`/ue-contexts/${UE1}/sendsms`));
+  const before = uplinks().length;
+  await n1n2(UE1, mtRpData(9, '46700000002', 'nope').rp, 'mt-err-1');
+  await new Promise(r => setTimeout(r, 150));
+  const err = uplinks().at(-1).body.jsonData.smsPayload.hex;
+  assert.strictEqual(uplinks().length, before + 1);
+  assert.deepStrictEqual(err, sms.rpError(9, 22));
+  assert.ok(!(await api('GET', `/ue/${UE1}/inbox`)).body.some(m => m.text === 'nope'));
+  await n1n2(UE1, mtRpData(10, '46700000002', 'yes').rp, 'mt-err-2');
+  await new Promise(r => setTimeout(r, 150));
+  assert.deepStrictEqual(uplinks().at(-1).body.jsonData.smsPayload.hex, sms.rpAck(10));
+  assert.strictEqual((await api('POST', `/ue/${UE1}/mt-error`, { cause: 500 })).status, 400);
+});

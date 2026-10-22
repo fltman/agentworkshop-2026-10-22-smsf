@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tompa · 5G Core Light test bench</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  #cases { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 10px; }
+  .card .head { display: flex; align-items: center; gap: 8px; }
+  .card .title { flex: 1; font-weight: 600; }
+  .grp { font-size: 10px; padding: 2px 6px; border-radius: 4px; background: #263247; color: var(--dim); }
+  .grp.reg { color: #7cc4ff; } .grp.dereg { color: #c9a0ff; } .grp.mo { color: #ffd479; } .grp.mt { color: #7dffb0; }
+  .badge { min-width: 44px; text-align: center; font-weight: 700; padding: 3px 8px; border-radius: 4px; background: #263247; color: var(--dim); }
+  .badge.ok { background: var(--ok); color: #08130c; } .badge.nok { background: var(--bad); color: #fff; }
+  .badge.run { color: #ffd479; }
+  .detail { font-size: 12px; color: var(--dim); margin-top: 6px; cursor: pointer; }
+  .raw { display: none; font-size: 11px; max-height: 220px; overflow: auto; margin: 6px 0 0; }
+  .raw.open { display: block; }
+  .bar { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; }
+  #sum.ok { color: var(--ok); font-weight: 700; } #sum.nok { color: var(--bad); font-weight: 700; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Test bench <small>one click per case against the live core · OK = the expected outcome</small></h1>
+  <span><a class="pill" href="scenario.html">Scenarios →</a> <a class="pill" href="amf.html">← AMF + UE tile</a></span>
+</header>
+<div class="card bar">
+  <button id="all">Run all</button><span id="sum" class="meta"></span>
+  <span class="meta">Uses test subscribers: UE1/UE2 ok, UE3 no SMS, UE4 MT-barred, UE5 MO-barred, unknown IMSI. MT via the SMSC (holminator). Click a result for the raw answer.</span>
+</div>
+<div id="cases"></div>
+<script src="bench.js"></script>
+</body>
+</html>

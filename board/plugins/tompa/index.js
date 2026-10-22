@@ -3,6 +3,10 @@
 
 const sms = require('./sms');
 const diagnose = require('./diagnose');
+const scenario = require('./scenario');
+const traffic = require('./traffic');
+const fs = require('node:fs');
+const nodePath = require('node:path');
 
 const TEAM = 'tompa';
 // Peers publish absolute apiPrefix values, so we register and call on the public origin (override for local runs).
@@ -30,9 +34,35 @@ const SUBSCRIBERS = [
 
 const ues = new Map();
 function newUe(supi, gpsi) {
-  return { supi, gpsi, state: 'DEREGISTERED', smsActive: false, reachable: true, lastSmsf: null, inbox: [], outbox: [] };
+  return { supi, gpsi, state: 'DEREGISTERED', smsActive: false, reachable: true, mtError: null, lastSmsf: null, inbox: [], outbox: [] };
 }
 for (const [supi, gpsi] of SUBSCRIBERS) ues.set(supi, newUe(supi, gpsi));
+
+// Registered UEs survive a plugin restart (deploy): saved to ctx.dataDir, re-registered once the NRF is up,
+// so peers do not get 409 UE_NOT_REGISTERED after every release round (krilju #build 189).
+let stateFile = null;
+let toRestore = [];
+function saveUes() {
+  if (!stateFile) return;
+  const registered = [...ues.values()].filter(u => u.state === 'REGISTERED').map(u => u.supi);
+  try { fs.writeFileSync(stateFile, JSON.stringify({ registered })); } catch (e) { console.error(`[${TEAM}] save ues:`, e.message); }
+}
+function loadUes(dataDir) {
+  stateFile = nodePath.join(dataDir, 'ues.json');
+  try { toRestore = JSON.parse(fs.readFileSync(stateFile, 'utf8')).registered.filter(s => ues.has(s)); } catch { toRestore = []; }
+}
+async function restoreUes() {
+  const todo = toRestore;
+  toRestore = [];
+  for (const supi of todo) {
+    const ue = ues.get(supi);
+    if (ue.state === 'REGISTERED') continue;
+    const r = (await invoke(register, ue)).body;
+    // No SMSF reachable yet: try again on the next NRF tick.
+    if (!r.smsActive && [0, 503].includes(r.smsf && r.smsf.status)) { ue.state = 'DEREGISTERED'; toRestore.push(supi); }
+  }
+  saveUes();
+}
 
 const log = [];
 let seq = 0;
@@ -85,15 +115,19 @@ const faults = new Map();
 function judge(entry, diag) {
   if (!entry || !diag) return diag;
   entry.diag = diag;
-  if (diag.verdict !== 'fault') return diag;
+  addFault(entry, diag);
+  if (diag.also) addFault(entry, diag.also);
+  return diag;
+}
+function addFault(entry, diag) {
+  if (diag.verdict !== 'fault') return;
   const key = `${diag.owner}|${diag.hop}|${diag.finding}`;
   const f = faults.get(key) || { owner: diag.owner, hop: diag.hop, finding: diag.finding, expected: diag.expected, count: 0, firstTs: entry.ts };
   f.count++;
   f.lastTs = entry.ts;
   f.lastLogId = entry.id;
-  f.report = diagnose.report(entry);
+  f.report = diagnose.report({ ...entry, diag });
   faults.set(key, f);
-  return diag;
 }
 
 function send(res, status, body, type = 'application/json') {
@@ -103,12 +137,23 @@ function send(res, status, body, type = 'application/json') {
 }
 const problem = (res, status, cause, detail) => send(res, status, { status, cause, detail }, 'application/problem+json');
 
+// Bodies are capped (spore backend-6): past MAX_BODY we keep draining but drop the bytes, so the
+// socket stays usable for the 413 and a large POST cannot grow memory on the shared server.
+const MAX_BODY = 64 * 1024;
 async function readJson(req) {
   const chunks = [];
-  for await (const c of req) chunks.push(c);
+  let size = 0;
+  for await (const c of req) {
+    size += c.length;
+    if (size <= MAX_BODY) chunks.push(c);
+  }
+  if (size > MAX_BODY) throw Object.assign(new Error(`body is ${size} bytes, max ${MAX_BODY}`), { tooLarge: true });
   const t = Buffer.concat(chunks).toString('utf8');
   return t ? JSON.parse(t) : {};
 }
+const bodyProblem = (res, e) => (e.tooLarge
+  ? problem(res, 413, 'PAYLOAD_TOO_LARGE', e.message)
+  : problem(res, 400, 'INVALID_JSON', 'body is not JSON'));
 
 async function call(peer, method, url, body, type = 'application/json') {
   const path = url.replace(HOST, '');
@@ -228,6 +273,7 @@ async function register(res, ue) {
   kpis.reg.attempts++;
   const r = await activateSms(ue);
   if (ue.smsActive) kpis.reg.smsActivated++; else { kpis.reg.smsRefused++; bump(kpis.reg.causes, causeOf(r)); }
+  saveUes();
   return send(res, 200, { supi: ue.supi, state: ue.state, smsActive: ue.smsActive, smsf: { status: r.status, body: r.body } });
 }
 
@@ -246,6 +292,7 @@ async function deregister(res, ue) {
   ue.state = 'DEREGISTERED';
   ue.smsActive = false;
   ue.lastSmsf = smsf && { op: 'deactivate', ...smsf };
+  saveUes();
   return send(res, 200, { supi: ue.supi, state: ue.state, smsf });
 }
 
@@ -260,16 +307,16 @@ async function uplink(ue, smsRecordId, hexPayload, text) {
 
 async function moSms(req, res, ue) {
   let b;
-  try { b = await readJson(req); } catch { return problem(res, 400, 'INVALID_JSON', 'body is not JSON'); }
+  try { b = await readJson(req); } catch (e) { return bodyProblem(res, e); }
   if (!b.to || typeof b.text !== 'string') return problem(res, 400, 'MANDATORY_IE_MISSING', 'to and text are required');
   if (ue.state !== 'REGISTERED') return problem(res, 409, 'UE_NOT_REGISTERED', 'register the UE first');
   if (!ue.smsActive) return problem(res, 409, 'SMS_NOT_ACTIVE', 'SMS over NAS is not active for this UE');
   const rpMr = nextMr();
-  const hexPayload = sms.moSubmit({ rpMr, tpMr: rpMr, scAddress: SC_ADDRESS, to: b.to, text: b.text });
+  const hexPayload = sms.moSubmit({ rpMr, tpMr: rpMr, scAddress: SC_ADDRESS, to: b.to, text: b.text, srr: b.srr === true });
   const smsRecordId = `mo-${TEAM}-${Date.now()}-${rpMr}`;
   kpis.mo.attempts++;
   const r = await uplink(ue, smsRecordId, hexPayload, b.text);
-  judge(r.entry, diagnose.smsfResponse('sendsms', ue.supi, r.status, r.body));
+  judge(r.entry, diagnose.smsfResponse('sendsms', ue.supi, r.status, r.body, { sentHex: hexPayload }));
   const ok = r.status === 200;
   if (ok) kpis.mo.ok++; else { kpis.mo.failed++; bump(kpis.mo.causes, causeOf(r)); }
   ue.outbox.unshift({ ts: new Date().toISOString(), smsRecordId, to: b.to, text: b.text, ok, status: r.status, result: r.body });
@@ -277,9 +324,20 @@ async function moSms(req, res, ue) {
   return send(res, ok ? 200 : 502, { smsRecordId, delivered: ok, smsf: { status: r.status, body: r.body } });
 }
 
+async function setMtError(req, res, ue) {
+  let b;
+  try { b = await readJson(req); } catch (e) { return bodyProblem(res, e); }
+  const cause = b.cause === undefined ? 22 : b.cause;
+  const count = b.count === undefined ? 1 : b.count;
+  if (!Number.isInteger(cause) || cause < 1 || cause > 127) return problem(res, 400, 'INVALID_IE', 'cause must be an RP cause 1-127');
+  if (!Number.isInteger(count) || count < 0 || count > 100) return problem(res, 400, 'INVALID_IE', 'count must be 0-100');
+  ue.mtError = count ? { cause, left: count } : null;
+  return send(res, 200, { supi: ue.supi, mtError: ue.mtError });
+}
+
 async function setReachable(req, res, ue) {
   let b;
-  try { b = await readJson(req); } catch { return problem(res, 400, 'INVALID_JSON', 'body is not JSON'); }
+  try { b = await readJson(req); } catch (e) { return bodyProblem(res, e); }
   if (typeof b.reachable !== 'boolean') return problem(res, 400, 'MANDATORY_IE_MISSING', 'reachable (boolean) is required');
   const was = ue.reachable;
   ue.reachable = b.reachable;
@@ -298,9 +356,9 @@ async function setReachable(req, res, ue) {
 async function n1n2(req, res, supi) {
   let b;
   const n1n2Path = `/namf-comm/v1/ue-contexts/${supi}/n1-n2-messages`;
-  try { b = await readJson(req); } catch {
+  try { b = await readJson(req); } catch (e) {
     judge(rec('in', 'smsf', 'POST', n1n2Path, null, null), diagnose.n1n2(null));
-    return problem(res, 400, 'INVALID_JSON', 'body is not JSON');
+    return bodyProblem(res, e);
   }
   judge(rec('in', 'smsf', 'POST', n1n2Path, null, b), diagnose.n1n2(b));
   kpis.mt.received++;
@@ -314,8 +372,16 @@ async function n1n2(req, res, supi) {
   let parsed = null;
   let parseError = null;
   try { parsed = sms.parseMt(hexPayload); } catch (e) { parseError = e.message; }
-  if (parsed) {
-    ue.inbox.unshift({ ts: new Date().toISOString(), smsRecordId: b.smsRecordId || null, from: parsed.from,
+  // Injected failure (POST /ue/{supi}/mt-error): the UE reads the MT but rejects it with RP-ERROR and this cause.
+  let injected = null;
+  if (parsed && ue.mtError && ue.mtError.left > 0) {
+    injected = ue.mtError.cause;
+    if (--ue.mtError.left === 0) ue.mtError = null;
+    parseError = `injected RP-ERROR cause ${injected}`;
+    parsed = { ...parsed, injected };
+  }
+  if (parsed && !injected) {
+    ue.inbox.unshift({ ts: new Date().toISOString(), smsRecordId: b.smsRecordId || null, kind: parsed.kind, from: parsed.from,
       text: parsed.text !== null ? parsed.text : (b.smsPayload.text || null), scAddress: parsed.scAddress, hex: hexPayload });
     ue.inbox.length = Math.min(ue.inbox.length, 20);
   }
@@ -323,10 +389,12 @@ async function n1n2(req, res, supi) {
 
   // TS 23.502 4.13.3.6: the UE answers the MT SMS on the uplink. RP-ACK if we could read it, RP-ERROR otherwise.
   // RP-ERROR cause 111 = protocol error, unspecified (TS 24.011 8.2.5.4).
-  const answer = parsed ? sms.rpAck(parsed.rpMr) : sms.rpError(parseInt(hexPayload.slice(2, 4), 16) || 0, 111);
-  if (parsed) { kpis.mt.delivered++; kpis.report.rpAck++; } else kpis.report.rpError++;
+  const accepted = parsed && !injected;
+  const answer = accepted ? sms.rpAck(parsed.rpMr)
+    : injected ? sms.rpError(parsed.rpMr, injected) : sms.rpError(parseInt(hexPayload.slice(2, 4), 16) || 0, 111);
+  if (accepted) { kpis.mt.delivered++; kpis.report.rpAck++; } else kpis.report.rpError++;
   const t = setTimeout(() => {
-    uplink(ue, b.smsRecordId, answer, parsed ? undefined : `RP-ERROR: ${parseError}`)
+    uplink(ue, b.smsRecordId, answer, accepted ? undefined : `RP-ERROR: ${parseError}`)
       .then(r => {
         judge(r.entry, diagnose.smsfResponse('report', ue.supi, r.status, r.body));
         if (r.status === 200) kpis.report.uplinkOk++; else kpis.report.uplinkFailed++;
@@ -337,11 +405,44 @@ async function n1n2(req, res, supi) {
   return true;
 }
 
+// ---------- scenario runner: drives the UE simulator handlers in-process (projects/tompa/CONTRACT.md) ----------
+
+async function invoke(fn, ue, body) {
+  const out = { status: 0, body: null };
+  const res = { writeHead(s) { out.status = s; }, end(t) { out.body = t ? JSON.parse(t) : null; } };
+  const req = { async *[Symbol.asyncIterator]() { if (body !== undefined) yield Buffer.from(JSON.stringify(body)); } };
+  if (fn === moSms || fn === setReachable) await fn(req, res, ue); else await fn(res, ue);
+  return out;
+}
+const ueBy = supi => { const ue = ues.get(supi); if (!ue) throw new Error(`no simulated UE ${supi}`); return ue; };
+const runner = scenario.createRunner({
+  register: async supi => (await invoke(register, ueBy(supi))).body,
+  deregister: async supi => (await invoke(deregister, ueBy(supi))).body,
+  sendSms: (supi, to, text) => invoke(moSms, ueBy(supi), { to, text }),
+  setReachable: async (supi, reachable) => (await invoke(setReachable, ueBy(supi), { reachable })).body,
+  inbox: supi => ueBy(supi).inbox,
+  lastLogId: () => seq,
+  logSince: id => log.filter(e => e.id > id),
+  originateMt: (to, text) => call('smsc', 'POST', `${HOST}/t/holminator/api/mt`, { to, text }),
+});
+const load = traffic.createGenerator({
+  sendSms: (supi, to, text) => invoke(moSms, ueBy(supi), { to, text }),
+  ensureRegistered: async supi => {
+    const ue = ueBy(supi);
+    if (ue.state === 'REGISTERED' && ue.smsActive) return { supi, already: true };
+    return (await invoke(register, ue)).body;
+  },
+  setTimer: (fn, ms) => { const t = setInterval(fn, ms); if (t.unref) t.unref(); return t; },
+});
+
 // ---------- routing ----------
 
 module.exports = {
-  init() {
-    const tick = () => heartbeat().catch(e => console.error(`[${TEAM}] nrf:`, e.message));
+  init(ctx = {}) {
+    if (ctx.dataDir) loadUes(ctx.dataDir);
+    const tick = () => heartbeat()
+      .then(() => (nrf.registered && toRestore.length ? restoreUes() : null))
+      .catch(e => console.error(`[${TEAM}] nrf:`, e.message));
     const first = setTimeout(() => { try { tick(); } catch (e) { console.error(`[${TEAM}]`, e.message); } }, 3000);
     if (first.unref) first.unref();
     // Until registered: retry every 10 s. Then heartbeat every HEARTBEAT_S. One timer, re-armed each round.
@@ -363,7 +464,7 @@ module.exports = {
     }
 
     if (req.method === 'GET' && path === '/ue') return send(res, 200, [...ues.values()]);
-    const u = path.match(/^\/ue\/([^/]+)(?:\/(register|deregister|sms|reachable|inbox))?$/);
+    const u = path.match(/^\/ue\/([^/]+)(?:\/(register|deregister|sms|reachable|inbox|mt-error))?$/);
     if (u) {
       const ue = ueOr404(res, decodeURIComponent(u[1]));
       if (!ue) return true;
@@ -376,9 +477,31 @@ module.exports = {
       if (action === 'deregister') return deregister(res, ue);
       if (action === 'sms') return moSms(req, res, ue);
       if (action === 'reachable') return setReachable(req, res, ue);
+      if (action === 'mt-error') return setMtError(req, res, ue);
       return problem(res, 405, 'METHOD_NOT_ALLOWED', 'see CONTRACT.md');
     }
 
+    if (req.method === 'GET' && path === '/scenario') return send(res, 200, { startedAt: null, steps: [], ...runner.last(), running: runner.running(), available: scenario.STEPS });
+    if (req.method === 'POST' && path === '/scenario/run') {
+      const step = new URL(req.url, 'http://x').searchParams.get('step');
+      rec('in', 'trigger', 'POST', `${path}${step ? `?step=${step}` : ''}`, null, null);
+      try { return send(res, 200, await runner.run(step || undefined)); } catch (e) {
+        if (e.code === 'BUSY') return problem(res, 409, 'SCENARIO_RUNNING', e.message);
+        if (e.code === 'NO_STEP') return problem(res, 400, 'INVALID_STEP', e.message);
+        throw e;
+      }
+    }
+    if (req.method === 'GET' && path === '/traffic') return send(res, 200, load.stats());
+    if (req.method === 'POST' && path === '/traffic/start') {
+      let b = {};
+      try { b = await readJson(req); } catch (e) { return bodyProblem(res, e); }
+      rec('in', 'trigger', 'POST', `${path} rate=${b.rate}`, null, null);
+      return send(res, 200, await load.start({ rate: b.rate, durationS: b.durationS }));
+    }
+    if (req.method === 'POST' && path === '/traffic/stop') {
+      rec('in', 'trigger', 'POST', path, null, null);
+      return send(res, 200, load.stop('stopped'));
+    }
     if (req.method === 'GET' && path === '/log') return send(res, 200, log.slice(-100).reverse());
     if (req.method === 'GET' && path === '/kpi') return send(res, 200, kpi());
     if (req.method === 'GET' && path === '/faults') {

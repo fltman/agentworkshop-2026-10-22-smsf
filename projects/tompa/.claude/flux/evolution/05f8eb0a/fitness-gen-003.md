@@ -1,0 +1,39 @@
+# 05f8eb0a fitness, generation 3 (FLUX strict, 2026-10-22 11:07)
+
+Same weights as gen-002: live faults with no FP (40), hop/owner (30), cost (15), demo (15).
+
+| Timeline | Gen | Live (40) | Hop/owner (30) | Cost (15) | Demo (15) | Fitness | Δ | Flags |
+|---|---|---|---|---|---|---|---|---|
+| α boundary decoder | 003 | 14: FIRST LIVE FALSE POSITIVE, holminator #build 174: a valid SMS-STATUS-REPORT (TP-MTI 2) was flagged "RP-DATA does not decode" and our UE sent RP-ERROR, the SMSF answered 502. Fixed in sms.parseMt within 7 min (PR 20). | 22: blame on the FP was wrong (SMSF blamed, the defect was ours) | 14 | 13: opts and diag.also now wired in index.js | **63** | −3 ▼ | own-node blind spot: the decoder shares the codec it judges |
+| β scenario runner | 003 | 12: still not run live (PR 20 not deployed) | 18 | 12 | 14 | **56** | 0 ─ | UNPROVEN, stagnant on paper only |
+| γ trace correlator | 002 | 16: no new work | 22 | 9 | 14 | **61** | 0 ─ | idle |
+| δ α×β cross | 001 | provisional, no live run | | | | **61 (provisional)** | — | unscored |
+
+## Termination check
+None below 20. No timeline has two scored declines. Nothing terminated.
+
+## Mutations recorded (no gen-004: 3-generation cap)
+- α: SKILL_ADD spec-coverage 0.7 (enumerate every TP-MTI/RP-MTI the peer may legally send before calling it a fault);
+  defensive 0.6 → 0.7; rule: when the decoder throws on OUR codec, blame tompa first, not the sender.
+- β, δ: no mutation until live evidence. γ: none.
+
+## Decision
+Generation 3 is scored, but β and δ have zero live evidence and α's lead is gone (63 vs 61 vs 61, < 5).
+Selecting now would crown a winner on paper. /select runs right after the approved live run
+(6 scenarios, then 1 msg/s for 5 min) as soon as PR 20 is live; that run scores β, δ and α held-out at once.
+Lesson for the graveyard/winner file: a decoder that reuses the node's own codec inherits its blind spots.
+
+## Live run (2026-10-22 11:52-11:58, PR 20 deployed)
+Evidence: scenario runner 6/6 pass live (happy path, SMS_NOT_ALLOWED, MO_SMS_BARRED, MT-barred cause, MWD + alert
+redelivery, USER_UNKNOWN). Load 1 msg/s for 300 s: 299 sent, 272 ok, 27 expected MO_SMS_BARRED, 0 failed,
+p95 45 ms, auto-stop. Faults list: 2 entries blamed on krilju (SMSF→AMF, missing n1MessageClass, missing smsRecordId),
+both from our own curl probes at 11:52: a FALSE POSITIVE, the decoder blames the endpoint's usual caller, not the sender.
+
+| Timeline | Live (40) | Hop/owner (30) | Cost (15) | Demo (15) | Fitness | Δ |
+|---|---|---|---|---|---|---|
+| β scenario runner | 36: 6/6 live, load 100 %, found the MO-terminates-at-SMSC change before peers said it | 22: per-step owner, no misattribution | 12 | 15: bench, group app button | **85** | +29 ▲ |
+| δ α×β cross | 30: β's driver passes, inherits α's misattribution | 20 | 12 | 15 | **77** | +16 ▲ |
+| γ trace correlator | 16 | 22 | 9 | 15: call flow embedded in group app | **62** | +1 ─ |
+| α boundary decoder | 10: 2nd live FP class (probe traffic blamed on krilju) | 18 | 14 | 13 | **55** | −8 ▼ |
+
+Decision: β leads by 8 (≥ 5) after generation 3 → /select β.

@@ -173,7 +173,10 @@ test('MT: UE RP-ERROR is reported to the SMSC as a failure', async () => {
   await req('POST', '/nsmsf-sms/v2/ue-contexts/imsi-001010000000002/sendsms', { jsonData: { smsRecordId: 'mt-test-3', smsPayload: { hex: `04${rpHex.slice(2, 4)}0116` } } });
   const r = await pending;
   assert.strictEqual(r.status, 502);
+  assert.strictEqual(r.body.result, 'FAILURE');
   assert.strictEqual(r.body.rpCause, 0x16);
+  assert.strictEqual(typeof r.body.rpCause, 'number', 'contract: rpCause is an integer, always present');
+  assert.strictEqual(r.body.deliveryReport, undefined, 'no TPDU from the UE, so no deliveryReport');
 });
 
 test('MT: unreachable UE gives 504 ABSENT_SUBSCRIBER, unknown subscriber 404, missing body 400', async () => {

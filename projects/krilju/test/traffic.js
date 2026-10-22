@@ -60,7 +60,7 @@ async function step(i) {
     kind = 'MO';
     r = await moSms(from, msisdn(to), text);
   }
-  const ok = r.status >= 200 && r.status < 300 && (kind === 'MT' || r.body.delivered !== false);
+  const ok = r.status >= 200 && r.status < 300 && (kind === 'MT' || !r.body || r.body.delivered !== false);
   stats[kind][ok ? 'ok' : 'fail']++;
   console.log(`${new Date().toTimeString().slice(0, 8)} ${kind} #${i} ${ok ? 'ok' : 'FAIL'} http ${r.status} | MO ${stats.MO.ok}/${stats.MO.ok + stats.MO.fail} MT ${stats.MT.ok}/${stats.MT.ok + stats.MT.fail}`);
 }

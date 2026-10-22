@@ -4,7 +4,7 @@ type: capability
 domain: meta
 tools: Read, Write, Edit, Bash, Grep
 model: inherit
-energy: 50
+energy: 60
 spawned: 2026-10-22
 can-merge-with: []
 ---

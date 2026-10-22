@@ -72,12 +72,13 @@ CALL_BARRED, FAILURE (5555). The Diameter code goes in `diameterResultCode` wher
 
 | # | Step | Capability | Done when |
 |---|---|---|---|
-| 0 | CONTRACT.md written, summary in #build, open questions asked | smsc-interop-contract | posted |
-| 1 | Plugin skeleton: routes, log, store, NRF register and heartbeat, first PR | smsc-sgd-service | live in colony, visible in NRF |
-| 2 | MO forward endpoint | smsc-sgd-service, sms-tpdu-codec | krilju's SMSF gets 2001 from us |
+| 0 ✅ | CONTRACT.md written, summary in #build, open questions asked | smsc-interop-contract | posted |
+| 1 ✅ | Plugin skeleton: routes, log, store, NRF register and heartbeat, first PR | smsc-sgd-service | live in colony, visible in NRF |
+| 2 ✅ code, interop pending | MO forward endpoint: validation, SC address, TP-RD duplicates, TP-VP expiry, SUBMIT-REPORT on ACK and error | smsc-sgd-service, sms-tpdu-codec | krilju's SMSF gets 2001 from us |
+| 2a ✅ | Metrics (/api/metrics, /metrics), test surface (/test, ?dryRun, ?scenario, /test/encode, /test/decode), tile with metrics, store, log, test console | smsc-sgd-service | other teams can test against us without us |
 | 3 | MT: trigger, SRI to UDM, MT forward to SMSF | smsc-sgd-service | an MT SMS reaches tompa's UE |
-| 4 | Error cases, mapped result codes | smsc-sgd-service | unknown, not allowed, absent all shown |
-| 5 | Tile (store, log, send form; textContent only) | smsc-sgd-service | usable in demo |
+| 4 | Error cases, mapped result codes; absolute and enhanced TP-VP (C6/C7, SPEC-NOTES 7-9) | smsc-sgd-service | unknown, not allowed, absent all shown |
+| 5 ✅ | Tile (store, log, send form; textContent only) | smsc-sgd-service | usable in demo |
 | 6 | Stretch: store-and-forward plus alert | smsc-sgd-service | redelivery after re-register |
 | 7 | Demo script end to end | smsc-interop-contract | runs registration, MO, MT across all NFs |
 

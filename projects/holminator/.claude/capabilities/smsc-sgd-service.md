@@ -4,7 +4,7 @@ type: capability
 domain: backend
 tools: Read, Write, Edit, Bash, Grep, Glob
 model: inherit
-energy: 50
+energy: 70
 spawned: 2026-10-22
 can-merge-with: [sms-tpdu-codec]
 ---

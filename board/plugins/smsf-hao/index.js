@@ -110,12 +110,16 @@ function normaliseType(t) {
 // top of TS 29.510 (the spec makes the consumer assemble it); it is documented in CONTRACT.md.
 function apiRootFor(profile, service) {
   if (service && service.apiRoot) return service.apiRoot;
+  const rawPrefix = service && service.apiPrefix ? String(service.apiPrefix).replace(/\/$/, '') : '';
+  // Several teams put a whole URL in apiPrefix. Concatenating it onto scheme://fqdn produced
+  // "https://hosthttps://host/t/team". If it is already absolute, it IS the apiRoot.
+  if (/^https?:\/\//i.test(rawPrefix)) return rawPrefix;
   const scheme = (service && service.scheme) || 'http';
   const host = profile.fqdn || (profile.ipv4Addresses && profile.ipv4Addresses[0]);
   if (!host) return null;
   const port = service && service.ipEndPoints && service.ipEndPoints[0] && service.ipEndPoints[0].port;
   const authority = port && !String(host).includes(':') ? `${host}:${port}` : host;
-  const prefix = service && service.apiPrefix ? String(service.apiPrefix).replace(/\/$/, '') : '';
+  const prefix = rawPrefix && !rawPrefix.startsWith('/') ? `/${rawPrefix}` : rawPrefix;
   return `${scheme}://${authority}${prefix}`;
 }
 

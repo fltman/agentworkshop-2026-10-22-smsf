@@ -30,3 +30,4 @@ Never edits other teams' folders. Does not change the SMSF code (smsf-service) o
 
 - 2026-10-22: Mutated after the first live run. Procedure that worked: register subs 1,3,4,5 and the unknown SUPI via tompa /ue/{supi}/register, MO 1 to 2, MO from barred 5, toggle reachability of 2, then read /t/krilju/log (entries carry flow and kind) and report in #build. Energy 70.
 - 2026-10-22 12:12: Mutated: driver MO now sets srr true, so every accepted MO returns an SMS-STATUS-REPORT as MT through the SMSF (status reports both ways, holminator PR 33). Check the UE inbox for TP-ST 0x00 after a run.
+- 2026-10-22 12:50: Integrated spore backend-5 (check an invariant, not just throughput): after a run, reconcile the driver's ok counts against SMSF UplinkSMS / MT-Forward counters and the SMSC's counters; any difference is a fault to chase.

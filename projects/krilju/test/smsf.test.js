@@ -47,6 +47,8 @@ test('rp: RP-DATA to the UE carries the SC address as RP-OA and an empty RP-DA',
 // ---- SMSF behaviour against faked peers ----
 const calls = [];
 let smscReply, amfReply, udmData;
+const instances = {}; // NF type -> apiRoots NRF returns; default is one instance per type
+const failing = {}; // apiRoot -> HTTP status to answer with (0 = connection refused)
 const json = (status, body) => ({ status, text: async () => (body === undefined ? '' : JSON.stringify(body)) });
 
 // The plugin runs on this faked global fetch; the tests talk to the local server through http.request.
@@ -55,8 +57,11 @@ global.fetch = async (url, opts = {}) => {
   calls.push({ method, url: u, body });
   if (u.includes('nf-instances?target-nf-type=')) {
     const t = u.match(/target-nf-type=(\w+)/)[1];
-    return json(200, { nfInstances: [{ nfServices: [{ apiRoot: `http://peer.test/${t.toLowerCase()}` }] }] });
+    const roots = instances[t] || [`http://peer.test/${t.toLowerCase()}`];
+    return json(200, { nfInstances: roots.map(apiRoot => ({ nfServices: [{ apiRoot }] })) });
   }
+  const bad = Object.keys(failing).find(root => u.startsWith(root + '/'));
+  if (bad) return failing[bad] === 0 ? Promise.reject(new Error('ECONNREFUSED')) : json(failing[bad], {});
   if (u.includes('/nudm-uecm/')) return json(method === 'DELETE' ? 204 : (udmData.uecm || 201), {});
   if (u.includes('/sms-mng-data')) return json(200, udmData.mng || {});
   if (u.includes('/sms-data')) return json(udmData.sms.status || 200, udmData.sms.body);
@@ -209,4 +214,90 @@ test('deactivate: removes the context and unregisters at the UDM', async () => {
   assert.strictEqual((await req('DELETE', '/nsmsf-sms/v2/ue-contexts/imsi-001010000000002')).status, 204);
   assert.strictEqual((await req('DELETE', '/nsmsf-sms/v2/ue-contexts/imsi-001010000000002')).status, 404);
   assert.ok(calls.some(c => c.method === 'DELETE' && c.url.includes('/nudm-uecm/')));
+});
+
+// ---- several instances of the same NF ----
+// The plugin caches discovery for 60 s; jump the clock so each test sees its own NRF answer.
+const realNow = Date.now;
+let skew = 0;
+Date.now = () => realNow() + skew;
+const reset = (type, roots) => { skew += 61000; for (const k of Object.keys(failing)) delete failing[k]; instances[type] = roots; };
+const hits = (root, part) => calls.filter(c => c.url.startsWith(root + '/') && c.url.includes(part));
+
+test('multi UDM: a dead first instance is skipped, the working one serves the whole UE procedure', async () => {
+  okUdm();
+  reset('UDM', ['http://peer.test/udm-a', 'http://peer.test/udm-b']);
+  failing['http://peer.test/udm-a'] = 503;
+  assert.strictEqual((await activate('imsi-001010000000011', 'msisdn-46700000011')).status, 201);
+  assert.ok(hits('http://peer.test/udm-b', '/nudm-uecm/').length >= 1);
+  assert.ok(hits('http://peer.test/udm-b', '/sms-data').length >= 1, 'sdm goes to the UDM that took the registration');
+  assert.strictEqual(hits('http://peer.test/udm-a', '/sms-data').length, 0);
+  // the first UDM comes back, but this UE stays with the UDM that registered it
+  reset('UDM', ['http://peer.test/udm-a', 'http://peer.test/udm-b']);
+  assert.strictEqual((await req('DELETE', '/nsmsf-sms/v2/ue-contexts/imsi-001010000000011')).status, 204);
+  assert.ok(hits('http://peer.test/udm-b', '/nudm-uecm/').some(c => c.method === 'DELETE'));
+  assert.ok(!hits('http://peer.test/udm-a', '/nudm-uecm/').some(c => c.method === 'DELETE'));
+});
+
+test('multi UDM: the instance that does not know the subscriber (404) is skipped, all-404 is USER_UNKNOWN', async () => {
+  okUdm();
+  reset('UDM', ['http://peer.test/udm-a', 'http://peer.test/udm-b']);
+  failing['http://peer.test/udm-a'] = 404;
+  assert.strictEqual((await activate('imsi-001010000000012', 'msisdn-46700000012')).status, 201);
+  failing['http://peer.test/udm-b'] = 404;
+  skew += 61000;
+  const r = await activate('imsi-001010000000013');
+  assert.strictEqual(r.status, 404);
+  assert.strictEqual(r.body.cause, 'USER_UNKNOWN');
+});
+
+test('multi UDM: every instance down gives 502 UDM_REGISTRATION_FAILED, not a hang', async () => {
+  reset('UDM', ['http://peer.test/udm-a', 'http://peer.test/udm-b']);
+  failing['http://peer.test/udm-a'] = 0;
+  failing['http://peer.test/udm-b'] = 503;
+  const r = await activate('imsi-001010000000014');
+  assert.strictEqual(r.status, 502);
+  assert.strictEqual(r.body.cause, 'UDM_REGISTRATION_FAILED');
+});
+
+test('multi SMSC: MO falls back to the second SMSC when the first is down', async () => {
+  okUdm();
+  delete instances.UDM;
+  skew += 61000;
+  await activate('imsi-001010000000015', 'msisdn-46700000015');
+  reset('CUSTOM_SMSC', ['http://peer.test/smsc-a', 'http://peer.test/smsc-b']);
+  failing['http://peer.test/smsc-a'] = 0;
+  smscReply = () => json(200, { result: 'SUCCESS', deliveryReport: { hex: '0100' } });
+  const r = await mo('imsi-001010000000015', 3, 'mo-multi-1');
+  assert.strictEqual(r.status, 200);
+  assert.ok(hits('http://peer.test/smsc-b', '/mo-forward-short-message').length >= 1);
+});
+
+test('multi SMSC: a real SMSC rejection (4xx) is final and is not retried at the other SMSC', async () => {
+  reset('CUSTOM_SMSC', ['http://peer.test/smsc-a', 'http://peer.test/smsc-b']);
+  smscReply = () => json(403, { result: 'SM_DELIVERY_FAILURE' });
+  const r = await mo('imsi-001010000000015', 4, 'mo-multi-2');
+  assert.strictEqual(r.status, 502);
+  assert.strictEqual(hits('http://peer.test/smsc-b', '/mo-forward-short-message').filter(c => c.body.smsRecordId === 'mo-multi-2').length, 0);
+});
+
+test('multi AMF: MT goes on to the AMF that knows the UE after the first answers 404', async () => {
+  reset('AMF', ['http://peer.test/amf-a', 'http://peer.test/amf-b']);
+  failing['http://peer.test/amf-a'] = 404;
+  let rpHex;
+  amfReply = body => { rpHex = body.smsPayload.hex; return json(200, {}); };
+  const pending = req('POST', '/smsc/mt-forward-short-message', { supi: 'imsi-001010000000015', smsRecordId: 'mt-multi-1', sms: { hex: 'AA' } });
+  await wait(100);
+  assert.ok(hits('http://peer.test/amf-b', '/n1-n2-messages').length >= 1);
+  await req('POST', '/nsmsf-sms/v2/ue-contexts/imsi-001010000000015/sendsms', { jsonData: { smsRecordId: 'mt-multi-1', smsPayload: { hex: `02${rpHex.slice(2, 4)}` } } });
+  assert.strictEqual((await pending).status, 200);
+});
+
+test('multi AMF: 404 from every AMF is still ABSENT_SUBSCRIBER', async () => {
+  reset('AMF', ['http://peer.test/amf-a', 'http://peer.test/amf-b']);
+  failing['http://peer.test/amf-a'] = 404;
+  failing['http://peer.test/amf-b'] = 404;
+  const r = await req('POST', '/smsc/mt-forward-short-message', { supi: 'imsi-001010000000015', smsRecordId: 'mt-multi-2', sms: { hex: 'AA' } });
+  assert.strictEqual(r.status, 504);
+  assert.strictEqual(r.body.result, 'ABSENT_SUBSCRIBER');
 });

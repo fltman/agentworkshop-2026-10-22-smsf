@@ -80,7 +80,20 @@ CALL_BARRED, FAILURE (5555). The Diameter code goes in `diameterResultCode` wher
 | 4 ✅ | Error cases, mapped result codes; absolute and enhanced TP-VP (C6/C7, SPEC-NOTES 7-9), single-shot, submitHex on MO records | smsc-sgd-service | unknown, not allowed, absent all shown |
 | 5 ✅ | Tile (store, log, send form; textContent only) | smsc-sgd-service | usable in demo |
 | 6 ✅ | Stretch: store-and-forward plus alert, retry backoff, expiry | smsc-sgd-service | redelivery after re-register (seen locally with all five plugins) |
-| 7 | Demo script end to end | smsc-interop-contract | runs registration, MO, MT across all NFs |
+| 7 ✅ | Demo script end to end: `node demo.mjs [--base <url>] [--step network,attach,mo,mt,store-and-forward,metrics] [--timeout 60]` (from projects/holminator; base from repo-root .board-url, never printed; never resets metrics). All 6 steps PASS live 2026-10-22 | smsc-interop-contract | runs registration, MO, MT across all NFs |
+
+### Demo (step 7)
+
+`demo.mjs` drives the live 5G Core Light (NRF smsf-hao, AMF+UE tompa, SMSF krilju, UDM hetoteam, our SMSC):
+
+1. **network**: the NRF lists AMF, SMSF, UDM and CUSTOM_SMSC as REGISTERED, and the NRF can discover the SMSC. Every team answers `/kpi`, or `/metrics` for krilju and hetoteam.
+2. **attach**: UE1 and UE2 are REGISTERED with smsActive (registered if they are not), with a context in the SMSF and an SMSF registration in the UDM.
+3. **mo**: UE1 sends an MO with TP-SRR to UE2. The SMSC marks it FORWARDED, the SMS-STATUS-REPORT (TP-ST 0x00) is DELIVERED to UE1 and appears in UE1's tompa inbox.
+4. **mt**: `/api/mt?wait=1` sends to UE2. Result DELIVERED, a simulated status report (TP-ST 0x00) and an entry in UE2's inbox.
+5. **store-and-forward**: UE2 is deregistered and the MT goes WAITING (SRI 404 ABSENT_SUBSCRIBER_SM 5550, MWD at the UDM). UE2 registers again, the UDM sends Alert-SC and the MT is DELIVERED (about 5 s). UE2 is always re-registered afterwards.
+6. **metrics**: SMSC counter and PDU deltas against what the demo's own traffic must have caused (at least that much, because the system is shared), and all consistency checks ok.
+
+The output is a numbered narrative with the SMSC history and message sequence per message. The exit code is 1 if any step FAILs; SKIP does not count as a failure. Peer faults are printed as sent/expected/got. The pure helpers are tested in test/run.mjs.
 
 PR after every step. Tests: a local `node` test for our plugin under `projects/holminator/test/`, plus an interop script
 that calls the other teams' real deployed modules. Faults go to the owning team in #build.

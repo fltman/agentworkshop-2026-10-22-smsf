@@ -1,5 +1,7 @@
 // Run: node --test projects/krilju/test/   (plain Node, no dependencies, peers are faked)
 process.env.SMSF_BOARD_URL = 'http://board.test';
+process.env.SMSF_MT_REPLY_MS = '150'; // short RP timers for the tests
+process.env.SMSF_TR1M_MS = '600';
 const test = require('node:test');
 const assert = require('node:assert');
 const http = require('node:http');
@@ -62,6 +64,7 @@ global.fetch = async (url, opts = {}) => {
   }
   const bad = Object.keys(failing).find(root => u.startsWith(root + '/'));
   if (bad) return failing[bad] === 0 ? Promise.reject(new Error('ECONNREFUSED')) : json(failing[bad], {});
+  if (u.includes('/sdm-subscriptions')) return method === 'DELETE' ? json(204) : (udmData.noSub ? json(404, {}) : json(201, { subscriptionId: 'sub-1' }));
   if (u.includes('/nudm-uecm/')) return json(method === 'DELETE' ? 204 : (udmData.uecm || 201), {});
   if (u.includes('/sms-mng-data')) return json(200, udmData.mng || {});
   if (u.includes('/sms-data')) return json(udmData.sms.status || 200, udmData.sms.body);
@@ -216,6 +219,44 @@ test('deactivate: removes the context and unregisters at the UDM', async () => {
   assert.ok(calls.some(c => c.method === 'DELETE' && c.url.includes('/nudm-uecm/')));
 });
 
+// ---- UDM callbacks (TS 29.503 SDM subscription + dereg notification) ----
+const cbSupi = 'imsi-001010000000012';
+test('callbacks: activation subscribes with a callback and passes the dereg callback URI', async () => {
+  okUdm();
+  assert.strictEqual((await activate(cbSupi, 'msisdn-46700000012')).status, 201);
+  const sub = calls.filter(c => c.method === 'POST' && c.url.endsWith(`/nudm-sdm/v2/${cbSupi}/sdm-subscriptions`)).pop();
+  assert.ok(sub.body.callbackReference.endsWith(`/nudm-callback/sdm/${cbSupi}`));
+  const reg = calls.filter(c => c.method === 'PUT' && c.url.includes('/nudm-uecm/')).pop();
+  assert.ok(reg.body.deregCallbackUri.endsWith(`/nudm-callback/dereg/${cbSupi}`));
+});
+
+test('callbacks: SDM notification re-reads the data; barring updates the context, loss of SMS removes it', async () => {
+  udmData.mng = { moSmsBarringAll: true };
+  assert.strictEqual((await req('POST', `/nudm-callback/sdm/${cbSupi}`, { notifyItems: [] })).status, 204);
+  assert.strictEqual((await req('POST', `/nsmsf-sms/v2/ue-contexts/${cbSupi}/sendsms`, { jsonData: { smsPayload: { hex: '00' } } })).body.cause, 'MO_SMS_BARRED');
+  udmData.sms = { body: { smsSubscribed: false } };
+  assert.strictEqual((await req('POST', `/nudm-callback/sdm/${cbSupi}`, {})).status, 204);
+  assert.strictEqual((await req('POST', `/nudm-callback/sdm/${cbSupi}`, {})).status, 404);
+});
+
+test('callbacks: dereg notification drops the context; unknown UE gets 404', async () => {
+  okUdm();
+  await activate(cbSupi, 'msisdn-46700000012');
+  assert.strictEqual((await req('POST', `/nudm-callback/dereg/${cbSupi}`, { deregReason: 'SUBSCRIPTION_WITHDRAWN' })).status, 204);
+  assert.strictEqual((await req('POST', `/nudm-callback/dereg/${cbSupi}`, {})).status, 404);
+});
+
+test('callbacks: a UDM without subscriptions does not break activation; deactivate removes a subscription', async () => {
+  udmData = { sms: { body: { smsSubscribed: true } }, mng: {}, noSub: true };
+  assert.strictEqual((await activate(cbSupi, 'msisdn-46700000012')).status, 201);
+  await req('DELETE', `/nsmsf-sms/v2/ue-contexts/${cbSupi}`);
+  assert.ok(!calls.some(c => c.method === 'DELETE' && c.url.includes(`/sdm-subscriptions/`) && c.url.includes(cbSupi) && calls.indexOf(c) > calls.length - 3));
+  okUdm();
+  await activate(cbSupi, 'msisdn-46700000012');
+  await req('DELETE', `/nsmsf-sms/v2/ue-contexts/${cbSupi}`);
+  assert.ok(calls.some(c => c.method === 'DELETE' && c.url.endsWith(`/nudm-sdm/v2/${cbSupi}/sdm-subscriptions/sub-1`)));
+});
+
 // ---- several instances of the same NF ----
 // The plugin caches discovery for 60 s; jump the clock so each test sees its own NRF answer.
 const realNow = Date.now;
@@ -330,4 +371,50 @@ test('MO rejection: TP-FCS report from the SMSC is carried in the RP-ERROR user 
   smscReply = () => json(403, { result: 'SM_DELIVERY_FAILURE', smDeliveryFailureCause: { smEnumeratedDeliveryFailureCause: 'INVALID_SME_ADDRESS', value: 5 }, deliveryReport: { hex: '01C300' } });
   const r = await mo('imsi-001010000000015', 40, 'mo-cause-fcs');
   assert.ok(r.body.smsPayload.hex.endsWith('4103' + '01C300'), 'RP-User-Data IEI 0x41 with the report');
+});
+
+// ---- RP timers (TS 24.011 TR1M) ----
+const mtOpen = async id => {
+  delete instances.AMF; for (const k of Object.keys(failing)) delete failing[k]; skew += 61000;
+  let rpHex;
+  amfReply = body => { rpHex = body.smsPayload.hex; return json(200, {}); };
+  const pending = req('POST', '/smsc/mt-forward-short-message', { supi: 'imsi-001010000000015', smsRecordId: id, sms: { hex: 'AA' } });
+  await wait(30);
+  return { pending, rpHex };
+};
+const ueAck = (rpHex, id) => req('POST', '/nsmsf-sms/v2/ue-contexts/imsi-001010000000015/sendsms', { jsonData: { smsRecordId: id, smsPayload: { hex: `02${rpHex.slice(2, 4)}` } } });
+const timers = async () => (await req('GET', '/metrics')).body.rpTimers;
+
+test('TR1M: the SMSC is answered at the reply deadline, the UE answer inside TR1M is still accepted', async () => {
+  const before = await timers();
+  const { pending, rpHex } = await mtOpen('mt-tr1m-1');
+  const r = await pending;
+  assert.strictEqual(r.status, 504, 'SMSC gets the timeout at the reply deadline');
+  const late = await ueAck(rpHex, 'mt-tr1m-1');
+  assert.strictEqual(late.status, 200, 'late RP-ACK inside TR1M is valid');
+  const after = await timers();
+  assert.strictEqual(after.mtReplyDeadline, before.mtReplyDeadline + 1);
+  assert.strictEqual(after.lateReport, before.lateReport + 1);
+});
+
+test('TR1M: after expiry the RP-MR is released and a UE answer is 404 NO_PENDING_MT', async () => {
+  const before = await timers();
+  const { pending, rpHex } = await mtOpen('mt-tr1m-2');
+  await pending;
+  await wait(700);
+  const r = await ueAck(rpHex, 'mt-tr1m-2');
+  assert.strictEqual(r.status, 404);
+  assert.strictEqual(r.body.cause, 'NO_PENDING_MT');
+  assert.strictEqual((await timers()).tr1mExpired, before.tr1mExpired + 1);
+});
+
+test('TR1M: an answer inside the reply deadline completes normally and leaves no timer state behind', async () => {
+  const before = await timers();
+  const { pending, rpHex } = await mtOpen('mt-tr1m-3');
+  assert.strictEqual((await ueAck(rpHex, 'mt-tr1m-3')).status, 200);
+  assert.strictEqual((await pending).status, 200);
+  await wait(700);
+  const after = await timers();
+  assert.deepStrictEqual(after, before, 'no deadline, no expiry, no late report');
+  assert.match((await raw('GET', '/metrics.prom')).text, /smsf_rp_timer_total\{event="tr1mExpired"\}/);
 });

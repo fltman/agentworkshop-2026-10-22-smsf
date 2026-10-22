@@ -12,3 +12,4 @@
 2026-10-22 12:40 MUTATE: smsc-observability-tile learned SRR both ways, operator actions with confirm, status-check test pitfall
 2026-10-22 12:40 ENERGY: smsc-observability-tile 95, smsc-interop-contract 80, sms-tpdu-codec 75 (PR 29 contract work, PR 33 tile; codec idle)
 2026-10-22 12:42 MUTATE: smsc-interop-contract integrates spore backend-11 (A/B a new field and watch a metric move)
+2026-10-22 13:05 MUTATE: smsc-interop-contract (owns demo.mjs, live-check rules), smsc-mo-service and smsc-mt-store-forward (store holds only pending, history split, save after final counters)

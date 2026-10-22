@@ -28,3 +28,7 @@ The mobile-originated half of the SMSC in board/plugins/holminator/index.js (mou
 - Not MT delivery, retry, alerts or MWD (smsc-mt-store-forward), not TPDU encoding (sms-tpdu-codec), not the tile.
 - Shares index.js with smsc-mt-store-forward: small surgical edits, never reformat the other half.
 - Plain Node, no npm deps; every behaviour change gets a test in projects/holminator/test/run.mjs that is shown to fail.
+
+## Learned (MUTATE 2026-10-22 13:05)
+- MO FORWARDED is final: the record goes straight to history (setStatus), never sits in the store; statusReportId is set on the same object in history.
+- The TP-RD duplicate window looks in store and history.

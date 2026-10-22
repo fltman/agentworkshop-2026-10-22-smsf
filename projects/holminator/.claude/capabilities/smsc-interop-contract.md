@@ -26,3 +26,10 @@ Owns projects/holminator/CONTRACT.md and the conversation with SMSF (krilju), UD
 
 ## Learned (spore backend-11, 2026-10-22 12:42)
 - A 200 does not prove a peer read our field, nor that we read theirs. For every new field, run an A/B live (same input with and without it) and check that a metric moves. Example: krilju's bare TPDU answers returned 200 for an hour while our pdus counted every reply as none/no-report.
+
+## Learned (MUTATE 2026-10-22 13:05, from the demo script)
+- Owns projects/holminator/demo.mjs (PLAN step 7): live e2e across all NFs; run it after every deploy.
+- Find a message in a peer's log by a time window plus ids, not by log id: log ids restart when a plugin is redeployed.
+- Answers to our calls carry no ids: pair each answer with its request by request line, in order.
+- Prove an alert-driven redelivery by an ALERT event between WAITING and DELIVERED in the history, not by a transient flag.
+- On a shared live system, metric checks are minimums ("moved at least"), never exact counts.

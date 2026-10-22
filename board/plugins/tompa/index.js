@@ -101,7 +101,7 @@ function kpi() {
 let mr = 0;
 const nextMr = () => (mr = (mr + 1) & 0xff);
 const nrf = { registered: false, lastStatus: null, timer: null };
-let smsfCache = null; // { base, ts }
+let smsfCache = null; // { base, bases, ts }
 
 function rec(dir, peer, method, path, status, body) {
   const entry = { id: ++seq, ts: new Date().toISOString(), dir, peer, method, path, status, body };
@@ -233,17 +233,43 @@ function baseOf(inst, serviceName) {
   return null;
 }
 
-async function smsfBase() {
-  if (smsfCache && Date.now() - smsfCache.ts < 60000) return smsfCache.base;
+// Discovery returns a list (spore smsf-14): keep every SMSF, not just element 0.
+async function smsfBases() {
+  if (smsfCache && Date.now() - smsfCache.ts < 60000) return smsfCache.bases;
   const r = await call('nrf', 'GET',
     `${NRF_DISC}/nf-instances?target-nf-type=SMSF&requester-nf-type=AMF&service-names=nsmsf-sms`);
   judge(r.entry, diagnose.discovery('SMSF', r.status, r.body));
-  const inst = r.body && Array.isArray(r.body.nfInstances) ? r.body.nfInstances[0] : null;
-  const base = inst ? baseOf(inst, 'nsmsf-sms') : null;
+  const list = r.body && Array.isArray(r.body.nfInstances) ? r.body.nfInstances : [];
+  const bases = [...new Set(list.map(i => baseOf(i, 'nsmsf-sms')).filter(Boolean))];
   kpis.nrf.discoveries++;
-  if (!base) kpis.nrf.discoveryMisses++;
-  smsfCache = base ? { base, ts: Date.now() } : null;
-  return base;
+  if (!bases.length) kpis.nrf.discoveryMisses++;
+  smsfCache = bases.length ? { base: bases[0], bases, ts: Date.now() } : null;
+  return bases;
+}
+
+const NO_SMSF = { status: 503, body: { status: 503, cause: 'NF_DISCOVERY_FAILED', detail: 'no SMSF found in NRF' } };
+const smsfDown = r => r.status === 0 || r.status >= 500;
+
+// Try the UE's own SMSF first, then the others. Move on at connection error or 5xx; any other answer is final.
+// A round where every SMSF failed drops the discovery cache and rediscovers once.
+async function callSmsf(ue, method, suffix, body, op) {
+  let last = null;
+  const failed = new Set();
+  for (let round = 0; round < 2; round++) {
+    const found = await smsfBases();
+    const order = [...new Set([ue.smsfBase, ...found].filter(Boolean))].filter(b => !failed.has(b));
+    if (!order.length) return last || NO_SMSF;
+    for (const base of order) {
+      const r = await call('smsf', method, `${base}/nsmsf-sms/v2/ue-contexts/${ue.supi}${suffix}`, body);
+      if (op) judge(r.entry, diagnose.smsfResponse(op, ue.supi, r.status, r.body));
+      last = r;
+      if (!smsfDown(r)) { ue.smsfBase = base; return r; }
+      failed.add(base);
+      if (ue.smsfBase === base) ue.smsfBase = null;
+    }
+    smsfCache = null;
+  }
+  return last;
 }
 
 // ---------- UE simulator triggers ----------
@@ -255,13 +281,9 @@ function ueOr404(res, supi) {
 }
 
 async function activateSms(ue) {
-  const smsf = await smsfBase();
-  if (!smsf) return { status: 503, body: { status: 503, cause: 'NF_DISCOVERY_FAILED', detail: 'no SMSF found in NRF' } };
-  const r = await call('smsf', 'PUT', `${smsf}/nsmsf-sms/v2/ue-contexts/${ue.supi}`, {
+  const r = await callSmsf(ue, 'PUT', '', {
     supi: ue.supi, gpsi: ue.gpsi, amfId: NF_ID, accessType: '3GPP_ACCESS', guami: GUAMI,
-  });
-  judge(r.entry, diagnose.smsfResponse('activate', ue.supi, r.status, r.body));
-  if (r.status === 0) smsfCache = null;
+  }, 'activate');
   ue.smsActive = r.status === 200 || r.status === 201;
   ue.lastSmsf = { op: 'activate', status: r.status, body: r.body };
   return r;
@@ -281,12 +303,8 @@ async function deregister(res, ue) {
   kpis.dereg.attempts++;
   let smsf = null;
   if (ue.smsActive) {
-    const base = await smsfBase();
-    if (base) {
-      const r = await call('smsf', 'DELETE', `${base}/nsmsf-sms/v2/ue-contexts/${ue.supi}`);
-      judge(r.entry, diagnose.smsfResponse('deactivate', ue.supi, r.status, r.body));
-      smsf = { status: r.status, body: r.body };
-    }
+    const r = await callSmsf(ue, 'DELETE', '', undefined, 'deactivate');
+    if (r !== NO_SMSF) smsf = { status: r.status, body: r.body };
   }
   if (!smsf || smsf.status === 204) kpis.dereg.ok++;
   ue.state = 'DEREGISTERED';
@@ -297,12 +315,9 @@ async function deregister(res, ue) {
 }
 
 async function uplink(ue, smsRecordId, hexPayload, text) {
-  const base = await smsfBase();
-  if (!base) return { status: 503, body: { status: 503, cause: 'NF_DISCOVERY_FAILED', detail: 'no SMSF found in NRF' } };
   const payload = { contentType: 'application/vnd.3gpp.sms', hex: hexPayload };
   if (text !== undefined) payload.text = text;
-  return call('smsf', 'POST', `${base}/nsmsf-sms/v2/ue-contexts/${ue.supi}/sendsms`,
-    { jsonData: { smsRecordId, smsPayload: payload, gpsi: ue.gpsi } });
+  return callSmsf(ue, 'POST', '/sendsms', { jsonData: { smsRecordId, smsPayload: payload, gpsi: ue.gpsi } });
 }
 
 async function moSms(req, res, ue) {

@@ -16,6 +16,7 @@ function mtRpData(rpMr, from, text) {
 }
 
 const seen = []; // requests the stub SMSF received
+let firstSmsfDown = false; // discovery returns two SMSFs and the first answers 503
 let stub; let amf; let plugin;
 
 function listen(handler) {
@@ -38,8 +39,10 @@ test.before(async () => {
     const out = (s, j) => { res.writeHead(s, { 'content-type': 'application/json' }); res.end(j ? JSON.stringify(j) : ''); };
     const origin = `http://127.0.0.1:${stub.address().port}`;
     if (req.url.startsWith('/t/smsf-hao/nnrf-disc/')) {
-      return out(200, { nfInstances: [{ nfType: 'SMSF', nfServices: [{ serviceName: 'nsmsf-sms', apiRoot: `${origin}/smsf` }] }] });
+      const inst = root => ({ nfType: 'SMSF', nfServices: [{ serviceName: 'nsmsf-sms', apiRoot: `${origin}${root}` }] });
+      return out(200, { nfInstances: firstSmsfDown ? [inst('/smsf'), inst('/smsf2')] : [inst('/smsf')] });
     }
+    if (firstSmsfDown && req.url.startsWith('/smsf/')) { seen.push({ method: req.method, url: req.url, body: b }); return out(503, { cause: 'SYSTEM_FAILURE' }); }
     if (req.url.startsWith('/t/smsf-hao/nnrf-nfm/')) return out(201, b);
     seen.push({ method: req.method, url: req.url, body: b });
     if (req.method === 'PUT' && req.url.endsWith('imsi-001010000000003')) return out(403, { status: 403, cause: 'SMS_NOT_ALLOWED' });
@@ -212,4 +215,19 @@ test('mt-error: the next MT is answered with RP-ERROR and the injected cause, th
   await new Promise(r => setTimeout(r, 150));
   assert.deepStrictEqual(uplinks().at(-1).body.jsonData.smsPayload.hex, sms.rpAck(10));
   assert.strictEqual((await api('POST', `/ue/${UE1}/mt-error`, { cause: 500 })).status, 400);
+});
+
+test('SMSF failover: a 503 from the first discovered SMSF moves on to the next, and the UE sticks to it', async () => {
+  const UE2 = 'imsi-001010000000002';
+  firstSmsfDown = true;
+  try {
+    const from = seen.length;
+    const r = await api('POST', `/ue/${UE2}/register`);
+    assert.strictEqual(r.body.smsActive, true);
+    const puts = seen.slice(from).filter(x => x.method === 'PUT').map(x => x.url.split('/nsmsf')[0]);
+    assert.deepStrictEqual(puts, ['/smsf', '/smsf2']);
+    const mark = seen.length;
+    await api('POST', `/ue/${UE2}/sms`, { to: 'msisdn-46700000001', text: 'via smsf2' });
+    assert.ok(seen.slice(mark)[0].url.startsWith('/smsf2/'), 'the UE uses the SMSF that took its registration');
+  } finally { firstSmsfDown = false; }
 });

@@ -21,3 +21,38 @@ test('group app: latest messages first, MO/MT step outcomes', () => {
   assert.equal(g.mtStep({ result: 'done', message: { status: 'DELIVERED' } }).status, 'DELIVERED');
   assert.equal(g.mtStep({ status: 'WAITING' }).cls, 's-warn');
 });
+
+const ev = require('../../../board/public/colony/tompa/events.js');
+const gui = require('../../../board/public/colony/tompa/gui.js');
+const arcade = require('../../../board/public/colony/tompa/arcade.js');
+
+test('events: caller is decided by whose API the path targets, not by log direction', () => {
+  const smsc = { team: 'holminator', node: 'SMSC' };
+  // holminator logs the UDM's answer to its own call as dir "in"
+  assert.deepEqual(ev.normalize(smsc, { dir: 'in', peer: 'udm', method: 'POST', path: '/t/hetoteam/sms-routing/v1/x', status: 404 }),
+    { ts: undefined, from: 'SMSC', to: 'UDM', status: 404, ok: false, label: 'POST /sms-routing/v1/x' });
+  const amf = { team: 'tompa', node: 'AMF' };
+  assert.equal(ev.normalize(amf, { dir: 'in', peer: 'smsf', method: 'POST', path: '/namf-comm/v1/ue-contexts/imsi-1/n1-n2-messages', status: 200 }).from, 'SMSF');
+  assert.equal(ev.normalize(amf, { dir: 'out', peer: 'nrf', method: 'PATCH', path: '/t/smsf-hao/x', status: null }), null);
+  const smsf = { team: 'krilju', node: 'SMSF' };
+  assert.deepEqual(ev.normalize(smsf, { dir: 'in', peer: 'amf', what: '502 N1N2 RP-ERROR' }).ok, false);
+  assert.equal(ev.normalize(smsf, { dir: 'out', peer: 'amf', what: '200 UplinkSMS' }).from, 'AMF');
+});
+
+test('events: the same call seen in two logs is drawn once', () => {
+  const a = { ts: '2026-10-22T10:00:00.100Z', peer: 'udm', dir: 'in', path: '/t/hetoteam/r', status: 200 };
+  const b = { ts: '2026-10-22T10:00:00.300Z', peer: 'smsc', dir: 'in', path: '/t/hetoteam/r', status: 200 };
+  const out = ev.collect([{ feed: { team: 'holminator', node: 'SMSC' }, list: [a] }, { feed: { team: 'hetoteam', node: 'UDM' }, list: [b] }]);
+  assert.equal(out.length, 1);
+});
+
+test('looks: flip order, hash pinning and arcade scoring', () => {
+  assert.equal(gui.nextView('arcade'), 'classic');
+  assert.equal(gui.fromHash('#map'), 'map');
+  assert.equal(gui.fromHash('#nope'), null);
+  let s = { score: 0, combo: 0, best: 0, hi: 0, landed: 0, lost: 0 };
+  for (let k = 0; k < 10; k++) s = arcade.scoreHit(s, true);
+  assert.equal(s.score, 9 * 10 + 20); // the 10th landing doubles
+  s = arcade.scoreHit(s, false);
+  assert.equal(s.combo, 0); assert.equal(s.best, 10); assert.equal(s.lost, 1);
+});

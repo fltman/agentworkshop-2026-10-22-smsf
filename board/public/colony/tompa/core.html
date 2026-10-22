@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tompa · 5G Core Light KPIs</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  #nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; margin-top: 12px; }
+  #nodes .cause span.v { color: var(--fg); }
+  .bar { display: flex; gap: 10px; align-items: center; font-size: 12px; margin-bottom: 8px; }
+  td.d-warn { color: var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>5G Core KPIs <small>every NF, from each team's own KPI endpoint</small></h1>
+  <span><a class="pill" href="flow.html">Call flow →</a> <a class="pill" href="./">← AMF + UE tile</a></span>
+</header>
+<div class="bar"><label><input type="checkbox" id="live" checked> live (5 s)</label><span class="meta" id="ts"></span></div>
+<div class="kpis" id="totals"></div>
+<div class="card">
+  <table>
+    <thead><tr><th>NF</th><th>Team</th><th>State</th><th>NRF</th><th>Requests</th><th>Errors</th><th>Error %</th><th>Latency</th><th>Source</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+<div id="nodes"></div>
+<script src="core.js"></script>
+</body>
+</html>

@@ -1,0 +1,227 @@
+// SMSF (team krilju): Nsmsf_SMService (TS 29.540) plus the SMSC-facing interface, SGd style.
+// Served at /t/krilju/. Contract: projects/krilju/CONTRACT.md
+
+const TEAM = 'krilju';
+// Peers publish public apiPrefix values, so we use the public origin too (override for local runs).
+const HOST = (process.env.SMSF_BOARD_URL || 'https://smsf.torget.bjarby.com').replace(/\/$/, '');
+// The NRF is the one well-known address; everything else is discovered through it.
+const NRF_TEAM = process.env.NRF_TEAM || 'smsf-hao';
+const NRF_NFM = `${HOST}/t/${NRF_TEAM}/nnrf-nfm/v1`;
+const NRF_DISC = `${HOST}/t/${NRF_TEAM}/nnrf-disc/v1`;
+const SELF_BASE = `${HOST}/t/${TEAM}`;
+const NF_ID = '6f1c2c1e-0000-4000-8000-0000006b7269'; // stable across restarts, so the NRF sees one SMSF
+const PENDING_MT_MS = 15000;
+
+const contexts = new Map(); // supi -> { supi, gpsi, amfId, since }
+const pendingMt = new Map(); // smsRecordId -> resolve(report)
+const log = [];
+const disc = new Map(); // nfType -> { base, ts }
+let registered = false;
+
+function rec(dir, peer, what, data) {
+  log.push({ ts: new Date().toISOString(), dir, peer, what, data });
+  if (log.length > 300) log.shift();
+}
+
+function send(res, status, body) {
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+  res.end(body === undefined ? '' : JSON.stringify(body));
+  return true;
+}
+const problem = (res, status, cause, detail) => send(res, status, { status, cause, detail });
+
+async function readJson(req) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  const t = Buffer.concat(chunks).toString('utf8');
+  if (!t) return {};
+  return JSON.parse(t);
+}
+
+async function call(peer, method, url, body) {
+  rec('out', peer, `${method} ${url}`, body);
+  try {
+    const r = await fetch(url, {
+      method,
+      headers: { 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(5000),
+    });
+    const text = await r.text();
+    let json = null;
+    try { json = text ? JSON.parse(text) : null; } catch { json = text; }
+    rec('in', peer, `${r.status} ${method} ${url}`, json);
+    return { status: r.status, body: json };
+  } catch (e) {
+    rec('in', peer, `ERROR ${method} ${url}`, e.message);
+    return { status: 0, body: null, error: e.message };
+  }
+}
+
+async function registerInNrf() {
+  const profile = {
+    nfInstanceId: NF_ID,
+    nfType: 'SMSF',
+    nfStatus: 'REGISTERED',
+    nfServices: [{
+      serviceInstanceId: 'nsmsf-sms-1', serviceName: 'nsmsf-sms', versions: [{ apiVersionInUri: 'v2' }],
+      scheme: 'http', nfServiceStatus: 'REGISTERED', apiPrefix: SELF_BASE,
+    }],
+  };
+  const r = await call('nrf', 'PUT', `${NRF_NFM}/nf-instances/${NF_ID}`, profile);
+  registered = r.status === 200 || r.status === 201;
+  return registered;
+}
+
+// Resolve the base URL of an NF through NRF discovery (cached 60 s).
+async function resolve(nfType) {
+  const hit = disc.get(nfType);
+  if (hit && Date.now() - hit.ts < 60000) return hit.base;
+  const r = await call('nrf', 'GET', `${NRF_DISC}/nf-instances?target-nf-type=${nfType}&requester-nf-type=SMSF`);
+  const inst = r.body && Array.isArray(r.body.nfInstances) ? r.body.nfInstances[0] : null;
+  if (!inst) return null;
+  const svc = (inst.nfServices || [])[0] || {};
+  const base = (svc.apiPrefix || inst.apiPrefix || '').replace(/\/$/, '') || null;
+  if (base) disc.set(nfType, { base, ts: Date.now() });
+  return base;
+}
+
+async function activate(req, res, supi) {
+  let b;
+  try { b = await readJson(req); } catch { return problem(res, 400, 'INVALID_JSON', 'body is not JSON'); }
+  rec('in', 'amf', `PUT ue-contexts/${supi}`, b);
+  if (!/^imsi-\d+$/.test(supi)) return problem(res, 400, 'INVALID_SUPI', 'supi must be imsi-<digits>');
+  const udm = await resolve('UDM');
+  if (!udm) return problem(res, 503, 'NF_DISCOVERY_FAILED', 'no UDM found in NRF');
+
+  // TS 23.502 4.13.3.1: register in the UDM first, then fetch the SMS subscription data.
+  const reg = await call('udm', 'PUT', `${udm}/nudm-uecm/v1/${supi}/registrations/smsf-3gpp-access`, {
+    smsfInstanceId: NF_ID,
+    plmnId: (b.guami && b.guami.plmnId) || b.plmnId || { mcc: '001', mnc: '01' },
+    smsfMAPAddress: '46700000999',
+    smsfDiameterAddress: { name: 'smsf.krilju', realm: 'workshop' },
+  });
+  if (reg.status === 404) return problem(res, 404, 'USER_UNKNOWN', 'subscriber not found in UDM');
+  if (reg.status === 0 || reg.status >= 300) return problem(res, 502, 'UDM_REGISTRATION_FAILED', `UDM answered ${reg.status}`);
+
+  const unregister = () => call('udm', 'DELETE', `${udm}/nudm-uecm/v1/${supi}/registrations/smsf-3gpp-access`);
+  const sms = await call('udm', 'GET', `${udm}/nudm-sdm/v2/${supi}/sms-data`);
+  if (sms.status === 404) { await unregister(); return problem(res, 404, 'USER_UNKNOWN', 'no SMS data for subscriber'); }
+  if (sms.status !== 200) { await unregister(); return problem(res, 502, 'UDM_UNAVAILABLE', `UDM answered ${sms.status}`); }
+  if (!sms.body || sms.body.smsSubscribed !== true) {
+    await unregister();
+    return problem(res, 403, 'SMS_NOT_ALLOWED', 'SMS is not part of the subscription');
+  }
+  const mng = await call('udm', 'GET', `${udm}/nudm-sdm/v2/${supi}/sms-mng-data`);
+  const mngData = mng.status === 200 && mng.body ? mng.body : {};
+
+  contexts.set(supi, { supi, gpsi: b.gpsi || null, amfId: b.amfId || null, mng: mngData, since: new Date().toISOString() });
+  return send(res, 201, { smsfInstanceId: NF_ID });
+}
+
+async function deactivate(res, supi) {
+  rec('in', 'amf', `DELETE ue-contexts/${supi}`);
+  if (!contexts.has(supi)) return problem(res, 404, 'CONTEXT_NOT_FOUND', 'no SMS context for this supi');
+  contexts.delete(supi);
+  const udm = await resolve('UDM');
+  if (udm) await call('udm', 'DELETE', `${udm}/nudm-uecm/v1/${supi}/registrations/smsf-3gpp-access`);
+  return send(res, 204);
+}
+
+async function uplinkSms(req, res, supi) {
+  let b;
+  try { b = await readJson(req); } catch { return problem(res, 400, 'INVALID_JSON', 'body is not JSON'); }
+  rec('in', 'amf', `POST ue-contexts/${supi}/sendsms`, b);
+  const ctx = contexts.get(supi);
+  if (!ctx) return problem(res, 404, 'CONTEXT_NOT_FOUND', 'SMS not activated for this supi');
+  const jd = b.jsonData || {};
+  const hex = jd.smsPayload && jd.smsPayload.hex;
+  if (!hex) return problem(res, 400, 'MANDATORY_IE_MISSING', 'jsonData.smsPayload.hex missing');
+
+  // The UE's answer to an MT SMS (RP-ACK / RP-ERROR) arrives here with the smsRecordId of the MT.
+  const waiting = jd.smsRecordId && pendingMt.get(jd.smsRecordId);
+  if (waiting) {
+    pendingMt.delete(jd.smsRecordId);
+    waiting({ hex, error: (parseInt(hex.slice(0, 2), 16) & 7) === 4 });
+    return send(res, 200, { smsRecordId: jd.smsRecordId, deliveryStatus: 'SMS_DELIVERY_SUCCESS' });
+  }
+
+  const mng = ctx.mng || {};
+  if (mng.moSmsSubscribed === false || mng.moSmsBarringAll === true) {
+    return problem(res, 403, 'MO_SMS_BARRED', 'MO SMS is not allowed for this subscriber');
+  }
+  const smsc = await resolve('SMSC');
+  if (!smsc) return problem(res, 503, 'NF_DISCOVERY_FAILED', 'no SMSC found in NRF');
+  const r = await call('smsc', 'POST', `${smsc}/smsc/mo-forward-short-message`,
+    { supi, msisdn: ctx.gpsi, sms: { hex }, smsRecordId: jd.smsRecordId });
+  if (r.status === 200 && r.body && r.body.result === 'SUCCESS') {
+    return send(res, 200, { smsRecordId: jd.smsRecordId, deliveryStatus: 'SMS_DELIVERY_SUCCESS', deliveryReport: r.body.deliveryReport });
+  }
+  const cause = (r.body && r.body.result) || 'SMSC_FAILURE';
+  return problem(res, r.status === 0 ? 504 : 502, cause, `SMSC answered ${r.status}`);
+}
+
+async function mtForward(req, res) {
+  let b;
+  try { b = await readJson(req); } catch { return problem(res, 400, 'INVALID_JSON', 'body is not JSON'); }
+  rec('in', 'smsc', 'POST /smsc/mt-forward-short-message', b);
+  const hex = b.sms && b.sms.hex;
+  if (!hex || !(b.supi || b.msisdn)) return send(res, 400, { result: 'FAILURE', cause: 'supi or msisdn and sms.hex are required' });
+  let ctx = b.supi ? contexts.get(b.supi) : null;
+  if (!ctx && b.msisdn) ctx = [...contexts.values()].find(c => c.gpsi && c.gpsi.replace(/^msisdn-/, '') === String(b.msisdn).replace(/^msisdn-/, ''));
+  if (!ctx) return send(res, 404, { result: 'UNKNOWN_SUBSCRIBER', cause: 'no SMS context in this SMSF' });
+  const amf = await resolve('AMF');
+  if (!amf) return send(res, 503, { result: 'FAILURE', cause: 'no AMF found in NRF' });
+  const id = b.smsRecordId || `mt-${Date.now()}`;
+  // Register before the call: the UE's RP-ACK may arrive before the N1N2 answer returns.
+  const report = new Promise(resolve => {
+    pendingMt.set(id, resolve);
+    const t = setTimeout(() => { if (pendingMt.delete(id)) resolve(null); }, PENDING_MT_MS);
+    if (t.unref) t.unref();
+  });
+  const r = await call('amf', 'POST', `${amf}/namf-comm/v1/ue-contexts/${ctx.supi}/n1-n2-messages`, {
+    n1MessageContainer: { n1MessageClass: 'SMS', n1MessageContent: { contentId: 'sms' } },
+    smsPayload: { contentType: 'application/vnd.3gpp.sms', hex },
+    smsRecordId: id,
+  });
+  if (r.status < 200 || r.status >= 300) {
+    pendingMt.delete(id);
+    if (r.status === 404 || r.status === 504 || r.status === 0) return send(res, 504, { result: 'ABSENT_SUBSCRIBER', cause: 'UE not reachable' });
+    return send(res, 502, { result: 'FAILURE', cause: `AMF answered ${r.status}` });
+  }
+  const rep = await report;
+  if (!rep) return send(res, 504, { result: 'FAILURE', cause: 'no delivery report from the UE' });
+  if (rep.error) return send(res, 502, { result: 'FAILURE', cause: 'UE answered RP-ERROR', deliveryReport: { hex: rep.hex } });
+  return send(res, 200, { result: 'SUCCESS', deliveryReport: { hex: rep.hex } });
+}
+
+module.exports = {
+  init() {
+    const tick = () => {
+      registerInNrf().catch(e => console.error(`[${TEAM}] nrf:`, e.message));
+    };
+    // The NRF may load after us: retry until registered, then stop.
+    const t = setInterval(() => {
+      try { if (registered) clearInterval(t); else tick(); } catch (e) { console.error(`[${TEAM}]`, e.message); }
+    }, 10000);
+    if (t.unref) t.unref();
+    const first = setTimeout(() => { try { tick(); } catch (e) { console.error(`[${TEAM}]`, e.message); } }, 3000);
+    if (first.unref) first.unref();
+  },
+
+  async handle(req, res, { path }) {
+    const m = path.match(/^\/nsmsf-sms\/v2\/ue-contexts\/([^/]+)(\/sendsms)?$/);
+    if (m) {
+      const supi = decodeURIComponent(m[1]);
+      if (!m[2] && req.method === 'PUT') return activate(req, res, supi);
+      if (!m[2] && req.method === 'DELETE') return deactivate(res, supi);
+      if (m[2] && req.method === 'POST') return uplinkSms(req, res, supi);
+      return problem(res, 405, 'METHOD_NOT_ALLOWED', 'see CONTRACT.md');
+    }
+    if (req.method === 'POST' && path === '/smsc/mt-forward-short-message') return mtForward(req, res);
+    if (req.method === 'GET' && path === '/log') return send(res, 200, log.slice(-100));
+    if (req.method === 'GET' && path === '/contexts') return send(res, 200, [...contexts.values()]);
+    if (req.method === 'GET' && path === '/status') return send(res, 200, { nfInstanceId: NF_ID, registeredInNrf: registered, contexts: contexts.size });
+    return false;
+  },
+};

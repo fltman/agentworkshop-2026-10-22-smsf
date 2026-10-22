@@ -17,6 +17,11 @@
       <span class="pill">up <b id="up">…</b></span>
       <span class="pill" id="consistency" title="backend self-checks (GET /api/metrics consistency)">consistency …</span>
       <span class="pill" id="since" title="counters are persisted from this time">counters since …</span>
+      <span class="reset">
+        <button type="button" class="ghost small" id="resetbtn" title="POST /api/metrics/reset: zero every counter and set since=now">Reset metrics</button>
+        <label class="cb"><input type="checkbox" id="resetclear"> also clear stored messages</label>
+        <span class="resetnote" id="resetnote" aria-live="polite"></span>
+      </span>
     </div>
     <div class="consfail" id="consfail" hidden></div>
   </div>
@@ -53,11 +58,17 @@
   </div>
   <div>
     <h2>Status reports <small class="dim">SMS-STATUS-REPORT to the originator</small></h2>
+    <h3>MO <small class="dim">sent to the originating UE (TP-SRR on an MO)</small></h3>
     <div class="srstats" id="srstats"></div>
-    <h3>by TP-ST</h3>
     <table class="tpst">
       <thead><tr><th>TP-ST</th><th>meaning</th><th class="n">n</th></tr></thead>
       <tbody id="tpst"></tbody>
+    </table>
+    <h3>MT <small class="dim">to the originating SME, simulated (TP-SRR on /api/mt)</small></h3>
+    <div class="srstats" id="srstatsmt"></div>
+    <table class="tpst">
+      <thead><tr><th>TP-ST</th><th>meaning</th><th class="n">n</th></tr></thead>
+      <tbody id="tpstmt"></tbody>
     </table>
   </div>
 </section>

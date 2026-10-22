@@ -301,3 +301,33 @@ test('multi AMF: 404 from every AMF is still ABSENT_SUBSCRIBER', async () => {
   assert.strictEqual(r.status, 504);
   assert.strictEqual(r.body.result, 'ABSENT_SUBSCRIBER');
 });
+
+// ---- MO rejection to RP-Cause, TS 23.040 11.3 ----
+test('MO rejection: SMSC failure maps to the RP-Cause the UE gets', async () => {
+  delete instances.CUSTOM_SMSC; skew += 61000;
+  const rows = [
+    [403, { result: 'SM_DELIVERY_FAILURE', diameterResultCode: 5555, smDeliveryFailureCause: { smEnumeratedDeliveryFailureCause: 'UNKNOWN_SERVICE_CENTRE', value: 3 } }, 1],
+    [403, { result: 'SM_DELIVERY_FAILURE', smDeliveryFailureCause: { smEnumeratedDeliveryFailureCause: 'SC_CONGESTION', value: 4 } }, 42],
+    [403, { result: 'SM_DELIVERY_FAILURE', smDeliveryFailureCause: { smEnumeratedDeliveryFailureCause: 'INVALID_SME_ADDRESS', value: 5 } }, 21],
+    [403, { result: 'SM_DELIVERY_FAILURE', smDeliveryFailureCause: { smEnumeratedDeliveryFailureCause: 'USER_NOT_SC_USER', value: 6 } }, 28],
+    [403, { result: 'SM_DELIVERY_FAILURE', smDeliveryFailureCause: { smEnumeratedDeliveryFailureCause: 'EQUIPMENT_PROTOCOL_ERROR', value: 1 } }, 21],
+    [403, { result: 'SM_DELIVERY_FAILURE', smDeliveryFailureCause: { value: 4 } }, 42], // numeric value only
+    [403, { result: 'FACILITY_NOT_SUPPORTED', diameterResultCode: 5552 }, 69],
+    [400, { result: 'UNEXPECTED_DATA_VALUE', diameterResultCode: 5004 }, 38],
+    [400, { result: 'MISSING_AVP', diameterResultCode: 5005 }, 38],
+    [500, { result: 'UNABLE_TO_COMPLY', diameterResultCode: 5012 }, 38],
+  ];
+  let mr = 20;
+  for (const [status, body, want] of rows) {
+    smscReply = () => json(status, body);
+    const r = await mo('imsi-001010000000015', ++mr, `mo-cause-${mr}`);
+    assert.strictEqual(r.body.rpCause, want, JSON.stringify(body));
+    assert.strictEqual(r.body.smsPayload.hex.slice(0, 8), `05${mr.toString(16).padStart(2, '0')}01${want.toString(16).padStart(2, '0')}`.toUpperCase(), 'RP-ERROR carries the cause');
+  }
+});
+
+test('MO rejection: TP-FCS report from the SMSC is carried in the RP-ERROR user data', async () => {
+  smscReply = () => json(403, { result: 'SM_DELIVERY_FAILURE', smDeliveryFailureCause: { smEnumeratedDeliveryFailureCause: 'INVALID_SME_ADDRESS', value: 5 }, deliveryReport: { hex: '01C300' } });
+  const r = await mo('imsi-001010000000015', 40, 'mo-cause-fcs');
+  assert.ok(r.body.smsPayload.hex.endsWith('4103' + '01C300'), 'RP-User-Data IEI 0x41 with the report');
+});

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tompa · 5G Core Light load generator</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .ctl { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; font-size: 12px; }
+  .ctl output { min-width: 50px; display: inline-block; }
+  #chart { width: 100%; height: 180px; display: block; }
+  #chart .ok { fill: var(--ok); } #chart .expected { fill: var(--dim); } #chart .failed { fill: var(--bad); }
+  #chart .axis { stroke: #344155; } #chart text { fill: var(--dim); font: 10px system-ui, sans-serif; }
+  .legend span { margin-right: 12px; font-size: 12px; } .legend .ok { color: var(--ok); } .legend .ex { color: var(--dim); } .legend .bad { color: var(--bad); }
+  button.go { border-color: var(--ok); } button.stop { border-color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Load generator <small>continuous MO SMS through UE → AMF → SMSF → SMSC → UDM</small></h1>
+  <span><a class="pill" href="core.html">Core KPIs →</a> <a class="pill" href="amf.html">← AMF + UE tile</a></span>
+</header>
+<div class="card ctl">
+  <label>rate <input type="range" id="rate" min="0.2" max="5" step="0.2" value="1"> <output id="rate-v">1</output> msg/s</label>
+  <label>run for <select id="dur"><option value="60">1 min</option><option value="120">2 min</option><option value="300" selected>5 min</option></select></label>
+  <button class="go" id="start">Start</button><button class="stop" id="stop">Stop</button>
+  <span class="meta" id="state"></span>
+  <span class="meta">Mix: ~90 % UE1↔UE2, ~5 % MO from barred UE5, ~5 % to MT-barred UE4. Capped at 5 msg/s, auto-stop after 5 min.</span>
+</div>
+<div class="kpis" id="cards"></div>
+<div class="grid">
+  <div class="card">
+    <h2>Last 60 s <small>outcomes per second</small></h2>
+    <svg id="chart" xmlns="http://www.w3.org/2000/svg"></svg>
+    <div class="legend"><span class="ok">■ ok</span><span class="ex">■ expected refusal</span><span class="bad">■ failed</span></div>
+  </div>
+  <div class="card"><h2>Failure causes</h2><div id="causes"><span class="meta">none yet</span></div></div>
+</div>
+<script src="load.js"></script>
+</body>
+</html>

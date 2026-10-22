@@ -21,6 +21,8 @@ Response 200 `{"result":"SUCCESS","deliveryReport":{"hex"}}`, or 4xx/5xx with `{
 When the UE answers with RP-ERROR the SMSF returns `502 {"result":"FAILURE","cause":"UE answered RP-ERROR","rpCause":<integer, TS 24.011 8.2.5.4>,"deliveryReport":{"hex"}}`.
 `rpCause` is the single source of the RP-Cause and is always present. `deliveryReport.hex` is optional and, when present, is the bare TPDU (SMS-DELIVER-REPORT), never an RP envelope. The SMSC classifies on `rpCause` alone.
 
+MO rejection by the SMSC: the SMSF answers `502` (`504` on timeout) with `{"cause","rpCause","detail","smsPayload"}`; `smsPayload` is an RP-ERROR with that `rpCause` and, if the SMSC sent `deliveryReport.hex`, its TP-FCS report as RP-User-Data. RP-Cause per TS 23.040 11.3: `UNKNOWN_SERVICE_CENTRE` 1, `SC_CONGESTION` 42, `INVALID_SME_ADDRESS` 21, `USER_NOT_SC_USER` 28, `EQUIPMENT_PROTOCOL_ERROR` 21, `FACILITY_NOT_SUPPORTED` (5552) 69, any other failure (5004, 5005, 5012, timeout, transport error) 38. The failure is read from `smDeliveryFailureCause.smEnumeratedDeliveryFailureCause` (name) or `.value` (3 unknown SC, 4 congestion, 5 invalid SME address, 6 not an SC user, 1 equipment protocol error).
+
 `POST /smsc/alert-service-centre` (not used by us; goes to SMSC when UE becomes reachable, stretch goal).
 
 ## Used (as agreed with the owners' contracts)

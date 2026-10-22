@@ -4,7 +4,7 @@ type: capability
 domain: protocol
 tools: Read, Write, Edit, Bash, Grep, Glob
 model: sonnet
-energy: 60
+energy: 70
 spawned: 2026-10-22
 can-merge-with: [smsf-service]
 ---

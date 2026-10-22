@@ -103,6 +103,7 @@ td.n.dim { color:var(--dim); }
 .kpi.g-MO { border-top:2px solid var(--mo); } .kpi.g-MT { border-top:2px solid var(--mt); }
 .kpi .est { color:var(--warn); font-size:10px; cursor:help; }
 .kpi .est::before { content:"≈"; }
+.kpi .note { display:block; font-size:10px; color:var(--dim, #888); font-style:italic; }
 
 /* ---- layout ---- */
 main { display:grid; grid-template-columns:minmax(0,1.25fr) minmax(0,1fr); gap:0 4px; padding-bottom:20px; }
@@ -128,6 +129,8 @@ tbody tr.sr td.txt { font-style:italic; }
 /* tags and status badges */
 .tag { display:inline-block; font-size:10.5px; padding:0 5px; border-radius:4px; border:1px solid currentColor; line-height:1.5; margin-right:3px; }
 .tag.MO { color:var(--mo); } .tag.MT { color:var(--mt); } .tag.SR { color:var(--sr); }
+.tag.srr.st-ok { color:var(--ok); } .tag.srr.st-warn { color:var(--warn); } .tag.srr.st-bad { color:var(--bad); }
+.tag.srr a { color:inherit; }
 .st { display:inline-block; font-size:11px; padding:0 7px; border-radius:999px; line-height:1.6; background:#30363d; color:var(--fg); }
 .st.ACCEPTED, .st.PENDING { background:#1f3a5f; color:#a5d6ff; }
 .st.DELIVERING { background:#1f3a5f; color:var(--acc); animation:blink 1s ease-in-out infinite; }
@@ -176,6 +179,11 @@ button { background:#238636; color:#fff; border:1px solid #2ea043; border-radius
 button:hover { background:#2ea043; }
 button.ghost { background:transparent; color:var(--acc); border-color:#30363d; }
 button.ghost:hover { border-color:var(--acc); background:#58a6ff14; }
+.reset { display:inline-flex; align-items:center; gap:6px; margin-left:6px; font-size:11px; color:var(--dim); }
+.reset button.small { padding:1px 8px; font-size:11px; color:var(--dim); }
+.reset button.small:hover { color:var(--bad); border-color:var(--bad); background:transparent; }
+.reset .cb { font-size:11px; color:var(--dim); }
+.resetnote.ok { color:var(--ok); } .resetnote.bad { color:var(--warn); }
 button.warnbtn { background:#3b2e0a; border-color:var(--warn); color:var(--warn); }
 button.warnbtn:hover { background:#4d3c10; }
 button:disabled { opacity:.5; cursor:wait; }

@@ -79,15 +79,22 @@ function renderPanels(m) {
     box.append(dl);
   }
 
-  const sp = srPanel(m), ss = $('srstats'); ss.replaceChildren();
-  for (const f of sp.fields) {
-    const d = el('div', `srs ${f.cls}${f.v === DASH ? ' unknown' : f.v ? '' : ' zero'}`);
-    d.append(el('span', 'v', f.v), el('span', 'l', f.k)); d.title = f.hint;
-    ss.append(d);
-  }
-  const tt = $('tpst'); tt.replaceChildren();
-  if (!sp.byTpSt || !sp.byTpSt.length) { const tr = el('tr'); const td = el('td', 'empty', sp.byTpSt ? 'no status reports yet' : DASH); td.colSpan = 3; tr.append(td); tt.append(tr); }
-  else for (const r of sp.byTpSt) { const tr = el('tr'); tr.append(el('td', `c-${r.cls}`, r.code), el('td', null, r.name), numTd(r.n)); tt.append(tr); }
+  const sp = srPanel(m);
+  const srStats = (id, fields) => {
+    const ss = $(id); ss.replaceChildren();
+    for (const f of fields) {
+      const d = el('div', `srs ${f.cls}${f.v === DASH ? ' unknown' : f.v ? '' : ' zero'}`);
+      d.append(el('span', 'v', f.v), el('span', 'l', f.k)); d.title = f.hint;
+      ss.append(d);
+    }
+  };
+  const tpStTable = (id, rows) => {
+    const tt = $(id); tt.replaceChildren();
+    if (!rows || !rows.length) { const tr = el('tr'); const td = el('td', 'empty', rows ? 'no status reports yet' : DASH); td.colSpan = 3; tr.append(td); tt.append(tr); }
+    else for (const r of rows) { const tr = el('tr'); tr.append(el('td', `c-${r.cls}`, r.code), el('td', null, r.name), numTd(r.n)); tt.append(tr); }
+  };
+  srStats('srstats', sp.fields); tpStTable('tpst', sp.byTpSt);
+  srStats('srstatsmt', sp.mt.fields); tpStTable('tpstmt', sp.mt.byTpSt);
 
   const so = sgdOps(m), sb = $('sgdops'); sb.replaceChildren();
   for (let i = 0; i < Math.max(so.in.length, so.out.length); i++) {
@@ -99,10 +106,12 @@ function renderPanels(m) {
 
 function renderKpis(m) {
   const k = $('kpis'); k.replaceChildren();
-  for (const { grp, label, v, cls, subs, est } of kpiCards(m, messages)) {
-    const d = el('div', `kpi ${cls} g-${grp || 'none'}${v ? '' : ' zero'}`);
+  for (const { grp, label, v, cls, subs, est, title, note } of kpiCards(m, messages)) {
+    const d = el('div', `kpi ${cls} g-${grp || 'none'}${v && v !== DASH ? '' : ' zero'}`);
     d.append(el('span', 'v', v), el('span', 'l', label));
+    if (title) d.title = title;
     if (est) { const e = el('span', 'est'); e.title = est; d.append(' ', e); d.title = est; }
+    if (note) d.append(el('span', 'note', note));
     const s = el('span', 's');
     subs.forEach(([n, what], i) => { if (i) s.append(' · '); s.append(el('b', null, n), ` ${what}`); });
     d.append(s);
@@ -256,9 +265,26 @@ function mtFlow(m) {
       { nm: 'AMF', glyph: '◇', sub: 'NAS', st: amf, edge: 'N1N2 transfer', back: ansLabel, backSt: ansSt },
       { nm: 'UE', glyph: '▯', sub: ueSub, st: ue, edge: isSR(m) ? 'SMS-STATUS-REPORT' : 'SMS-DELIVER',
         back: delivered ? 'RP-ACK · DELIVER-REPORT' : ansLabel, backSt: ansSt },
+      ...(m.srr && !isSR(m) ? [mtReportStep(m)] : []),
     ],
     side,
   };
+}
+
+// TP-ST of the simulated status report for an MT with TP-SRR (message.statusReport), or null while there is none.
+function mtReportInfo(m) {
+  const r = m && m.statusReport;
+  if (!r) return null;
+  const raw = typeof r === 'object' ? (r.st ?? r.tpSt ?? r.tp_st) : r;
+  return raw === undefined || raw === null ? null : stInfo(raw);
+}
+// The MT's last step, like the MO's "onward delivery (simulated)": status report back to the originating SME.
+function mtReportStep(m) {
+  const info = mtReportInfo(m);
+  const final = /^(DELIVERED|FAILED|EXPIRED)$/.test(m.status);
+  const st = info ? { ok: 'done', warn: 'wait', bad: 'fail' }[info.cls] : final ? 'active' : 'off';
+  return { nm: 'orig. SME', glyph: '↩', end: true, st, edge: 'status report (simulated)',
+    sub: info ? `TP-ST ${info.code} ${info.name}` : final ? 'reporting…' : 'after the final outcome' };
 }
 
 const flowModel = m => (flowKind(m) === 'MO' ? moFlow(m) : mtFlow(m));
@@ -281,13 +307,19 @@ function kpiCards(m, msgs) {
     { grp: 'MO', label: 'MO forwarded', v: newBackend ? c('mo_forwarded') : mo('FORWARDED'), cls: 'mo',
       est: newBackend ? '' : 'no mo_forwarded counter: counted in the message window',
       subs: [[mo('ACCEPTED'), 'not yet forwarded'], [c('mo_expired'), 'expired'], [mo(), 'MO in window']] },
+    { grp: 'MO', label: 'MO status reports', v: has('status_reports_sent') ? c('status_reports_sent') : DASH, cls: 'sr',
+      title: 'SMS-STATUS-REPORT sent back to the originating UE for MOs with TP-SRR, delivered (RP-ACK)',
+      subs: [[num(cs.mo_srr_requested), 'requested'], [num(cs.status_reports_generated), 'generated'], [num(cs.status_reports_failed), 'failed']] },
     { grp: 'MT', label: 'MT originated', v: c('mt_originated'), cls: 'mt',
       est: newBackend ? '' : 'older backend: includes MOs it delivered as MT',
       subs: [[c('mt_attempts'), 'attempts'], [c('sri_requests'), 'SRI-for-SM']] },
-    { grp: 'MT', label: 'MT delivered', v: c('mt_delivered'), cls: 'ok', subs: [[c('mt_rp_error_temporary'), 'RP-ERROR temp']] },
+    { grp: 'MT', label: 'MT SMS delivered', v: c('mt_delivered'), cls: 'ok', title: 'generator SMS acknowledged by the UE with RP-ACK; status reports excluded',
+      subs: [[c('mt_rp_error_temporary'), 'RP-ERROR temp']] },
     { grp: 'MT', label: 'MT waiting', v: bs.WAITING || 0, cls: 'warn', subs: [[c('mt_absent'), 'absent'], [c('mt_retries_scheduled'), 'retries'], [c('mt_alert_fast_retries'), 'fast retries'], [mwd, 'in MWD']] },
     { grp: 'MT', label: 'MT failed', v: c('mt_failed'), cls: 'bad', subs: [[c('mt_expired'), 'expired'], [c('mt_attempts_exhausted'), 'attempts exhausted'], [bs.FAILED || 0, 'stored failed']] },
-    { grp: 'MT', label: 'MT status reports', v: c('status_reports_sent'), cls: 'sr', subs: [[c('status_reports_generated'), 'generated'], [c('status_reports_failed'), 'failed']] },
+    { grp: 'MT', label: 'MT status reports', v: num(cs.mt_status_reports_simulated), cls: 'sr', note: 'to originating SME, simulated',
+      title: 'SMS-STATUS-REPORT for MTs with TP-SRR, returned to the originating SME (simulated)',
+      subs: [[num(cs.mt_srr_requested), 'requested']] },
     { grp: 'MT', label: 'Alert-SC received', v: c('alerts_received'), cls: 'mt', subs: [[c('udm_delivery_reports'), 'ReportSM-DeliveryStatus'], [c('alerts_redelivering'), 'redelivered']] },
     { grp: '', label: 'in store', v: ms.total || 0, cls: '', subs: [[bd.MO || 0, 'MO'], [bd.MT || 0, 'MT'], [c('test_requests'), 'test calls']] },
   ];
@@ -351,14 +383,32 @@ function rpCauses(m) {
   const side = d => (r && r[d] && typeof r[d] === 'object' ? Object.entries(r[d]).filter(([, n]) => n !== 0).map(([cause, n]) => ({ cause, n: num(n) })).sort((a, b) => (Number(b.n) || 0) - (Number(a.n) || 0)) : null);
   return { in: side('in'), out: side('out') };
 }
-const SR_FIELDS = [['generated', '', 'status report records made (TP-SRR outcomes)'], ['sent', 'sr', 'MT-Forward attempts carrying an SMS-STATUS-REPORT'],
+const SR_FIELDS = [['requested', '', 'MOs that asked for a report (TP-SRR=1)'], ['generated', '', 'status report records made (TP-SRR outcomes)'], ['sent', 'sr', 'MT-Forward attempts carrying an SMS-STATUS-REPORT'],
   ['delivered', 'ok', 'acknowledged by the UE (RP-ACK)'], ['failed', 'bad', 'permanent failure'], ['expired', 'bad', 'validity period ended'], ['waiting', 'warn', 'in the store, still to be delivered']];
+const SR_MT_FIELDS = [['requested', '', 'MTs that asked for a report (TP-SRR)'], ['simulated', 'sr', 'reports returned to the originating SME (simulated)']];
+const tpStRows = bt => (bt && typeof bt === 'object'
+  ? Object.entries(bt).filter(([, n]) => n !== 0).map(([k, n]) => ({ ...stInfo(k), n: num(n) })).sort((a, b) => (Number(b.n) || 0) - (Number(a.n) || 0) || a.code.localeCompare(b.code))
+  : null);
+// Status reports both ways: MO side (sent to the originating UE, statusReports) at the top level, MT side (simulated
+// to the originating SME, statusReportsMt) under .mt.
 function srPanel(m) {
-  const s = m && m.statusReports && typeof m.statusReports === 'object' ? m.statusReports : null;
+  const obj = k => (m && m[k] && typeof m[k] === 'object' ? m[k] : null);
+  const s = obj('statusReports'), t = obj('statusReportsMt');
   const fields = SR_FIELDS.map(([k, cls, hint]) => ({ k, cls, hint, v: s ? num(s[k]) : DASH }));
-  const bt = s && s.byTpSt && typeof s.byTpSt === 'object' ? s.byTpSt : null;
-  const byTpSt = bt ? Object.entries(bt).map(([k, n]) => ({ ...stInfo(k), n: num(n) })).sort((a, b) => (Number(b.n) || 0) - (Number(a.n) || 0) || a.code.localeCompare(b.code)) : null;
-  return { known: !!s, fields, byTpSt };
+  const mt = { known: !!t, fields: SR_MT_FIELDS.map(([k, cls, hint]) => ({ k, cls, hint, v: t ? num(t[k]) : DASH })), byTpSt: tpStRows(t && t.byTpSt) };
+  return { known: !!s, fields, byTpSt: tpStRows(s && s.byTpSt), mt };
+}
+// TP-SRR note for a message row: MO -> the status report MT we send to the UE; MT -> the simulated report to the SME.
+function srrNote(m, msgs) {
+  if (!m || !m.srr || isSR(m)) return null;
+  if (flowKind(m) === 'MO') {
+    const id = srIdOf(m);
+    const sr = id && Array.isArray(msgs) ? msgs.find(x => x.id === id) : null;
+    const status = (sr && sr.status) || null;
+    return { kind: 'MO', id, cls: 'SR', text: id ? `SRR · report ${id}${status ? ` ${status}` : ''}` : 'SRR · report pending' };
+  }
+  const info = mtReportInfo(m);
+  return { kind: 'MT', id: null, cls: info ? `st-${info.cls}` : 'SR', text: info ? `SRR · report TP-ST ${info.code} (simulated)` : 'SRR · report pending (simulated)' };
 }
 const SGD_OPS = {
   in: ['MO-Forward-SM', 'Alert-SC'],
@@ -381,6 +431,15 @@ function consistencyBadge(m) {
   const failed = c.filter(x => !x || x.ok !== true).map(x => ({ name: (x && x.name) || '?', detail: (x && x.detail) || '' }));
   if (!failed.length) return { state: 'ok', text: `consistent (${c.length} check${c.length === 1 ? '' : 's'})`, failed };
   return { state: 'bad', text: `inconsistent: ${failed.map(f => f.name).join(', ')}`, failed };
+}
+// Inline note after POST /api/metrics/reset ({status, body:{ok, since, clearedMessages}}). Non-2xx: older backend.
+function resetNote(res) {
+  const ok = !!(res && res.status >= 200 && res.status < 300 && res.body && res.body.ok);
+  if (!ok) return { ok: false, text: 'reset not supported by this backend' };
+  const d = new Date(res.body.since);
+  const at = isNaN(d) ? DASH : `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  const n = Number(res.body.clearedMessages) || 0;
+  return { ok: true, text: `reset at ${at} (${n} message${n === 1 ? '' : 's'} cleared)` };
 }
 // ---------- end flow model ----------
 
@@ -493,8 +552,13 @@ function renderMessages() {
     if (isSR(m)) { txt.append(`↳ report for `, refLink(m.reportFor), ` · TP-ST ${fmtSt(m.st)}`); }
     else {
       txt.append(m.text || '');
+      const srr = srrNote(m, messages);
       const srId = flowKind(m) === 'MO' ? srIdOf(m) : null;
-      if (srId) { txt.append(' '); const s = el('span', 'tag SR'); s.append(refLink(srId, `MT SR ${srId}`)); txt.append(s); }
+      if (srr) {
+        txt.append(' '); const s = el('span', `tag srr ${srr.cls}`);
+        if (srr.id) s.append(refLink(srr.id, srr.text)); else s.textContent = srr.text;
+        txt.append(s);
+      } else if (srId) { txt.append(' '); const s = el('span', 'tag SR'); s.append(refLink(srId, `MT SR ${srId}`)); txt.append(s); }
     }
     const stTd = el('td'); stTd.append(stBadge(m.status));
     if (m.mwd && m.status === 'WAITING') stTd.append(el('span', 'dim', ' MWD'));
@@ -804,6 +868,15 @@ $('follow').onclick = () => select(null);
 $('logpeer').onchange = renderLog;
 $('logq').oninput = renderLog;
 $('logpause').onchange = () => { if (!$('logpause').checked) pollLog(); };
+$('resetbtn').onclick = async () => {
+  if (!confirm('Reset all SMSC metrics?')) return;
+  const clearMessages = $('resetclear').checked, note = $('resetnote');
+  let res;
+  try { res = await post('/api/metrics/reset', { clearMessages }); } catch { res = null; }
+  const n = resetNote(res);
+  note.textContent = n.text; note.className = `resetnote ${n.ok ? 'ok' : 'bad'}`;
+  if (n.ok) { if (clearMessages) selectedId = null; while (ticking) await new Promise(r => setTimeout(r, 50)); await tick(); }
+};
 
 getJson('/test').then(c => {
   for (const [name, what] of Object.entries(c.moScenarios || {})) {

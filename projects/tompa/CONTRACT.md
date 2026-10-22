@@ -58,14 +58,19 @@ Activate body we send: `{"supi","gpsi","amfId","accessType":"3GPP_ACCESS","guami
 | Reachability | `POST /ue/{supi}/reachable` body `{"reachable":false}` | next MT SMS gets 504 `UE_NOT_REACHABLE`. Setting it back to true triggers the stretch-goal alert path. |
 | Inbox | `GET /ue/{supi}/inbox` | MT SMS the UE has received |
 
-## Test subscribers (proposal for the group)
+## Test subscribers
 
-| SUPI | GPSI | Purpose |
-|---|---|---|
-| `imsi-001010000000001` | `msisdn-46700000001` | normal, SMS allowed |
-| `imsi-001010000000002` | `msisdn-46700000002` | normal, SMS allowed (MO/MT partner) |
-| `imsi-001010000000003` | `msisdn-46700000003` | SMS not allowed in subscription |
-| `imsi-001010000000099` | `msisdn-46700000099` | unknown in UDM |
+The UDM (hetoteam) owns subscriber data; see `projects/hetoteam/CONTRACT.md`. The UE simulator is pre-loaded with
+the same identities and holds only UE state (registered, reachable, inbox). SMS permissions come from the UDM via the SMSF.
+
+| SUPI | GPSI | UDM profile | Expected behaviour |
+|---|---|---|---|
+| `imsi-001010000000001` | `msisdn-46700000001` | SMS allowed | all flows work |
+| `imsi-001010000000002` | `msisdn-46700000002` | SMS allowed | all flows work (MO/MT partner) |
+| `imsi-001010000000003` | `msisdn-46700000003` | `smsSubscribed: false` | SMSF rejects Activate (SMS not allowed) |
+| `imsi-001010000000004` | `msisdn-46700000004` | `mtSmsBarringAll: true` | MT SMS barred at SRI-for-SM |
+| `imsi-001010000000005` | `msisdn-46700000005` | `moSmsBarringAll: true` | SMSF rejects UplinkSMS |
+| `imsi-001019999999999` | `msisdn-46799999999` | not provisioned | unknown subscriber |
 
 ## Logs
 
@@ -75,6 +80,5 @@ Activate body we send: `{"supi","gpsi","amfId","accessType":"3GPP_ACCESS","guami
 
 - @krilju: is the RP-ACK via UplinkSMS (above) fine, or do you want the delivery report in the N1N2 response?
 - @smsf-hao: please confirm the NF profile fields you need from the AMF (we plan nfInstanceId, nfType, nfStatus, nfServices with apiPrefix).
-- @hetoteam: are the test subscribers OK for the UDM?
 
 Changes are announced in `#build` before they ship.

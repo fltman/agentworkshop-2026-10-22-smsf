@@ -50,6 +50,8 @@ Strongly recommended: `fqdn` or `ipv4Addresses`, and `nfServices[]` so others ca
 - `nfStatus` defaults to `REGISTERED`, `heartBeatTimer` defaults to `30` (seconds).
 - Unknown `nfType` values are accepted and logged, not rejected. We would rather keep the demo running.
 - **400** with ProblemDetails if `nfInstanceId` is missing or does not match the path, or `nfType` is missing.
+- Keep `/` out of your `nfInstanceId`. The board hands us a decoded path, so a slash becomes a path
+  separator and the id will not match; you get a clear 400 saying so. Spaces and dots are fine.
 
 ### Heartbeat
 
@@ -141,9 +143,33 @@ Response **200**:
 ```
 GET {BASE}/status        who is registered right now, per type, plus counters
 GET {BASE}/log?limit=60  the last messages in and out of the NRF, for cross-team debugging
+GET {BASE}/kpi           the KPIs below, as JSON
+GET {BASE}/metrics       the same KPIs in Prometheus text format, scrape it if you want
 ```
 
-The colony tile at `/colony/smsf-hao/` shows both.
+The colony tile at `/colony/smsf-hao/` shows all of it.
+
+### KPIs
+
+Only `/nnrf-nfm` and `/nnrf-disc` traffic is measured. Our own tile polls every five seconds and
+counting that would make every rate a lie.
+
+| KPI | Where | Means |
+|---|---|---|
+| `coreCompleteness` | `nrf_core_completeness_ratio` | How many of AMF, UDM, SMSF, SMSC are registered **and** `REGISTERED`. `CUSTOM_SMSC` counts as the SMSC. 1.0 means the SMS path can be resolved end to end. |
+| `registry` | `nrf_nf_instances{nf_type=}` | NF profiles by type and by `nfStatus`. |
+| `discovery.hitRatio` | `nrf_discovery_hit_ratio` | Share of discovery queries that returned at least one instance. `null` before the first query, never a fake 0. |
+| `discovery.unservedTargets` | `nrf_discovery_queries_total{result="empty"}` | **Read this one.** A target NF type somebody keeps asking for that has never matched anything. If your NF is on that list, you are not registered and nobody can reach you. The tile raises an alert for it. |
+| `traffic` | `nrf_requests_total{operation=}` | Requests by operation: register, replace, heartbeat, patch, read, list, discover, deregister. Plus `perMinute` and a 5-minute average. |
+| `reliability.errorRatio` | `nrf_error_ratio` | Share of responses that were 4xx or 5xx. If this climbs, somebody is sending us something we refuse — ask us in `#build` and we will tell you what we saw. |
+| `reliability.suspensions` / `revivals` | `nrf_suspensions_total` | How many NFs we dropped out of discovery for missing heartbeats, and how many came back. |
+| `latencyMs` | `nrf_request_duration_ms{quantile=}` | p50, p95 and max over the last 500 requests. |
+| `heartbeats[]` | `nrf_heartbeat_budget_used_ratio` | Per NF: seconds since the last heartbeat, and how far through its suspend budget (`heartBeatTimer` × 3) it is. `1.0` means we suspend it on the next sweep. Worst first. |
+
+```
+curl -s {BASE}/kpi | jq '.coreCompleteness, .discovery.unservedTargets'
+curl -s {BASE}/metrics | grep nrf_discovery
+```
 
 ---
 
@@ -152,6 +178,13 @@ The colony tile at `/colony/smsf-hao/` shows both.
 ```bash
 projects/smsf-hao/smoke.sh                                   # against the live board
 BASE=http://localhost:8080/t/smsf-hao projects/smsf-hao/smoke.sh   # against a local server
+```
+
+Our own unit tests run the NRF in-process, with no server and no network:
+
+```
+node projects/smsf-hao/test.mjs                        # 83 tests
+node --experimental-test-coverage projects/smsf-hao/test.mjs   # 100% lines, 94% branches
 ```
 
 It registers a dummy NF, heartbeats it, discovers it, deregisters it and prints every step.

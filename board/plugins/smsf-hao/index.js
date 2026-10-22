@@ -17,6 +17,11 @@ const MISSED_HEARTBEATS_BEFORE_SUSPEND = 3;
 const DEFAULT_HEARTBEAT_TIMER = 30;
 const LOG_MAX = 300;
 const BODY_MAX = 1024 * 1024;
+const LATENCY_WINDOW = 500;          // keep the last N durations for the percentiles
+const RATE_WINDOW_MS = 5 * 60 * 1000;
+// The 5G Core Light needs these four to carry an SMS end to end. "present" is a substring match,
+// so holminator's CUSTOM_SMSC counts as the SMSC.
+const EXPECTED_TYPES = ['AMF', 'UDM', 'SMSF', 'SMSC'];
 // The board's own bots mention @smsf-hao when they report a release. Answering them is pure noise.
 const SYSTEM_SENDERS = ['release', 'colony', 'evolution', 'spore', 'lead', 'hub', 'news', 'radio'];
 // A test registration is not news. smoke.sh uses smoke-<epoch> ids.
@@ -33,6 +38,17 @@ const st = {
   started: new Date().toISOString(),
   lastReply: 0,
   counters: { register: 0, update: 0, deregister: 0, discover: 0, rejected: 0 },
+  // KPIs. The counters above are the headline numbers the tile has always shown; these are the
+  // ones an operator actually watches, and they are exposed on /kpi and /metrics.
+  kpi: {
+    byOperation: {},        // register | replace | heartbeat | patch | deregister | discover | read | error
+    byCode: {},             // HTTP status -> count
+    discovery: { queries: 0, hits: 0, empty: 0, byTarget: {} },
+    suspensions: 0,
+    revivals: 0,
+    latency: [],            // last LATENCY_WINDOW durations in ms
+    recent: [],             // request timestamps, for the per-minute rate
+  },
 };
 
 // ---------- small helpers ----------
@@ -96,6 +112,179 @@ function save() {
     const entries = [...st.profiles.values()].map(e => ({ profile: e.profile, announced: e.announced }));
     fs.writeFileSync(st.file, JSON.stringify({ entries }, null, 2));
   } catch (err) { console.error('[smsf-hao] save:', err && err.message); }
+}
+
+// ---------- KPIs ----------
+// Only the two service-based interfaces are counted. The tile polls /status and /kpi every five
+// seconds, and letting our own dashboard dominate the request rate would make every number a lie.
+
+function kpiOperation(op) {
+  st.kpi.byOperation[op] = (st.kpi.byOperation[op] || 0) + 1;
+}
+
+function kpiResponse(code, ms) {
+  const k = st.kpi;
+  k.byCode[code] = (k.byCode[code] || 0) + 1;
+  k.latency.push(ms);
+  if (k.latency.length > LATENCY_WINDOW) k.latency.splice(0, k.latency.length - LATENCY_WINDOW);
+  const now = nowMs();
+  k.recent.push(now);
+  while (k.recent.length && now - k.recent[0] > RATE_WINDOW_MS) k.recent.shift();
+}
+
+function kpiDiscovery(target, matched) {
+  const d = st.kpi.discovery;
+  d.queries++;
+  if (matched) d.hits++; else d.empty++;
+  const t = d.byTarget[target] || (d.byTarget[target] = { queries: 0, hits: 0, empty: 0 });
+  t.queries++;
+  if (matched) t.hits++; else t.empty++;
+}
+
+function percentile(sorted, p) {
+  if (!sorted.length) return 0;
+  const i = Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1);
+  return Math.round(sorted[Math.max(0, i)] * 1000) / 1000;
+}
+
+const ratio = (part, total) => (total ? Math.round((part / total) * 10000) / 10000 : null);
+
+// Per-NF heartbeat health. age / (timer * 3) is how far an NF is through its suspend budget,
+// so a team can see it drifting before we drop it out of discovery.
+function heartbeatHealth() {
+  return [...st.profiles.values()].map(e => {
+    const timer = Number(e.profile.heartBeatTimer) > 0 ? Number(e.profile.heartBeatTimer) : DEFAULT_HEARTBEAT_TIMER;
+    const ageSeconds = Math.round((nowMs() - e.lastSeen) / 1000);
+    const budget = timer * MISSED_HEARTBEATS_BEFORE_SUSPEND;
+    return {
+      nfInstanceId: e.profile.nfInstanceId,
+      nfType: normaliseType(e.profile.nfType),
+      nfStatus: e.profile.nfStatus,
+      heartBeatTimer: timer,
+      ageSeconds,
+      budgetSeconds: budget,
+      budgetUsed: Math.round((ageSeconds / budget) * 1000) / 1000,
+      health: e.profile.nfStatus !== 'REGISTERED' ? 'down' : ageSeconds > timer ? 'late' : 'ok',
+    };
+  }).sort((a, b) => b.budgetUsed - a.budgetUsed);
+}
+
+function kpiReport() {
+  const k = st.kpi;
+  const profiles = [...st.profiles.values()].map(e => e.profile);
+  const byType = {}, byStatus = {};
+  for (const p of profiles) {
+    const t = normaliseType(p.nfType);
+    byType[t] = (byType[t] || 0) + 1;
+    byStatus[p.nfStatus] = (byStatus[p.nfStatus] || 0) + 1;
+  }
+  const registeredTypes = profiles.filter(p => p.nfStatus === 'REGISTERED').map(p => normaliseType(p.nfType));
+  const present = EXPECTED_TYPES.filter(w => registeredTypes.some(t => String(t).includes(w)));
+  const missing = EXPECTED_TYPES.filter(w => !present.includes(w));
+
+  const sorted = [...k.latency].sort((a, b) => a - b);
+  const requests = Object.values(k.byOperation).reduce((a, b) => a + b, 0);
+  const errors = Object.entries(k.byCode).filter(([c]) => Number(c) >= 400).reduce((a, [, n]) => a + n, 0);
+  const responses = Object.values(k.byCode).reduce((a, b) => a + b, 0);
+  const now = nowMs();
+
+  return {
+    nrf: st.team,
+    generated: new Date().toISOString(),
+    started: st.started,
+    uptimeSeconds: Math.round((now - Date.parse(st.started)) / 1000),
+
+    // Is the core complete? The one number the whole group cares about.
+    coreCompleteness: { expected: EXPECTED_TYPES, present, missing, ratio: ratio(present.length, EXPECTED_TYPES.length) },
+
+    registry: {
+      total: profiles.length,
+      registered: byStatus.REGISTERED || 0,
+      suspended: byStatus.SUSPENDED || 0,
+      byType, byStatus,
+    },
+
+    traffic: {
+      requests,
+      perMinute: k.recent.filter(t => now - t <= 60000).length,
+      perMinuteAvg5m: Math.round((k.recent.length / 5) * 10) / 10,
+      byOperation: { ...k.byOperation },
+      byCode: { ...k.byCode },
+    },
+
+    discovery: {
+      queries: k.discovery.queries,
+      hits: k.discovery.hits,
+      empty: k.discovery.empty,
+      hitRatio: ratio(k.discovery.hits, k.discovery.queries),
+      byTarget: JSON.parse(JSON.stringify(k.discovery.byTarget)),
+      // Somebody is looking for an NF that is not registered. This is the list to act on.
+      unservedTargets: Object.entries(k.discovery.byTarget)
+        .filter(([, v]) => v.empty > 0 && v.hits === 0)
+        .map(([target, v]) => ({ target, queries: v.queries }))
+        .sort((a, b) => b.queries - a.queries),
+    },
+
+    reliability: {
+      responses,
+      errors,
+      errorRatio: ratio(errors, responses),
+      rejected: st.counters.rejected,
+      suspensions: k.suspensions,
+      revivals: k.revivals,
+    },
+
+    latencyMs: {
+      count: sorted.length,
+      avg: sorted.length ? Math.round((sorted.reduce((a, b) => a + b, 0) / sorted.length) * 1000) / 1000 : 0,
+      p50: percentile(sorted, 50),
+      p95: percentile(sorted, 95),
+      max: sorted.length ? Math.round(sorted[sorted.length - 1] * 1000) / 1000 : 0,
+    },
+
+    heartbeats: heartbeatHealth(),
+  };
+}
+
+// Prometheus text exposition, so any team can scrape us without parsing our JSON.
+function metricsText() {
+  const r = kpiReport();
+  const esc = v => String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, ' ');
+  const out = [];
+  const m = (name, help, type, samples) => {
+    out.push(`# HELP ${name} ${help}`, `# TYPE ${name} ${type}`);
+    for (const [labels, value] of samples) out.push(`${name}${labels ? `{${labels}}` : ''} ${value}`);
+  };
+
+  m('nrf_up', 'Always 1 while the NRF answers.', 'gauge', [['', 1]]);
+  m('nrf_uptime_seconds', 'Seconds since the NRF plugin started.', 'gauge', [['', r.uptimeSeconds]]);
+  m('nrf_core_completeness_ratio', 'Share of the NF types the 5G Core Light needs that are registered.', 'gauge', [['', r.coreCompleteness.ratio ?? 0]]);
+  m('nrf_nf_instances', 'NF profiles in the registry.', 'gauge',
+    Object.entries(r.registry.byType).flatMap(([t, n]) => [[`nf_type="${esc(t)}"`, n]]));
+  m('nrf_nf_instances_by_status', 'NF profiles by nfStatus.', 'gauge',
+    Object.entries(r.registry.byStatus).map(([s, n]) => [`nf_status="${esc(s)}"`, n]));
+  m('nrf_requests_total', 'Service requests handled, by operation.', 'counter',
+    Object.entries(r.traffic.byOperation).map(([o, n]) => [`operation="${esc(o)}"`, n]));
+  m('nrf_responses_total', 'Responses sent, by HTTP status code.', 'counter',
+    Object.entries(r.traffic.byCode).map(([c, n]) => [`code="${esc(c)}"`, n]));
+  m('nrf_discovery_queries_total', 'Discovery queries, by target NF type and whether anything matched.', 'counter',
+    Object.entries(r.discovery.byTarget).flatMap(([t, v]) => [
+      [`target_nf_type="${esc(t)}",result="hit"`, v.hits],
+      [`target_nf_type="${esc(t)}",result="empty"`, v.empty],
+    ]));
+  m('nrf_discovery_hit_ratio', 'Share of discovery queries that returned at least one instance.', 'gauge', [['', r.discovery.hitRatio ?? 1]]);
+  m('nrf_error_ratio', 'Share of responses with a 4xx or 5xx status.', 'gauge', [['', r.reliability.errorRatio ?? 0]]);
+  m('nrf_suspensions_total', 'NFs suspended after missed heartbeats.', 'counter', [['', r.reliability.suspensions]]);
+  m('nrf_revivals_total', 'Suspended NFs brought back by a heartbeat or a status patch.', 'counter', [['', r.reliability.revivals]]);
+  m('nrf_request_duration_ms', 'Request handling time inside the NRF.', 'summary', [
+    ['quantile="0.5"', r.latencyMs.p50], ['quantile="0.95"', r.latencyMs.p95], ['quantile="1"', r.latencyMs.max],
+  ]);
+  m('nrf_heartbeat_age_seconds', 'Seconds since each NF last heartbeated.', 'gauge',
+    r.heartbeats.map(h => [`nf_instance_id="${esc(h.nfInstanceId)}",nf_type="${esc(h.nfType)}"`, h.ageSeconds]));
+  m('nrf_heartbeat_budget_used_ratio', 'How far each NF is through its suspend budget (1 = suspended next sweep).', 'gauge',
+    r.heartbeats.map(h => [`nf_instance_id="${esc(h.nfInstanceId)}",nf_type="${esc(h.nfType)}"`, h.budgetUsed]));
+
+  return out.join('\n') + '\n';
 }
 
 // ---------- NF profile ----------
@@ -171,6 +360,7 @@ function sweep() {
     const stale = nowMs() - e.lastSeen > deadline;
     if (stale && e.profile.nfStatus === 'REGISTERED') {
       e.profile.nfStatus = 'SUSPENDED';
+      st.kpi.suspensions++;
       changed = true;
       note('out', `SUSPENDED ${e.profile.nfType} ${e.profile.nfInstanceId}`, `no heartbeat for ${Math.round(deadline / 1000)}s`);
     }
@@ -189,6 +379,7 @@ async function nfManagement(req, res, method, segments) {
     if (method !== 'GET') return problem(res, 405, 'METHOD_NOT_ALLOWED', `${method} is not allowed on the nf-instances collection`);
     const links = [...st.profiles.values()].map(e => ({ href: `/t/${st.team}/nnrf-nfm/v1/nf-instances/${e.profile.nfInstanceId}` }));
     note('in', 'GET nf-instances (collection)', `${links.length} instances`);
+    kpiOperation('list');
     return json(res, 200, { _links: { item: links } });
   }
 
@@ -196,12 +387,14 @@ async function nfManagement(req, res, method, segments) {
 
   if (method === 'GET') {
     note('in', `GET nf-instances/${id}`);
+    kpiOperation('read');
     if (!existing) return problem(res, 404, 'NOT_FOUND', `no NF instance ${id} is registered`, 'NF_INSTANCE_NOT_FOUND');
     return json(res, 200, decorate(existing.profile));
   }
 
   if (method === 'DELETE') {
     note('in', `DELETE nf-instances/${id}`);
+    kpiOperation('deregister');
     if (!existing) return problem(res, 404, 'NOT_FOUND', `no NF instance ${id} is registered`, 'NF_INSTANCE_NOT_FOUND');
     st.profiles.delete(id);
     st.counters.deregister++;
@@ -229,6 +422,8 @@ async function nfManagement(req, res, method, segments) {
     const isNew = !existing;
     st.profiles.set(id, { profile, lastSeen: nowMs(), announced: existing ? existing.announced : false });
     if (isNew) st.counters.register++; else st.counters.update++;
+    kpiOperation(isNew ? 'register' : 'replace');
+    if (!isNew && existing.profile.nfStatus !== 'REGISTERED' && profile.nfStatus === 'REGISTERED') st.kpi.revivals++;
     save();
     if (isNew) announce(st.profiles.get(id));
 
@@ -251,9 +446,12 @@ async function nfManagement(req, res, method, segments) {
     catch (e) { return problem(res, 400, 'INVALID_MSG_FORMAT', e.message); }
 
     // An empty patch, or no body at all, is the plain heartbeat of TS 29.510 5.2.2.3.
+    const wasDown = existing.profile.nfStatus !== 'REGISTERED';
     existing.profile = patched;
     existing.lastSeen = nowMs();
     st.counters.update++;
+    kpiOperation(ops.length === 0 ? 'heartbeat' : 'patch');
+    if (wasDown && patched.nfStatus === 'REGISTERED') st.kpi.revivals++;
     save();
 
     if (ops.length === 0) { note('out', `204 heartbeat ${patched.nfType} ${id}`); res.writeHead(204); res.end(); return true; }
@@ -312,6 +510,8 @@ function discovery(res, url) {
 
   if (limit) hits = hits.slice(0, limit);
   st.counters.discover++;
+  kpiOperation('discover');
+  kpiDiscovery(target, hits.length > 0);
   note('out', '200 SearchResult', `${hits.length} instance(s) of ${target} for ${requester}`);
   return json(res, 200, { validityPeriod: VALIDITY_PERIOD, nfInstances: hits.map(decorate) }, { 'cache-control': `max-age=${VALIDITY_PERIOD}` });
 }
@@ -376,6 +576,28 @@ module.exports = {
       return json(res, 200, { log: st.log.slice(-n) });
     }
 
+    if (method === 'GET' && segments[0] === 'kpi') {
+      return json(res, 200, kpiReport());
+    }
+
+    if (method === 'GET' && segments[0] === 'metrics') {
+      res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' });
+      res.end(metricsText());
+      return true;
+    }
+
+    // Only the two service interfaces are timed and counted. The tile polls /status, /log and
+    // /kpi every five seconds; counting our own dashboard would drown every rate we report.
+    if (segments[0] === 'nnrf-nfm' || segments[0] === 'nnrf-disc') {
+      const t0 = process.hrtime.bigint();
+      const origWriteHead = res.writeHead.bind(res);
+      res.writeHead = (code, headers) => {
+        res.writeHead = origWriteHead;
+        kpiResponse(code, Number(process.hrtime.bigint() - t0) / 1e6);
+        return origWriteHead(code, headers);
+      };
+    }
+
     if (segments[0] === 'nnrf-nfm' && segments[1] === 'v1') {
       return nfManagement(req, res, method, segments.slice(2));
     }
@@ -405,4 +627,7 @@ module.exports = {
         m.channel, m.id);
     } catch (err) { console.error('[smsf-hao] onMessage:', err && err.message); }
   },
+
+  // Only for projects/smsf-hao/test.mjs. The board server never looks at this.
+  _test: { st, sweep, applyPatch, apiRootFor, decorate, validate, inSupiRange, normaliseType, save, load, kpiReport, metricsText, percentile, heartbeatHealth },
 };

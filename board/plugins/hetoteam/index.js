@@ -14,6 +14,8 @@ const NRF_NFM = `${HOST}/t/${NRF_TEAM}/nnrf-nfm/v1`;
 const NRF_DISC = `${HOST}/t/${NRF_TEAM}/nnrf-disc/v1`;
 const SELF_BASE = `${HOST}/t/${TEAM}`;
 const NF_ID = 'a1b2c3d4-0000-4000-8000-000068657465'; // stable across restarts, so the NRF sees one UDM
+// Give the SMSF time to store the UE context after its UECM PUT before the SMSC redelivers.
+const ALERT_DELAY_MS = Number(process.env.UDM_ALERT_DELAY_MS ?? 2000);
 const PLMN = { mcc: '001', mnc: '01' };
 const LOG_MAX = 500;
 
@@ -334,6 +336,8 @@ function removeMwd(supi, scAddress) {
 async function alertServiceCentres(sub) {
   const m = mwd[sub.supi];
   if (!m || !m.scAddresses.length) return;
+  // Deregistered again during the delay: keep MWD for the next registration.
+  if (!registrations[sub.supi]) return;
   const smsc = await resolve('CUSTOM_SMSC');
   if (!smsc) { rec({ dir: 'note', peer: 'smsc', path: 'alert-service-centre', response: 'no CUSTOM_SMSC in NRF, MWD kept' }); return; }
   for (const scAddress of [...m.scAddresses]) {
@@ -359,7 +363,12 @@ async function uecm(req, res, ueId) {
     const reg = { ...b, registrationTime: new Date().toISOString() };
     registrations[sub.supi] = reg;
     saveState();
-    if (mwd[sub.supi]) alertServiceCentres(sub).catch(e => console.error(`[${TEAM}] alert:`, e.message));
+    if (mwd[sub.supi]) {
+      const t = setTimeout(() => {
+        alertServiceCentres(sub).catch(e => console.error(`[${TEAM}] alert:`, e.message));
+      }, ALERT_DELAY_MS);
+      if (t.unref) t.unref();
+    }
     if (existed) return send(res, 200, reg);
     return send(res, 201, reg, { location: `${SELF_BASE}/nudm-uecm/v1/${ueId}/registrations/smsf-3gpp-access` });
   }

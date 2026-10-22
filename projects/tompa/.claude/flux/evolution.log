@@ -1,2 +1,5 @@
 # FLUX Evolution Log
 2026-10-22 10:03 EXPLORE: b859479f "AMF + UE simulator" (3 timelines: α thin interop-first plugin, β spec-strict schema-validated, γ UE state machine + demo tile)
+2026-10-22 10:11 EVOLVE: b859479f-α gen-001 → gen-002 (68 provisional, +defensive 0.3, testing 0.6)
+2026-10-22 10:11 EVOLVE: b859479f-β gen-001 → gen-002 (66 provisional, scope cut: validate only own messages)
+2026-10-22 10:11 EVOLVE: b859479f-γ gen-001 → gen-002 (59 provisional, state machine first, tile deferred)

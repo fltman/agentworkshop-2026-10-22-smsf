@@ -181,8 +181,9 @@ Errors: `404 UNKNOWN_SUBSCRIBER`, `400 UNEXPECTED_DATA_VALUE`.
 
 ## 4. Alert-Service-Centre — UDM → SMSC (stretch goal)
 
-When an SMSF registers for a UE with MWD (section 1.1), the UDM sends one alert per stored SC address, then clears
-MWD. Agreed with holminator in #build:
+When an SMSF registers for a UE with MWD (section 1.1), the UDM waits 2 s (so the SMSF has stored the UE context
+before the SMSC redelivers), then sends one alert per stored SC address and clears MWD for each 2xx answer. If the
+SMSF deregisters the UE within those 2 s, no alert is sent and MWD is kept. Agreed with holminator in #build:
 
 - The UDM discovers the SMSC through the NRF with `target-nf-type=CUSTOM_SMSC` (service `nsmsc-sgd`).
 - `POST {smsc apiPrefix}/smsc/alert-service-centre`

@@ -171,9 +171,24 @@ async function t(name, fn) {
     assert.strictEqual(rep.status, 200);
     assert.strictEqual(rep.body.mwdStatus.scAddressInMwd, true);
     assert.strictEqual((await req('PUT', UECM('imsi-001010000000002'), REG)).status, 201);
-    await wait(300);
+    await wait(1500);
+    assert.deepStrictEqual(alerts, [], 'alert sent before the 2 s delay');
+    await wait(1000);
     assert.deepStrictEqual(alerts, [{ msisdn: '46700000002', scAddress: '46700000100', alertReason: 'UE_PRESENT' }]);
     assert.strictEqual((await req('GET', '/registrations')).body.mwd['imsi-001010000000002'], undefined, 'MWD not cleared');
+  });
+  await t('Alert skipped when the SMSF deregisters within the delay; MWD kept for the next registration', async () => {
+    assert.strictEqual((await req('DELETE', UECM('imsi-001010000000002'))).status, 204);
+    assert.strictEqual((await req('POST', SRI, { msisdn: '46700000002', scAddress: '46700000100' })).body.result, 'ABSENT_SUBSCRIBER_SM');
+    await req('PUT', UECM('imsi-001010000000002'), REG);
+    await req('DELETE', UECM('imsi-001010000000002'));
+    await wait(2500);
+    assert.strictEqual(alerts.length, 1, 'alert sent although the UE deregistered');
+    assert((await req('GET', '/registrations')).body.mwd['imsi-001010000000002'], 'MWD lost');
+    await req('PUT', UECM('imsi-001010000000002'), REG);
+    await wait(2500);
+    assert.strictEqual(alerts.length, 2);
+    assert.strictEqual((await req('GET', '/registrations')).body.mwd['imsi-001010000000002'], undefined);
   });
   await t('Report-SM-Delivery-Status SUCCESSFUL_TRANSFER clears MWD; bad outcome → 400', async () => {
     await req('POST', RSDS, { msisdn: '46700000001', scAddress: '46700000100', deliveryOutcome: 'MEMORY_CAPACITY_EXCEEDED' });

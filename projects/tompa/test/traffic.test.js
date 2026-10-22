@@ -54,3 +54,30 @@ test('in-flight cap skips ticks instead of piling up', async () => {
   assert.strictEqual(s.inFlight, 20);
   assert.strictEqual(s.totals.skipped, 5);
 });
+
+test('register/deregister churn toggles UE4 and UE3; UE3 SMS refusal counts as expected', async () => {
+  const state = new Map(), calls = [];
+  let t = 1_000_000, i = 0;
+  const seq = [0.12, 0.12, 0.17, 0.17];
+  const g = createGenerator({
+    sendSms: async () => ({ status: 200, body: {} }),
+    ensureRegistered: async supi => ({ supi }),
+    register: async supi => { calls.push(['reg', supi]); state.set(supi, true);
+      return { status: 200, body: { state: 'REGISTERED', smsActive: supi.endsWith('4') } }; },
+    deregister: async supi => { calls.push(['dereg', supi]); state.set(supi, false);
+      return { status: 200, body: { state: 'DEREGISTERED', smsf: supi.endsWith('4') ? { status: 204 } : null } }; },
+    isRegistered: supi => !!state.get(supi),
+    now: () => t, rnd: () => seq[i++ % seq.length], setTimer: () => ({}), clearTimer: () => {},
+  });
+  await g.start({ rate: 1 });
+  for (let k = 0; k < 4; k++) { await g.fire(); t += 1000; }
+  assert.deepStrictEqual(calls, [['reg', 'imsi-001010000000004'], ['dereg', 'imsi-001010000000004'],
+    ['reg', 'imsi-001010000000003'], ['dereg', 'imsi-001010000000003']]);
+  const s = g.stats();
+  assert.deepStrictEqual(s.procedures, { sms: 0, register: 2, deregister: 2 });
+  assert.deepStrictEqual(s.totals, { sent: 4, ok: 3, expected: 1, failed: 0, skipped: 0 });
+});
+
+test('a UE4 registration where the SMSF refuses SMS is a failure', () => {
+  assert.strictEqual(classify({ kind: 'register', sms: true }, { status: 200, body: { state: 'REGISTERED', smsActive: false } }), 'failed');
+});

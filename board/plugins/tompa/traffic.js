@@ -8,17 +8,25 @@ const MAX_IN_FLIGHT = 20;    // skip ticks rather than pile up on a slow core
 const WINDOW_S = 60;
 const LAT_SAMPLES = 500;
 
-const UE1 = 'imsi-001010000000001', UE2 = 'imsi-001010000000002', UE5 = 'imsi-001010000000005';
+const UE1 = 'imsi-001010000000001', UE2 = 'imsi-001010000000002', UE3 = 'imsi-001010000000003';
+const UE4 = 'imsi-001010000000004', UE5 = 'imsi-001010000000005';
 const MSISDN = { [UE1]: '46700000001', [UE2]: '46700000002', [UE5]: '46700000005' };
 const UE4_MSISDN = '46700000004';
 const SENDERS = [UE1, UE2, UE5];
+// Registration churn runs on UEs that never send load SMS: UE4 (SMS allowed) and UE3 (SMS not subscribed).
+const MOBILE = { [UE4]: { sms: true }, [UE3]: { sms: false } };
 
-// ~90 % happy path UE1↔UE2, ~5 % MO from MO-barred UE5, ~5 % to MT-barred UE4.
-function pick(rnd) {
+// ~80 % happy path UE1↔UE2, ~5 % MO from MO-barred UE5, ~5 % to MT-barred UE4,
+// ~10 % register/deregister of UE4 or UE3 (toggles the UE's current state).
+function pick(rnd, isRegistered = () => false) {
   const x = rnd();
   if (x < 0.05) return { kind: 'mo-barred', from: UE5, to: MSISDN[UE1], expect: 'MO_SMS_BARRED' };
   if (x < 0.10) return { kind: 'mt-barred', from: UE1, to: UE4_MSISDN, expect: 'BARRED' };
-  return x < 0.55 ? { kind: 'happy', from: UE1, to: MSISDN[UE2] } : { kind: 'happy', from: UE2, to: MSISDN[UE1] };
+  if (x < 0.20) {
+    const ue = x < 0.15 ? UE4 : UE3;
+    return { kind: isRegistered(ue) ? 'deregister' : 'register', ue, sms: MOBILE[ue].sms };
+  }
+  return x < 0.60 ? { kind: 'happy', from: UE1, to: MSISDN[UE2] } : { kind: 'happy', from: UE2, to: MSISDN[UE1] };
 }
 
 const causeOf = r => {
@@ -30,6 +38,13 @@ const causeOf = r => {
 // verdict: ok (delivered as intended), expected (the core refused as the subscriber data says), failed (anything else)
 function classify(p, r) {
   const ok = r && r.status === 200;
+  const b = (r && r.body) || {};
+  if (p.kind === 'register') {
+    if (!ok || b.state !== 'REGISTERED') return 'failed';
+    if (p.sms) return b.smsActive ? 'ok' : 'failed';
+    return b.smsActive ? 'failed' : 'expected'; // 5GS registration succeeds, SMS over NAS refused
+  }
+  if (p.kind === 'deregister') return ok && b.state === 'DEREGISTERED' && (!b.smsf || b.smsf.status === 204) ? 'ok' : 'failed';
   if (p.kind === 'happy') return ok ? 'ok' : 'failed';
   if (p.kind === 'mt-barred') return ok || /BARRED/i.test(causeOf(r)) ? 'expected' : 'failed'; // MT barring may only bite on delivery
   return !ok && causeOf(r) === p.expect ? 'expected' : 'failed';
@@ -40,7 +55,7 @@ function percentile(sorted, q) {
   return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
 }
 
-function createGenerator({ sendSms, ensureRegistered, now = Date.now, rnd = Math.random, setTimer = setInterval, clearTimer = clearInterval }) {
+function createGenerator({ sendSms, ensureRegistered, register, deregister, isRegistered, now = Date.now, rnd = Math.random, setTimer = setInterval, clearTimer = clearInterval }) {
   let st = null;
   const empty = () => ({ sent: 0, ok: 0, expected: 0, failed: 0, skipped: 0 });
 
@@ -56,11 +71,19 @@ function createGenerator({ sendSms, ensureRegistered, now = Date.now, rnd = Math
     if (!st || !st.running) return;
     if (now() >= st.stopsAt) return stop('auto-stop');
     if (st.inFlight >= MAX_IN_FLIGHT) { st.totals.skipped++; bucket(now()).skipped++; return; }
-    const p = pick(rnd);
+    let p = pick(rnd, isRegistered);
+    if (p.ue && (!register || !deregister || st.busy.has(p.ue))) p = { kind: 'happy', from: UE1, to: MSISDN[UE2] };
     st.inFlight++; st.totals.sent++; bucket(now()).sent++;
+    st.procedures[p.kind === 'register' || p.kind === 'deregister' ? p.kind : 'sms']++;
     const t0 = now();
     let r;
-    try { r = await sendSms(p.from, p.to, `load ${st.totals.sent}`); } catch (e) { r = { status: 0, body: { cause: e.message } }; }
+    try {
+      if (p.ue) {
+        st.busy.add(p.ue);
+        r = await (p.kind === 'register' ? register : deregister)(p.ue);
+      } else r = await sendSms(p.from, p.to, `load ${st.totals.sent}`);
+    } catch (e) { r = { status: 0, body: { cause: e.message } }; }
+    if (p.ue) st.busy.delete(p.ue);
     const ms = now() - t0;
     st.inFlight--;
     const v = classify(p, r);
@@ -79,7 +102,7 @@ function createGenerator({ sendSms, ensureRegistered, now = Date.now, rnd = Math
     }
     const t = now();
     st = { running: true, rate, durationS, startedAt: t, stopsAt: t + durationS * 1000, stoppedBy: null,
-      inFlight: 0, totals: empty(), causes: {}, lat: [], window: [], prep };
+      inFlight: 0, totals: empty(), procedures: { sms: 0, register: 0, deregister: 0 }, busy: new Set(), causes: {}, lat: [], window: [], prep };
     st.timer = setTimer(() => { fire(); }, Math.round(1000 / rate));
     return stats();
   }
@@ -104,7 +127,7 @@ function createGenerator({ sendSms, ensureRegistered, now = Date.now, rnd = Math
       remainingS: st.running ? Math.max(0, Math.round((st.stopsAt - t) / 1000)) : 0,
       inFlight: st.inFlight,
       currentRate: Math.round((recent.reduce((s, b) => s + b.sent, 0) / 10) * 10) / 10,
-      totals: st.totals,
+      totals: st.totals, procedures: st.procedures,
       successPct: done ? Math.round(((st.totals.ok + st.totals.expected) / done) * 1000) / 10 : null,
       latencyMs: { avg: sorted.length ? Math.round(sorted.reduce((a, b) => a + b, 0) / sorted.length) : null,
         p95: percentile(sorted, 0.95), max: sorted.length ? sorted[sorted.length - 1] : null },

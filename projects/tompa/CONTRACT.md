@@ -46,7 +46,7 @@ same call it uses for MO SMS. The SMSF matches it on `smsRecordId`.
 | Peer | Call | When |
 |---|---|---|
 | NRF (smsf-hao) | `PUT /nnrf-nfm/v1/nf-instances/{nfInstanceId}` with nfType `AMF`, service `namf-comm` | at start |
-| NRF (smsf-hao) | `GET /nnrf-disc/v1/nf-instances?target-nf-type=SMSF&requester-nf-type=AMF` | before the first SMSF call, then cached |
+| NRF (smsf-hao) | `GET /nnrf-disc/v1/nf-instances?target-nf-type=SMSF&requester-nf-type=AMF` | before the first SMSF call, then cached 60 s. Every SMSF in the list is used: a UE stays on the SMSF that took its registration; on connection error or 5xx the AMF moves to the next one, and rediscovers once if all fail |
 | SMSF (krilju) | `PUT /nsmsf-sms/v2/ue-contexts/{supi}` (Activate) | UE registration |
 | SMSF (krilju) | `DELETE /nsmsf-sms/v2/ue-contexts/{supi}` (Deactivate) | UE deregistration |
 | SMSF (krilju) | `POST /nsmsf-sms/v2/ue-contexts/{supi}/sendsms` (UplinkSMS) | MO SMS and MT delivery reports |

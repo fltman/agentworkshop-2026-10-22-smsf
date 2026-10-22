@@ -16,6 +16,43 @@
   #e2e-steps li { padding: 3px 0; } .s-ok { color: var(--ok); } .s-bad { color: var(--bad); } .s-warn { color: var(--warn); }
   iframe { width: 100%; height: 460px; border: 0; border-radius: 8px; background: var(--card); }
   .links a { margin: 0 4px 4px 0; display: inline-block; color: var(--acc); }
+  /* look switcher */
+  #looks { display: flex; gap: 6px; align-items: center; margin-bottom: 12px; }
+  #looks button { padding: 4px 12px; font-size: 13px; } #looks button.on { border-color: var(--acc); color: var(--acc); }
+  #look-left { color: var(--dim); font-size: 11px; }
+  /* Torget map look: The Square's newsreel palette and fonts */
+  @font-face { font-family: 'Bowlby One SC'; src: url('/bowlby-one-sc.woff2') format('woff2'); }
+  @font-face { font-family: 'Jost'; src: url('/jost.woff2') format('woff2'); }
+  body[data-look="map"] { background: #f6e1bd; color: #121617; }
+  body[data-look="map"] header h1, body[data-look="map"] header small { color: #121617; }
+  body[data-look="map"] #looks button { background: #fceed2; color: #121617; border-color: #cf973b; }
+  body[data-look="map"] #looks button.on { background: #253850; color: #fceed2; }
+  #v-map { font-family: 'Jost', system-ui, sans-serif; }
+  #v-map .band { background: #253850; color: #fceed2; padding: 10px 16px; border-bottom: 6px solid #dca844; display: flex; justify-content: space-between; align-items: baseline; }
+  #v-map .band b { font-family: 'Bowlby One SC', Impact, sans-serif; font-size: 26px; letter-spacing: 1px; }
+  #v-map .band span { font-family: ui-monospace, monospace; color: #edc884; }
+  #v-map .paper { display: grid; grid-template-columns: 3fr 1fr; gap: 12px; background: #fceed2; border: 2px solid #121617; padding: 12px; }
+  @media (max-width: 900px) { #v-map .paper { grid-template-columns: 1fr; } }
+  #map-svg { width: 100%; height: auto; }
+  .m-edge { stroke: #253850; stroke-width: 3; opacity: .35; } .m-edge.m-bad { stroke: #e2432e; stroke-dasharray: 8 6; opacity: .6; }
+  .m-count { font: 600 13px 'Jost', sans-serif; fill: #121617; text-anchor: middle; }
+  .m-node circle { fill: #253850; stroke: #dca844; stroke-width: 5; transition: fill .4s; }
+  .m-node .m-name { font: 20px 'Bowlby One SC', Impact, sans-serif; fill: #fceed2; text-anchor: middle; }
+  .m-node .m-team { font: 11px 'Jost', sans-serif; fill: #edc884; text-anchor: middle; }
+  .m-node.hit-ok circle { animation: hitok .7s; } .m-node.hit-nok circle { animation: hitnok 1.2s; }
+  @keyframes hitok { 30% { fill: #2f7d3a; } } @keyframes hitnok { 20%, 60% { fill: #e2432e; } }
+  .m-dot.m-sig.ok { fill: #253850; stroke: #dca844; } .m-legend { font-size: 12px; margin-left: 14px; }
+  .m-dot.ok { fill: #2f9e44; stroke: #fceed2; stroke-width: 2; } .m-dot.nok { fill: #e2432e; stroke: #121617; stroke-width: 2; }
+  #map-ticker { list-style: none; margin: 0; padding: 0; font: 12px ui-monospace, monospace; }
+  #map-ticker li { padding: 5px 0; border-bottom: 1px dashed #cf973b; white-space: normal; }
+  #map-ticker li.ok::before { content: '● '; color: #2f9e44; } #map-ticker li.nok { color: #e2432e; font-weight: 600; } #map-ticker li.nok::before { content: '✖ '; }
+  #v-map h3 { font-family: 'Bowlby One SC', Impact, sans-serif; color: #253850; margin: 0 0 6px; }
+  /* arcade look */
+  body[data-look="arcade"] { background: #000; }
+  #v-arcade { text-align: center; }
+  #arcade-canvas { width: 100%; max-width: 1100px; image-rendering: pixelated; border: 4px solid #ffd33d; border-radius: 6px; box-shadow: 0 0 30px #ffd33d55; }
+  #coin { margin-top: 10px; font: bold 16px ui-monospace, monospace; padding: 8px 20px; background: #ffd33d; color: #000; border: 0; }
+  #v-arcade h2 { font: bold 22px ui-monospace, monospace; color: #ffd33d; letter-spacing: 4px; }
 </style>
 </head>
 <body>
@@ -24,6 +61,12 @@
   <span class="meta" id="ts"></span>
 </header>
 
+<nav id="looks">
+  <button data-look="classic">Classic</button><button data-look="map">Torget map</button><button data-look="arcade">SMS Space Post</button>
+  <button id="look-auto">auto ⟳</button><span id="look-left"></span>
+</nav>
+
+<section id="v-classic">
 <div id="chain"></div>
 
 <div class="grid">
@@ -60,8 +103,28 @@
 
 <h2>Call flow <small>signalling seen by the AMF</small></h2>
 <iframe src="flow.html" title="call flow"></iframe>
+</section>
+
+<section id="v-map" hidden>
+  <div class="band"><b>5G Core Light · live network</b><span id="map-tally">waiting for traffic</span><span class="m-legend">● SMS · ◆ UDM/NRF signalling</span></div>
+  <div class="paper">
+    <svg id="map-svg" viewBox="0 0 900 540" role="img" aria-label="5G core nodes and live calls"></svg>
+    <div><h3>On the wire</h3><ul id="map-ticker"></ul></div>
+  </div>
+</section>
+
+<section id="v-arcade" hidden>
+  <h2>SMS SPACE POST</h2>
+  <canvas id="arcade-canvas" width="900" height="540"></canvas><br>
+  <small>✉ SMS rocket · ◆ data crystal: UDM/NRF signalling</small><br>
+  <button id="coin">INSERT COIN (send SMS)</button>
+</section>
 
 <script src="core.js"></script>
 <script src="group.js"></script>
+<script src="events.js"></script>
+<script src="map.js"></script>
+<script src="arcade.js"></script>
+<script src="gui.js"></script>
 </body>
 </html>

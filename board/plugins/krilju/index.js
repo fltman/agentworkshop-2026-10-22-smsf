@@ -63,9 +63,11 @@ async function registerInNrf() {
     nfInstanceId: NF_ID,
     nfType: 'SMSF',
     nfStatus: 'REGISTERED',
+    fqdn: new URL(HOST).host,
+    heartBeatTimer: 30,
     nfServices: [{
-      serviceInstanceId: 'nsmsf-sms-1', serviceName: 'nsmsf-sms', versions: [{ apiVersionInUri: 'v2' }],
-      scheme: 'http', nfServiceStatus: 'REGISTERED', apiPrefix: SELF_BASE,
+      serviceInstanceId: 'nsmsf-sms-1', serviceName: 'nsmsf-sms', versions: [{ apiVersionInUri: 'v2', apiFullVersion: '2.0.0' }],
+      scheme: new URL(HOST).protocol.replace(':', ''), nfServiceStatus: 'REGISTERED', apiPrefix: `/t/${TEAM}`, apiRoot: SELF_BASE,
     }],
   };
   const r = await call('nrf', 'PUT', `${NRF_NFM}/nf-instances/${NF_ID}`, profile);
@@ -73,15 +75,34 @@ async function registerInNrf() {
   return registered;
 }
 
+// The NRF suspends a profile after 3 missed heartbeats; re-register if it forgot us.
+async function heartbeat() {
+  const r = await fetch(`${NRF_NFM}/nf-instances/${NF_ID}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json-patch+json' },
+    body: '[]',
+    signal: AbortSignal.timeout(5000),
+  }).catch(() => null);
+  if (r && r.status === 204) return;
+  registered = false;
+  await registerInNrf();
+}
+
+// NRF type names for peers that TS 29.510 has no type for.
+const NF_TYPE = { SMSC: 'CUSTOM_SMSC' };
+
 // Resolve the base URL of an NF through NRF discovery (cached 60 s).
 async function resolve(nfType) {
   const hit = disc.get(nfType);
   if (hit && Date.now() - hit.ts < 60000) return hit.base;
-  const r = await call('nrf', 'GET', `${NRF_DISC}/nf-instances?target-nf-type=${nfType}&requester-nf-type=SMSF`);
+  const target = NF_TYPE[nfType] || nfType;
+  const r = await call('nrf', 'GET', `${NRF_DISC}/nf-instances?target-nf-type=${target}&requester-nf-type=SMSF`);
   const inst = r.body && Array.isArray(r.body.nfInstances) ? r.body.nfInstances[0] : null;
   if (!inst) return null;
   const svc = (inst.nfServices || [])[0] || {};
-  const base = (svc.apiPrefix || inst.apiPrefix || '').replace(/\/$/, '') || null;
+  let base = svc.apiRoot || svc.apiPrefix || '';
+  if (base.startsWith('/')) base = `${HOST}${base}`; // relative apiPrefix: same board
+  base = base.replace(/\/$/, '') || null;
   if (base) disc.set(nfType, { base, ts: Date.now() });
   return base;
 }
@@ -198,12 +219,12 @@ async function mtForward(req, res) {
 module.exports = {
   init() {
     const tick = () => {
-      registerInNrf().catch(e => console.error(`[${TEAM}] nrf:`, e.message));
+      (registered ? heartbeat() : registerInNrf()).catch(e => console.error(`[${TEAM}] nrf:`, e.message));
     };
-    // The NRF may load after us: retry until registered, then stop.
+    // Register (retrying while the NRF is not up), then heartbeat every 20 s.
     const t = setInterval(() => {
-      try { if (registered) clearInterval(t); else tick(); } catch (e) { console.error(`[${TEAM}]`, e.message); }
-    }, 10000);
+      try { tick(); } catch (e) { console.error(`[${TEAM}]`, e.message); }
+    }, 20000);
     if (t.unref) t.unref();
     const first = setTimeout(() => { try { tick(); } catch (e) { console.error(`[${TEAM}]`, e.message); } }, 3000);
     if (first.unref) first.unref();

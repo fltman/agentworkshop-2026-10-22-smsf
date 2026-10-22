@@ -21,3 +21,4 @@
 2026-10-22 11:59 SELECT: 05f8eb0a-β wins (fitness 85 vs δ 77, γ 62, α 55), α γ δ to the graveyard
 2026-10-22 13:07 EVOLVE: no active timelines (b859479f-α and 05f8eb0a-β already selected); PR 36 work (NRF feed, reg/dereg load, SMSF failover) ran on the β scenario-runner genome, no new problem class seen twice, nothing to fork
 2026-10-22 15:02 EXPLORE: ff12f991 "second AMF instance for SMSF failover" (3 timelines: α twin instance, β twin + fault switch, γ AMF set with GUAMI ownership)
+2026-10-22 15:08 SELECT: ff12f991-β wins (fitness 82 vs α 60, γ 48), α γ to the graveyard; delivered as PR 42

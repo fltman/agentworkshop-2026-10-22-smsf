@@ -18,6 +18,9 @@ Error bodies are ProblemDetails: `{"status","cause","detail"}`.
 `POST /smsc/mt-forward-short-message` (SMSC to SMSF): `{"supi" or "msisdn","scAddress","sms":{"hex"},"smsRecordId"}`
 Response 200 `{"result":"SUCCESS","deliveryReport":{"hex"}}`, or 4xx/5xx with `{"result":"ABSENT_SUBSCRIBER"|"UNKNOWN_SUBSCRIBER"|"SMS_NOT_ALLOWED"|"FAILURE","cause"}`.
 
+When the UE answers with RP-ERROR the SMSF returns `502 {"result":"FAILURE","cause":"UE answered RP-ERROR","rpCause":<integer, TS 24.011 8.2.5.4>,"deliveryReport":{"hex"}}`.
+`rpCause` is the single source of the RP-Cause and is always present. `deliveryReport.hex` is optional and, when present, is the bare TPDU (SMS-DELIVER-REPORT), never an RP envelope. The SMSC classifies on `rpCause` alone.
+
 `POST /smsc/alert-service-centre` (not used by us; goes to SMSC when UE becomes reachable, stretch goal).
 
 ## Used (as agreed with the owners' contracts)

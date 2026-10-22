@@ -30,22 +30,69 @@ const st = {
   disc: new Map(), // nfType or nfType/instanceId -> { base, ts }
   dataDir: null,
   timers: [],
-  metrics: newMetrics(),
+  metrics: null, // newMetrics(), set below once the key lists exist
   inflight: new Set(), // recipients with an SMS-DELIVER outstanding: only one at a time per MS (TS 23.040 6.2)
   lastScts: new Map(), // recipient -> last TP-SCTS second used, so timestamps stay unique per MS
 };
 
-// Counters reset on restart; message totals by status come from the persisted store instead.
+// Every known counter, PDU, RP-Cause, TP-ST and SGd operation key starts at 0, so a missing key is never a silent 0.
+// Counters are persisted in store.json with the messages (saveStore/loadStore); since is when they started counting.
+const COUNTERS = [
+  'requests_in', 'answers_error', 'test_requests', 'store_evicted',
+  'mo_received', 'mo_accepted', 'mo_rejected', 'mo_dry_runs', 'mo_duplicates_accepted', 'mo_forwarded', 'mo_expired',
+  'mt_originated', 'mt_attempts', 'mt_forward_not_sent', 'mt_delivered', 'mt_failed', 'mt_expired', 'mt_absent',
+  'mt_retries_scheduled', 'mt_rp_error_temporary', 'mt_attempts_exhausted', 'mt_alert_fast_retries',
+  'sri_requests', 'udm_delivery_reports', 'alerts_received', 'alerts_redelivering',
+  'status_reports_generated', 'status_reports_sent', 'status_reports_failed', 'status_reports_expired',
+  'nrf_register_attempts', 'nrf_registrations', 'nrf_heartbeats_ok', 'nrf_heartbeats_failed',
+  'nrf_discoveries', 'nrf_discoveries_empty', 'nrf_discovery_cache_hits',
+];
+const PDUS_IN = ['RP-DATA/SMS-SUBMIT', 'RP-ACK/SMS-DELIVER-REPORT', 'RP-ACK/STATUS-REPORT-ACK', 'RP-ERROR/SMS-DELIVER-REPORT', 'none/no-report'];
+const PDUS_OUT = ['RP-ACK/SMS-SUBMIT-REPORT', 'RP-ERROR/SMS-SUBMIT-REPORT', 'RP-DATA/SMS-DELIVER', 'RP-DATA/SMS-STATUS-REPORT'];
+const OPS_OUT = ['SRI-for-SM', 'MT-Forward-SM', 'Report-SM-Delivery-Status', 'NFDiscover', 'NFRegister', 'NFUpdate'];
+const OPS_IN = ['MO-Forward-SM', 'Alert-SC'];
+// "22 MEMORY_CAPACITY_EXCEEDED": number plus the TS 24.011 8.2.5.4 name in upper snake case.
+const rpCauseKey = c => `${c} ${String(tpdu.RP_CAUSE[c] || 'Unknown RP-Cause').toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, '')}`;
+const tpStKey = v => `0x${Number(v).toString(16).padStart(2, '0')}`;
+const zeros = keys => Object.fromEntries(keys.map(k => [k, 0]));
 function newMetrics() {
+  const now = new Date().toISOString();
+  const causes = Object.keys(tpdu.RP_CAUSE).map(Number).map(rpCauseKey);
   return {
-    startedAt: new Date().toISOString(),
-    counters: {},
+    startedAt: now, // this process
+    since: now, // when the persisted counters started counting (kept across restarts)
+    counters: zeros(COUNTERS),
     results: {}, // operation -> result -> count, for every answer we give and every answer we get
     peers: {}, // peer -> { in, out, errors, latencyMsSum, latencyMsMax, calls }
     nrf: { lastHeartbeatAt: null, lastHeartbeatStatus: null, lastRegisteredAt: null },
+    pdus: { in: zeros(PDUS_IN), out: zeros(PDUS_OUT) },
+    rpCauses: { in: zeros(causes), out: zeros(causes) },
+    byTpSt: zeros([...new Set([...Object.values(tpdu.ST), 0x60].map(tpStKey))].sort()),
+    operationsOut: zeros(OPS_OUT),
+    operationsIn: zeros(OPS_IN),
   };
 }
+st.metrics = newMetrics();
+// Persisted parts of st.metrics, merged over fresh pre-seeded defaults on load.
+const PERSISTED = ['since', 'counters', 'results', 'peers', 'pdus', 'rpCauses', 'byTpSt', 'operationsOut', 'operationsIn'];
+function restoreMetrics(saved) {
+  const m = newMetrics();
+  if (!saved || typeof saved !== 'object') return m;
+  if (saved.since) m.since = saved.since;
+  for (const k of ['counters', 'results', 'peers', 'byTpSt', 'operationsOut', 'operationsIn']) Object.assign(m[k], saved[k] || {});
+  for (const k of ['pdus', 'rpCauses']) for (const d of ['in', 'out']) Object.assign(m[k][d], (saved[k] && saved[k][d]) || {});
+  return m;
+}
 function inc(name, n = 1) { st.metrics.counters[name] = (st.metrics.counters[name] || 0) + n; }
+function bump(map, key, n = 1) { map[key] = (map[key] || 0) + n; }
+function pdu(dir, key) { bump(st.metrics.pdus[dir], key); }
+function rpCause(dir, c) { if (c !== null && c !== undefined) bump(st.metrics.rpCauses[dir], rpCauseKey(c)); }
+// SGd/NRF operation names per Diameter-style operation; call() passes its op label.
+const OP_NAME = { 'MT-Forward-Short-Message': 'MT-Forward-SM', 'NFUpdate (heartbeat)': 'NFUpdate' };
+function countOp(dir, op) { bump(dir === 'out' ? st.metrics.operationsOut : st.metrics.operationsIn, OP_NAME[op] || op); }
+// In-flight MT attempts, so the consistency checks hold while an attempt runs: counted but no forward sent yet
+// (openNoFwd), forward sent but no answer yet (openFwd). Not persisted: a restart ends every attempt.
+const mtOpen = { noFwd: 0, fwd: 0 };
 function countResult(op, result) {
   const r = st.metrics.results[op] || (st.metrics.results[op] = {});
   r[result] = (r[result] || 0) + 1;
@@ -68,12 +115,14 @@ function loadStore() {
     const s = JSON.parse(fs.readFileSync(f, 'utf8'));
     st.messages = Array.isArray(s.messages) ? s.messages : [];
     st.msgSeq = s.msgSeq || st.messages.length;
+    if (s.metrics) st.metrics = { ...restoreMetrics(s.metrics), startedAt: st.metrics.startedAt, nrf: st.metrics.nrf };
   } catch (e) { console.error(`[${TEAM}] store:`, e.message); }
 }
 function saveStore() {
   const f = storeFile();
   if (!f) return;
-  try { fs.writeFileSync(f, JSON.stringify({ msgSeq: st.msgSeq, messages: st.messages })); }
+  const metrics = Object.fromEntries(PERSISTED.map(k => [k, st.metrics[k]]));
+  try { fs.writeFileSync(f, JSON.stringify({ msgSeq: st.msgSeq, messages: st.messages, metrics })); }
   catch (e) { console.error(`[${TEAM}] store:`, e.message); }
 }
 
@@ -104,6 +153,7 @@ async function call(peer, method, url, body, { quiet = false, op = null } = {}) 
     if (op) countResult(op, status === 0 ? 'NO_ANSWER' : ((json && json.result) || String(status)));
     return ms;
   };
+  if (op) countOp('out', op);
   try {
     const r = await fetch(url, {
       method,
@@ -200,9 +250,12 @@ function every(ms, fn) {
   return t;
 }
 
+// Every inbound peer request gets exactly one reply(), so these two counters feed GET /kpi.
 function reply(res, peer, what, status, body) {
   rec('out', peer, `answer ${what}`, status, body);
   peerStats(peer).out++;
+  inc('requests_in');
+  if (status >= 400) inc('answers_error');
   const cause = body && body.smDeliveryFailureCause && body.smDeliveryFailureCause.smEnumeratedDeliveryFailureCause;
   countResult(what, (body && body.result ? body.result : String(status)) + (cause ? `/${cause}` : ''));
   return send(res, status, body);
@@ -225,7 +278,7 @@ function inbound(peer, what, body) {
 
 function saveMessage(m) {
   st.messages.push(m);
-  if (st.messages.length > STORE_MAX) st.messages.shift();
+  if (st.messages.length > STORE_MAX) { st.messages.shift(); inc('store_evicted'); }
   saveStore();
   return m;
 }
@@ -265,12 +318,23 @@ const MO_SCENARIOS = {
   NO_ANSWER: { delayMs: 30000, what: 'SUCCESS after 30 s, past every caller timeout' },
 };
 
+// Every MO answer is one RP-ACK or RP-ERROR towards the UE (the SMSF builds the RP layer from our answer). The
+// RP-Cause it would carry for a rejection (TS 24.011 8.2.5.4), by our Diameter result: 5004 -> 95 semantically incorrect,
+// 5005 -> 96 invalid mandatory information, 5552 -> 69 facility not implemented, 5012 -> 38 network out of order,
+// 5555 -> 42 congestion for SC_CONGESTION, else 21 short message transfer rejected.
+const MO_RP_CAUSE = { 5004: 95, 5005: 96, 5552: 69, 5012: 38 };
+function moRejected(cause) {
+  inc('mo_rejected');
+  pdu('out', 'RP-ERROR/SMS-SUBMIT-REPORT');
+  rpCause('out', cause);
+}
+
 const sameAddr = (a, b) => tpdu.digitsOf(a) === tpdu.digitsOf(b);
 const sleep = ms => new Promise(r => { const t = setTimeout(r, ms); if (t.unref) t.unref(); });
 const flag = (url, name) => !!url && ['1', 'true', 'yes'].includes(String(url.searchParams.get(name) || '').toLowerCase());
 
 // TS 29.338 6.2.1 (OFR/OFA) and TS 23.040 clause 10 MO: the SC accepts the SMS-SUBMIT, answers, then
-// forwards it towards the recipient. ?scenario= forces an outcome, ?dryRun=1 validates and answers without storing
+// forwards it towards the recipient as a simulated onward delivery (status FORWARDED; no MT is made for an MO). ?scenario= forces an outcome, ?dryRun=1 validates and answers without storing
 // or delivering.
 async function moForward(req, res, url) {
   const what = 'MO-Forward-Short-Message';
@@ -278,15 +342,17 @@ async function moForward(req, res, url) {
   const dryRun = flag(url, 'dryRun');
   let b;
   inc('mo_received');
+  pdu('in', 'RP-DATA/SMS-SUBMIT');
+  countOp('in', 'MO-Forward-SM');
   if (scenarioName || dryRun) inc('test_requests');
   try { b = await readJson(req); } catch {
     inbound('smsf', 'POST /smsc/mo-forward-short-message', 'invalid JSON');
-    inc('mo_rejected');
+    moRejected(95);
     return reply(res, 'smsf', what, 400, { result: 'UNEXPECTED_DATA_VALUE', diameterResultCode: 5004, detail: 'body is not JSON' });
   }
   inbound('smsf', `POST /smsc/mo-forward-short-message${scenarioName ? ` [scenario ${scenarioName}]` : ''}${dryRun ? ' [dry run]' : ''}`, b);
-  const bad = (status, body) => { inc('mo_rejected'); return reply(res, 'smsf', what, status, body); };
-  const fail = (cause, fcs, detail) => { inc('mo_rejected'); return moFailure(res, cause, fcs, detail); };
+  const bad = (status, body) => { moRejected(MO_RP_CAUSE[body.diameterResultCode] || 111); return reply(res, 'smsf', what, status, body); };
+  const fail = (cause, fcs, detail) => { moRejected(cause === 'SC_CONGESTION' ? 42 : 21); return moFailure(res, cause, fcs, detail); };
 
   let sc = null;
   if (scenarioName) {
@@ -320,26 +386,34 @@ async function moForward(req, res, url) {
   const s = mo.submit;
   const to = tpdu.digitsOf(s.da);
   if (!to || to.length > 15) return fail('INVALID_SME_ADDRESS', tpdu.FCS.INVALID_SME_ADDRESS, 'TP-DA is empty or invalid');
+  // TS 23.040 9.2.3.12: reserved or unsupported TP-VP is TP-FCS C7, mapped like the other TPDU faults. An absolute
+  // TP-VP already in the past is rejected the same way: the SC cannot keep the SM for a period that is over (3.2.1).
+  if (s.vpError) return fail('EQUIPMENT_PROTOCOL_ERROR', tpdu.FCS.TP_VP_NOT_SUPPORTED, `TP-VP not supported: ${s.vpError}`);
+  if (s.validUntil && Date.parse(s.validUntil) <= Date.now()) {
+    return fail('EQUIPMENT_PROTOCOL_ERROR', tpdu.FCS.TP_VP_NOT_SUPPORTED, `TP-VP not supported: absolute validity ${s.validUntil} is already past`);
+  }
 
   const from = tpdu.digitsOf(b.msisdn) || null;
   const supi = b.supi || null;
   // TS 23.040 9.2.3.25: TP-RD=1 tells the SC to reject an SMS-SUBMIT with the same TP-MR and TP-DA from the same OA
-  // as one it still holds; TP-RD=0 tells it to accept.
+  // as one it still holds; TP-RD=0 tells it to accept. A FORWARDED MO counts as held until its validity period ends.
   const dup = st.messages.find(m => m.direction === 'MO' && m.mr === s.mr && m.to === to
     && ((from && m.from === from) || (supi && m.supi === supi))
-    && ['ACCEPTED', ...ACTIVE].includes(m.status));
+    && (['ACCEPTED', ...ACTIVE].includes(m.status) || (m.status === 'FORWARDED' && !expired(m))));
   if (dup && s.rd) {
     return fail('EQUIPMENT_PROTOCOL_ERROR', tpdu.FCS.SM_REJECTED_DUPLICATE_SM, `duplicate of ${dup.id} (TP-MR ${s.mr}, TP-RD=1)`);
   }
   if (dup) inc('mo_duplicates_accepted');
 
   const now = new Date();
+  const expiresAt = s.validUntil || new Date(now.getTime() + (s.validityMs || DEFAULT_VALIDITY_MS)).toISOString();
   const report = { hex: tpdu.bytesToHex(tpdu.encodeSubmitReportAck(now)) };
   if (dryRun) {
     inc('mo_dry_runs');
+    pdu('out', 'RP-ACK/SMS-SUBMIT-REPORT');
     return reply(res, 'smsf', what, 200, {
       result: 'SUCCESS', diameterResultCode: 2001, messageId: null, dryRun: true, deliveryReport: report,
-      decoded: { from, supi, to, text: s.text, mr: s.mr, srr: s.srr, rd: s.rd, dcs: s.dcs, rpWrapped: !!mo.rp },
+      decoded: { from, supi, to, text: s.text, mr: s.mr, srr: s.srr, rd: s.rd, dcs: s.dcs, rpWrapped: !!mo.rp, vpFormat: s.vpFormat, singleShot: !!s.singleShot, expiresAt },
     });
   }
   const msg = saveMessage({
@@ -350,13 +424,15 @@ async function moForward(req, res, url) {
     from, supi, to,
     text: s.text, mr: s.mr, srr: s.srr, pid: s.pid, dcs: s.dcs,
     smsRecordId: b.smsRecordId || null,
+    submitHex: tpdu.bytesToHex(mo.tpdu), vpFormat: s.vpFormat, singleShot: !!s.singleShot,
     submittedAt: now.toISOString(),
-    expiresAt: new Date(now.getTime() + (s.validityMs || DEFAULT_VALIDITY_MS)).toISOString(),
+    expiresAt,
     duplicateOf: dup ? dup.id : null,
     history: [{ ts: now.toISOString(), event: 'ACCEPTED', detail: `MO from ${from || supi}` }],
   });
 
   inc('mo_accepted');
+  pdu('out', 'RP-ACK/SMS-SUBMIT-REPORT');
   reply(res, 'smsf', what, 200, {
     result: 'SUCCESS', diameterResultCode: 2001, messageId: msg.id, deliveryReport: report,
   });
@@ -371,6 +447,37 @@ const ACTIVE = ['PENDING', 'DELIVERING', 'WAITING'];
 const RETRY_BASE_MS = 30000;
 const RETRY_MAX_MS = 10 * 60000;
 const SWEEP_MS = 10000;
+// Store-and-forward limits: backoff retries stop after MAX_ATTEMPTS attempts (mutable for tests via _internals).
+const MT_LIMITS = { MAX_ATTEMPTS: Number(process.env.HOLMINATOR_MT_MAX_ATTEMPTS) || 8 };
+// RP-Cause values from the UE that are temporary (TS 24.011 8.2.5.4): retried with backoff. 111 (protocol error
+// unspecified) is what the simulated UE answers on a TPDU it cannot parse: temporary, but bounded by MAX_ATTEMPTS.
+const RP_TEMPORARY = new Set([41, 42, 47, 111]);
+const ST_CONGESTION_STOPPED = 0x60; // TS 23.040 9.2.3.15: permanent error, SC is not making any more attempts
+// Alert timing (mutable for tests via _internals.TIMING, or env). The UDM may alert while the SMSF's UECM
+// registration is still in progress, before the SMSF holds the UE context: wait a grace delay before redelivering,
+// and give an alert-triggered attempt that the SMSF answers absent/unknown one fast retry before going back to MWD.
+const TIMING = {
+  ALERT_GRACE_MS: Number(process.env.HOLMINATOR_ALERT_GRACE_MS) || 2000,
+  ALERT_FAST_RETRY_MS: Number(process.env.HOLMINATOR_ALERT_FAST_RETRY_MS) || 5000,
+};
+
+// Move the given WAITING messages to PENDING once their nextRetryAt is due, then kick the recipient.
+function redeliverAfter(ms, to, ids, reason) {
+  const tm = setTimeout(() => {
+    const i = st.timers.indexOf(tm); if (i >= 0) st.timers.splice(i, 1);
+    try {
+      const now = Date.now();
+      for (const m of st.messages) {
+        if (!ids.includes(m.id) || m.status !== 'WAITING' || !m.nextRetryAt || Date.parse(m.nextRetryAt) > now + 5) continue;
+        m.nextRetryAt = null; m.status = 'PENDING'; hist(m, 'PENDING', reason);
+      }
+      saveStore();
+      kick(to);
+    } catch (e) { console.error(`[${TEAM}] redeliver:`, e.message); }
+  }, ms);
+  if (tm.unref) tm.unref();
+  st.timers.push(tm);
+}
 
 function hist(m, event, detail) { m.history.push({ ts: new Date().toISOString(), event, detail }); }
 function setStatus(m, status, detail) { m.status = status; hist(m, status, detail); saveStore(); }
@@ -413,12 +520,34 @@ function kick(to) {
 
 function expired(m) { return m.expiresAt && Date.now() > Date.parse(m.expiresAt); }
 
+// Wrapper so every counted attempt ends in exactly one of: forward answered (pdus.in) or mt_forward_not_sent.
 async function attemptMt(m) {
+  const a = { counted: false, sent: false, answered: false };
+  try { return await attemptMtOnce(m, a); } finally {
+    if (a.counted && !a.sent) { mtOpen.noFwd--; inc('mt_forward_not_sent'); }
+    if (a.sent && !a.answered) { mtOpen.fwd--; pdu('in', 'none/no-report'); }
+  }
+}
+
+// Which RP message came back in the MT-Forward answer (TS 24.011 7.3): counted per PDU, RP-ERROR also per cause.
+function countMtAnswer(m, fwd) {
+  const hex = fwd.body && fwd.body.deliveryReport && fwd.body.deliveryReport.hex;
+  const mti = hex && /^[0-9a-f]{2}/i.test(hex) ? parseInt(hex.slice(0, 2), 16) & 7 : -1;
+  if (mti === 2 || mti === 3) return pdu('in', m.kind === 'STATUS_REPORT' ? 'RP-ACK/STATUS-REPORT-ACK' : 'RP-ACK/SMS-DELIVER-REPORT');
+  if (mti === 4 || mti === 5) { pdu('in', 'RP-ERROR/SMS-DELIVER-REPORT'); return rpCause('in', tpdu.rpErrorCause(hex)); }
+  return pdu('in', 'none/no-report');
+}
+
+async function attemptMtOnce(m, a) {
+  if (m.direction === 'MO') return onMoAccepted(m); // an MO never goes out as MT (legacy relay records)
   if (expired(m)) return expire(m);
   m.attempts = (m.attempts || 0) + 1;
   m.nextRetryAt = null;
+  const viaAlert = !!m.viaAlert;
+  m.viaAlert = false;
   setStatus(m, 'DELIVERING', `attempt ${m.attempts}`);
   inc('mt_attempts');
+  a.counted = true; mtOpen.noFwd++;
 
   const udm = await resolve('UDM');
   if (!udm) return retryLater(m, 'no UDM in the NRF');
@@ -448,9 +577,13 @@ async function attemptMt(m) {
   const more = st.messages.some(x => x !== m && x.to === m.to && x.status === 'PENDING');
   const hex = tpdu.bytesToHex(buildMtTpdu(m, more));
   m.tpduHex = hex;
+  pdu('out', m.kind === 'STATUS_REPORT' ? 'RP-DATA/SMS-STATUS-REPORT' : 'RP-DATA/SMS-DELIVER');
+  a.sent = true; mtOpen.noFwd--; mtOpen.fwd++;
   const fwd = await call('smsf', 'POST', `${smsf}/smsc/mt-forward-short-message`, {
     supi, msisdn: m.to, scAddress: SC_ADDRESS, sms: { hex }, smsRecordId: `${m.id}-${m.attempts}`, moreMessagesToSend: more,
   }, { op: 'MT-Forward-Short-Message' });
+  a.answered = true; mtOpen.fwd--;
+  countMtAnswer(m, fwd);
   const fr = fwd.body && fwd.body.result;
   if (fwd.body && fwd.body.deliveryReport && fwd.body.deliveryReport.hex) m.deliveryReportHex = fwd.body.deliveryReport.hex;
   hist(m, 'MT-Forward-Short-Message', `${fwd.status} ${fr || fwd.error || ''}`.trim());
@@ -458,15 +591,30 @@ async function attemptMt(m) {
   if (fwd.status === 200) return delivered(m);
   if (fr === 'ABSENT_SUBSCRIBER' || (fwd.status === 404 && fr === 'UNKNOWN_SUBSCRIBER')) {
     inc('mt_absent');
+    // Right after an alert the SMSF may not have stored the UE context yet: one fast retry per alert.
+    if (viaAlert && !m.alertFastRetryUsed && !m.singleShot) {
+      m.alertFastRetryUsed = true;
+      m.nextRetryAt = new Date(Date.now() + TIMING.ALERT_FAST_RETRY_MS).toISOString();
+      inc('mt_alert_fast_retries');
+      setStatus(m, 'WAITING', `SMSF answered ${fwd.status} ${fr} right after Alert-Service-Centre (UE context likely not stored yet); one fast retry in ${TIMING.ALERT_FAST_RETRY_MS / 1000} s`);
+      redeliverAfter(TIMING.ALERT_FAST_RETRY_MS, m.to, [m.id], 'fast retry after Alert-Service-Centre');
+      return;
+    }
     await reportDeliveryStatus(m, 'ABSENT_SUBSCRIBER');
     return waitForAlert(m, 'absent subscriber at the SMSF, reported to the UDM for MWD');
   }
-  const rpCause = m.deliveryReportHex ? tpdu.rpErrorCause(m.deliveryReportHex) : null;
+  // Only this attempt's delivery report counts; m.deliveryReportHex may hold one from an earlier attempt.
+  const drHex = fwd.body && fwd.body.deliveryReport && fwd.body.deliveryReport.hex;
+  const rpCause = drHex ? tpdu.rpErrorCause(drHex) : null;
   if (rpCause === 22) { // RP-Cause 22: memory capacity exceeded (TS 24.011 8.2.5.4)
     await reportDeliveryStatus(m, 'MEMORY_CAPACITY_EXCEEDED');
     return waitForAlert(m, 'UE memory full, reported to the UDM for MWD');
   }
-  if (fwd.status === 502 && m.deliveryReportHex) return fail(m, tpdu.ST.ERROR_IN_SME_STOPPED, `UE answered RP-ERROR${rpCause === null ? '' : ` cause ${rpCause}`}`);
+  if (fwd.status === 502 && drHex && RP_TEMPORARY.has(rpCause)) {
+    inc('mt_rp_error_temporary');
+    return retryLater(m, `UE answered RP-ERROR cause ${rpCause} (temporary)`, rpCause === 42 ? ST_CONGESTION_STOPPED : tpdu.ST.ERROR_IN_SME_STOPPED);
+  }
+  if (fwd.status === 502 && drHex) return fail(m, tpdu.ST.ERROR_IN_SME_STOPPED, `UE answered RP-ERROR${rpCause === null ? '' : ` cause ${rpCause}`}`);
   if (fwd.status === 0 || fwd.status >= 500) return retryLater(m, `MT-Forward failed (${fwd.status || fwd.error} ${fr || ''})`.trim());
   return fail(m, tpdu.ST.REMOTE_PROCEDURE_ERROR, `MT-Forward answered ${fwd.status} ${fr || ''}`.trim());
 }
@@ -492,11 +640,24 @@ async function delivered(m) {
 
 // Alert-driven redelivery, with a slow autonomous retry in case the alert never comes (TS 23.040 3.2.7 note 5).
 function waitForAlert(m, detail) {
+  if (singleShotOver(m, detail)) return;
   m.nextRetryAt = new Date(Date.now() + RETRY_MAX_MS).toISOString();
   setStatus(m, 'WAITING', detail);
 }
 
-function retryLater(m, detail) {
+// Single-shot SM (enhanced TP-VP b6, TS 23.040 9.2.3.12.3): one delivery attempt only, no retry, no alert wait.
+function singleShotOver(m, detail) {
+  if (!m.singleShot) return false;
+  fail(m, tpdu.ST.NO_RESPONSE_FROM_SME_STOPPED, `single-shot SM, no further attempts: ${detail}`);
+  return true;
+}
+
+function retryLater(m, detail, capSt = tpdu.ST.NO_RESPONSE_FROM_SME_STOPPED) {
+  if (singleShotOver(m, detail)) return;
+  if ((m.attempts || 0) >= MT_LIMITS.MAX_ATTEMPTS) {
+    inc('mt_attempts_exhausted');
+    return fail(m, capSt, `${detail}; giving up after ${m.attempts} attempts (max ${MT_LIMITS.MAX_ATTEMPTS})`);
+  }
   const ms = Math.min(RETRY_BASE_MS * 2 ** Math.max(0, (m.attempts || 1) - 1), RETRY_MAX_MS);
   m.nextRetryAt = new Date(Date.now() + ms).toISOString();
   inc('mt_retries_scheduled');
@@ -512,7 +673,7 @@ function fail(m, stValue, detail) {
 
 function expire(m) {
   setStatus(m, 'EXPIRED', `validity period ended ${m.expiresAt}`);
-  inc('mt_expired');
+  inc(m.direction === 'MO' ? 'mo_expired' : m.kind === 'STATUS_REPORT' ? 'status_reports_expired' : 'mt_expired');
   statusReport(m, tpdu.ST.VALIDITY_PERIOD_EXPIRED);
 }
 
@@ -530,16 +691,23 @@ function statusReport(orig, stValue) {
     history: [{ ts: now.toISOString(), event: 'PENDING', detail: `TP-ST 0x${stValue.toString(16).padStart(2, '0')} for ${orig.id}` }],
   });
   inc('status_reports_generated');
+  bump(st.metrics.byTpSt, tpStKey(stValue));
+  inc('mt_originated');
   orig.statusReportId = sr.id;
   saveStore();
   kick(sr.to);
   return sr;
 }
 
-// Every accepted MO SMS goes on to its recipient as MT.
+// Every accepted MO terminates here (PROJEKT.md: UE -> AMF -> SMSF -> SMSC, result back to the UE). Onward delivery
+// to TP-DA is simulated: no SRI-for-SM, no MT-Forward. With TP-SRR the originator gets an SMS-STATUS-REPORT (TP-ST
+// 0x00) as a new MT record over the real MT path. Also used on restart for MOs an older deploy left unfinished.
 function onMoAccepted(msg) {
-  inc('mt_originated');
-  enqueue(msg, `queued for MT delivery to ${msg.to}`);
+  if (expired(msg)) return expire(msg);
+  msg.forwardedAt = new Date().toISOString();
+  setStatus(msg, 'FORWARDED', `simulated onward delivery to ${msg.to}`);
+  inc('mo_forwarded');
+  statusReport(msg, tpdu.ST.RECEIVED_BY_SME);
 }
 
 // Expire, and move due WAITING messages back to PENDING. Also picks up PENDING ones after a restart.
@@ -563,6 +731,7 @@ async function alertServiceCentre(req, res) {
   const what = 'Alert-Service-Centre';
   let b;
   inc('alerts_received');
+  countOp('in', 'Alert-SC');
   try { b = await readJson(req); } catch {
     inbound('udm', 'POST /smsc/alert-service-centre', 'invalid JSON');
     return reply(res, 'udm', what, 400, { result: 'UNEXPECTED_DATA_VALUE', diameterResultCode: 5004, detail: 'body is not JSON' });
@@ -574,11 +743,16 @@ async function alertServiceCentre(req, res) {
     return reply(res, 'udm', what, 400, { result: 'UNEXPECTED_DATA_VALUE', diameterResultCode: 5004, detail: `SC address ${b.scAddress} is not ${SC_ADDRESS}` });
   }
   const waiting = st.messages.filter(m => m.to === msisdn && m.status === 'WAITING');
-  for (const m of waiting) { m.nextRetryAt = null; m.status = 'PENDING'; hist(m, 'PENDING', `Alert-Service-Centre ${b.alertReason || ''}`.trim()); }
+  // Grace delay: the alert can arrive before the SMSF has stored the UE context (UECM PUT still in progress).
+  const due = new Date(Date.now() + TIMING.ALERT_GRACE_MS).toISOString();
+  for (const m of waiting) {
+    m.nextRetryAt = due; m.viaAlert = true; m.alertFastRetryUsed = false;
+    hist(m, 'ALERT', `Alert-Service-Centre ${b.alertReason || ''}`.trim() + `; redelivery in ${TIMING.ALERT_GRACE_MS / 1000} s`);
+  }
   saveStore();
   inc('alerts_redelivering', waiting.length);
   reply(res, 'udm', what, 200, { result: 'SUCCESS', diameterResultCode: 2001, redelivering: waiting.map(m => m.id) });
-  kick(msisdn);
+  if (waiting.length) redeliverAfter(TIMING.ALERT_GRACE_MS, msisdn, waiting.map(m => m.id), `Alert-Service-Centre ${b.alertReason || ''}`.trim());
   return true;
 }
 
@@ -605,7 +779,7 @@ async function apiMt(req, res, url) {
     });
   }
   const m = saveMessage({
-    id: `smsc-${++st.msgSeq}`, direction: 'MT', kind: 'SMS', status: 'PENDING', from, to, text: b.text, srr: false,
+    id: `smsc-${++st.msgSeq}`, direction: 'MT', kind: 'SMS', status: 'PENDING', from, to, text: b.text, srr: false, singleShot: !!b.singleShot,
     submittedAt: now.toISOString(), expiresAt: new Date(now.getTime() + validityMs).toISOString(),
     history: [{ ts: now.toISOString(), event: 'ACCEPTED', detail: `originated by the SC API from ${from}` }],
   });
@@ -632,11 +806,112 @@ function metricsSnapshot() {
     nf: 'SMSC', team: TEAM, nfInstanceId: NF_ID, scAddress: SC_ADDRESS,
     startedAt: st.metrics.startedAt, uptimeS: Math.round((Date.now() - Date.parse(st.metrics.startedAt)) / 1000),
     nrf: { team: NRF_TEAM, registered: st.registered, ...st.metrics.nrf },
+    since: st.metrics.since,
     counters: { ...st.metrics.counters },
     results: st.metrics.results,
     peers,
     messages: { total: st.messages.length, byStatus, byDirection },
+    pdus: { in: { ...st.metrics.pdus.in }, out: { ...st.metrics.pdus.out } },
+    rpCauses: { in: { ...st.metrics.rpCauses.in }, out: { ...st.metrics.rpCauses.out } },
+    statusReports: statusReportStats(),
+    sgd: { results: st.metrics.results, operationsOut: { ...st.metrics.operationsOut }, operationsIn: { ...st.metrics.operationsIn } },
+    consistency: consistency(),
   };
+}
+
+const sinceCounting = m => !m.submittedAt || Date.parse(m.submittedAt) >= Date.parse(st.metrics.since);
+function statusReportStats() {
+  const c = st.metrics.counters;
+  return {
+    generated: c.status_reports_generated, // SMS-STATUS-REPORT records made (TP-SRR outcomes)
+    sent: st.metrics.pdus.out['RP-DATA/SMS-STATUS-REPORT'], // MT-Forward attempts carrying one
+    delivered: c.status_reports_sent, // acknowledged by the UE (the counter keeps its old name)
+    failed: c.status_reports_failed,
+    expired: c.status_reports_expired,
+    waiting: st.messages.filter(m => m.kind === 'STATUS_REPORT' && ACTIVE.includes(m.status)).length, // current
+    byTpSt: { ...st.metrics.byTpSt },
+  };
+}
+
+// Self-checks over the counters: every PDU in has its PDU out, every MT attempt ends in an answer or a reason.
+// Attempts still running are counted as open (mtOpen), so the checks also hold mid-attempt.
+function consistency() {
+  const c = st.metrics.counters, pin = st.metrics.pdus.in, pout = st.metrics.pdus.out;
+  const out = [];
+  const chk = (name, left, right, detail) => out.push({ name, ok: left === right, detail: `${left} ${left === right ? '==' : '!='} ${right}: ${detail}` });
+  chk('mo_pdus', pin['RP-DATA/SMS-SUBMIT'], pout['RP-ACK/SMS-SUBMIT-REPORT'] + pout['RP-ERROR/SMS-SUBMIT-REPORT'],
+    'in RP-DATA/SMS-SUBMIT == out RP-ACK + RP-ERROR SMS-SUBMIT-REPORT');
+  const fwds = pout['RP-DATA/SMS-DELIVER'] + pout['RP-DATA/SMS-STATUS-REPORT'];
+  chk('mt_attempts_forwarded', c.mt_attempts, fwds + c.mt_forward_not_sent + mtOpen.noFwd,
+    `mt_attempts == out RP-DATA SMS-DELIVER + SMS-STATUS-REPORT (${fwds}) + mt_forward_not_sent (${c.mt_forward_not_sent}) + starting now (${mtOpen.noFwd})`);
+  const answers = pin['RP-ACK/SMS-DELIVER-REPORT'] + pin['RP-ACK/STATUS-REPORT-ACK'] + pin['RP-ERROR/SMS-DELIVER-REPORT'] + pin['none/no-report'];
+  chk('mt_attempts_answered', c.mt_attempts, answers + c.mt_forward_not_sent + mtOpen.noFwd + mtOpen.fwd,
+    `mt_attempts == in RP-ACK (both) + RP-ERROR + none/no-report (${answers}) + mt_forward_not_sent (${c.mt_forward_not_sent}) + in flight (${mtOpen.noFwd + mtOpen.fwd})`);
+  const sr = statusReportStats();
+  const srWaiting = st.messages.filter(m => m.kind === 'STATUS_REPORT' && ACTIVE.includes(m.status) && sinceCounting(m)).length;
+  chk('status_reports', sr.generated, sr.delivered + sr.failed + sr.expired + srWaiting,
+    `generated == delivered + failed + expired + waiting (${srWaiting} generated since ${st.metrics.since})`);
+  const moStored = st.messages.filter(m => m.direction === 'MO' && sinceCounting(m)).length;
+  if (c.store_evicted) out.push({ name: 'mo_store', ok: true, detail: `not checked: ${c.store_evicted} message(s) evicted from the store (max ${STORE_MAX})` });
+  else chk('mo_store', c.mo_received, moStored + c.mo_rejected + c.mo_dry_runs,
+    `mo_received == MO records stored since ${st.metrics.since} (${moStored}) + mo_rejected (${c.mo_rejected}) + mo_dry_runs (${c.mo_dry_runs})`);
+  return out;
+}
+
+// GET /kpi: the common KPI summary every NF team offers (tompa, #build 142). Derived from the metrics above.
+// requests: inbound peer requests we answered; errors: our answers >= 400 plus outbound peer errors (no answer or 5xx);
+// latencyMs: average over every outbound peer call.
+function kpi() {
+  const c = st.metrics.counters;
+  const peers = Object.values(st.metrics.peers);
+  const calls = peers.reduce((s, p) => s + p.calls, 0);
+  const latencySum = peers.reduce((s, p) => s + p.latencyMsSum, 0);
+  return {
+    nf: 'SMSC', up: true,
+    requests: c.requests_in || 0,
+    errors: (c.answers_error || 0) + peers.reduce((s, p) => s + p.errors, 0),
+    latencyMs: calls ? Math.round(latencySum / calls) : 0,
+    extra: {
+      mo_accepted: c.mo_accepted || 0,
+      mt_delivered: c.mt_delivered || 0,
+      mt_failed: c.mt_failed || 0,
+      waiting: st.messages.filter(m => m.status === 'WAITING').length,
+      status_reports_sent: c.status_reports_sent || 0,
+      alerts_received: c.alerts_received || 0,
+      registeredInNrf: st.registered,
+      pdus_in: Object.values(st.metrics.pdus.in).reduce((s, v) => s + v, 0),
+      pdus_out: Object.values(st.metrics.pdus.out).reduce((s, v) => s + v, 0),
+      consistent: consistency().every(x => x.ok),
+    },
+  };
+}
+
+// GET /api/messages[?limit=N][&since=X]. The store is an array in arrival order (ids smsc-<seq> ascending), so:
+// since=smsc-<n> (or <n>) keeps messages created after that id; since=<ISO time> keeps messages whose updatedAt (the
+// ts of their last history entry) is later. limit=N then keeps the newest N. The answer is always oldest first.
+function updatedAt(m) { const h = m.history || []; return (h.length && h[h.length - 1].ts) || m.submittedAt; }
+function listMessages(url) {
+  const qs = url ? url.searchParams : new URLSearchParams();
+  let list = st.messages;
+  const since = qs.get('since');
+  if (since !== null && since !== '') {
+    const idm = /^(?:smsc-)?(\d+)$/.exec(since);
+    if (idm) {
+      const n = Number(idm[1]);
+      list = list.filter(m => Number(String(m.id).replace(/^smsc-/, '')) > n);
+    } else {
+      const t = Date.parse(since);
+      if (isNaN(t)) return { error: 'since must be a message id (smsc-<n>) or an ISO timestamp' };
+      list = list.filter(m => Date.parse(updatedAt(m)) > t);
+    }
+  }
+  const limit = qs.get('limit');
+  if (limit !== null && limit !== '') {
+    const n = Number(limit);
+    if (!Number.isInteger(n) || n < 1) return { error: 'limit must be a positive integer' };
+    list = list.slice(-n);
+  }
+  return { list };
 }
 
 // Prometheus text exposition, for anyone who wants to scrape us.
@@ -661,6 +936,15 @@ function metricsText() {
     line('peer_latency_ms_sum', { peer }, p.latencyMsSum);
   }
   for (const [s, v] of Object.entries(m.messages.byStatus)) line('messages', { status: s }, v);
+  for (const dir of ['in', 'out']) {
+    for (const [type, v] of Object.entries(m.pdus[dir])) line('pdus_total', { dir, type }, v);
+    for (const [cause, v] of Object.entries(m.rpCauses[dir])) line('rp_causes_total', { dir, cause }, v);
+  }
+  for (const [k, v] of Object.entries(m.statusReports)) if (k !== 'byTpSt') line(k === 'waiting' ? 'status_reports_waiting' : 'status_reports_total', k === 'waiting' ? {} : { outcome: k }, v);
+  for (const [tpSt, v] of Object.entries(m.statusReports.byTpSt)) line('status_reports_by_tp_st_total', { tp_st: tpSt }, v);
+  for (const [operation, v] of Object.entries(m.sgd.operationsOut)) line('sgd_operations_total', { dir: 'out', operation }, v);
+  for (const [operation, v] of Object.entries(m.sgd.operationsIn)) line('sgd_operations_total', { dir: 'in', operation }, v);
+  for (const ck of m.consistency) line('consistency_ok', { check: ck.name }, ck.ok ? 1 : 0);
   return out.join('\n') + '\n';
 }
 
@@ -675,16 +959,17 @@ function testCatalogue() {
     nf: 'SMSC', team: TEAM, scAddress: SC_ADDRESS,
     note: 'Every endpoint is open. ?dryRun=1 validates and answers without storing or delivering. ?scenario=<NAME> forces an outcome. Results show up in /colony/holminator.',
     endpoints: [
-      { method: 'POST', path: `${base}/smsc/mo-forward-short-message`, what: 'MO-Forward-Short-Message (TS 29.338 OFR/OFA). Real: stores the SM and delivers it as MT.', example: mo },
+      { method: 'POST', path: `${base}/smsc/mo-forward-short-message`, what: 'MO-Forward-Short-Message (TS 29.338 OFR/OFA). Real: stores the SM, answers RP-ACK and marks it FORWARDED (simulated onward delivery, no MT); TP-SRR gives a status report MT to the originator.', example: mo },
       { method: 'POST', path: `${base}/smsc/mo-forward-short-message?dryRun=1`, what: 'Same, nothing stored or delivered; the answer includes the decoded SMS-SUBMIT.', example: mo },
       { method: 'POST', path: `${base}/smsc/mo-forward-short-message?dryRun=1`, what: 'RP-DATA wrapped SMS-SUBMIT is accepted too.', example: { ...mo, sms: { hex: rpHex } } },
       { method: 'POST', path: `${base}/smsc/alert-service-centre`, what: 'Alert-Service-Centre from the UDM: every WAITING SM for that MSISDN is delivered again. Answers with the ids it redelivers.', example: { msisdn: '46700000002', scAddress: SC_ADDRESS, alertReason: 'UE_PRESENT' } },
       { method: 'POST', path: `${base}/api/mt?wait=1`, what: 'Make the SMSC originate an MT SMS: SRI-for-SM to the UDM, then MT-Forward to the serving SMSF. ?wait=1 answers with the outcome of the first attempt (DELIVERED, WAITING, FAILED), without it you get 202 and a messageId.', example: { from: '46700000100', to: '46700000002', text: 'Hello from the SMSC', validitySeconds: 3600 } },
       { method: 'POST', path: `${base}/api/mt?dryRun=1`, what: 'Build the SMS-DELIVER we would send, decoded, without sending anything.', example: { to: '46700000002', text: 'Hello' } },
       { method: 'GET', path: `${base}/api/messages/smsc-1`, what: 'One message with its full history: SRI answer, MT-Forward answer, MWD reports, status report.' },
-      { method: 'POST', path: `${base}/test/encode`, what: 'Build a TPDU: type SUBMIT or DELIVER; rp=true wraps it in RP-DATA.', example: { type: 'SUBMIT', to: '46700000002', text: 'Hello', mr: 1, srr: false, rd: false, rp: false } },
-      { method: 'POST', path: `${base}/test/decode`, what: 'Decode RP-DATA, SMS-SUBMIT, SMS-DELIVER or SMS-STATUS-REPORT hex.', example: { hex: submitHex } },
-      { method: 'GET', path: `${base}/api/messages`, what: 'Messages the SMSC holds, with history.' },
+      { method: 'POST', path: `${base}/test/encode`, what: 'Build a TPDU: type SUBMIT or DELIVER; rp=true wraps it in RP-DATA. SUBMIT vp: a relative octet, or {type:"absolute",time,tzMinutes}, {type:"enhanced",format:"none|relative|seconds|hhmmss",value,singleShot}, {type:"raw",vpf,hex}.', example: { type: 'SUBMIT', to: '46700000002', text: 'Hello', mr: 1, srr: false, rd: false, rp: false } },
+      { method: 'POST', path: `${base}/test/decode`, what: 'Decode RP-DATA, RP-ACK, RP-ERROR, SMS-SUBMIT, SMS-DELIVER, SMS-STATUS-REPORT, SMS-SUBMIT-REPORT or SMS-DELIVER-REPORT hex. Optional kind (e.g. "submit-report") or direction ("MO"/"MT") picks between TPDUs sharing a TP-MTI.', example: { hex: submitHex } },
+      { method: 'GET', path: `${base}/api/messages?limit=50`, what: 'Messages the SMSC holds, with history, oldest first. ?limit=N keeps the newest N; ?since=smsc-<n> only those created after that id; ?since=<ISO time> only those updated (last history entry) after it.' },
+      { method: 'GET', path: `${base}/kpi`, what: 'Common KPI summary: {nf, up, requests, errors, latencyMs, extra:{mo_accepted, mt_delivered, mt_failed, waiting, status_reports_sent, alerts_received, registeredInNrf}}.' },
       { method: 'GET', path: `${base}/api/log?since=0`, what: 'Every request and answer, in and out.' },
       { method: 'GET', path: `${base}/api/metrics`, what: 'Counters, results per operation, per-peer traffic and latency (JSON).' },
       { method: 'GET', path: `${base}/metrics`, what: 'The same in Prometheus text format.' },
@@ -704,7 +989,7 @@ async function testEncode(req, res) {
     let t;
     if (type === 'SUBMIT') {
       if (!b.to) throw new Error('to is required');
-      t = tpdu.encodeSubmit({ mr: Number(b.mr) || 0, to: b.to, text: b.text, srr: !!b.srr, rd: !!b.rd });
+      t = tpdu.encodeSubmit({ mr: Number(b.mr) || 0, to: b.to, text: b.text, srr: !!b.srr, rd: !!b.rd, vp: b.vp === undefined ? null : b.vp });
     } else if (type === 'DELIVER') {
       if (!b.from) throw new Error('from is required');
       t = tpdu.encodeDeliver({ from: b.from, text: b.text, sri: !!b.srr });
@@ -721,8 +1006,8 @@ async function testEncode(req, res) {
 async function testDecode(req, res) {
   let b;
   try { b = await readJson(req); } catch { return send(res, 400, { error: 'body is not JSON' }); }
-  inc('test_requests');
-  try { return send(res, 200, tpdu.decodeAny(String(b.hex || ''))); }
+  if (req.headers['x-holminator-tile'] !== '1') inc('test_requests'); // the tile's own detail view does not count
+  try { return send(res, 200, tpdu.decodeAny(String(b.hex || ''), { kind: b.kind, direction: b.direction })); }
   catch (e) { return send(res, 400, { error: e.message }); }
 }
 
@@ -737,7 +1022,11 @@ async function handle(req, res, { path: p, url }) {
     const m = st.messages.find(x => x.id === decodeURIComponent(p.slice('/api/messages/'.length)));
     return m ? send(res, 200, m) : send(res, 404, { error: 'no such message' });
   }
-  if (req.method === 'GET' && p === '/api/messages') return send(res, 200, st.messages);
+  if (req.method === 'GET' && p === '/api/messages') {
+    const r = listMessages(url);
+    return r.error ? send(res, 400, { error: r.error }) : send(res, 200, r.list);
+  }
+  if (req.method === 'GET' && p === '/kpi') return send(res, 200, kpi());
   if (req.method === 'GET' && p === '/api/metrics') return send(res, 200, metricsSnapshot());
   if (req.method === 'GET' && p === '/metrics') {
     res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' });
@@ -767,6 +1056,22 @@ module.exports = {
     loadStore();
     // An attempt cut short by a restart is simply tried again.
     for (const m of st.messages) if (m.status === 'DELIVERING') { m.status = 'PENDING'; hist(m, 'PENDING', 'restart during an attempt'); }
+    // Store-and-forward across restarts: ACCEPTED (MT never started, e.g. a crash right after the MO) and PENDING
+    // go out now, expired ones end with a status report if SRR was set. WAITING keeps waiting for the alert; its
+    // fallback nextRetryAt is in the store and sweep() picks it up when due.
+    const requeue = new Set();
+    for (const m of st.messages) {
+      // Every record has an explicit direction; MTs come only from /api/mt and status reports.
+      if (!m.direction) m.direction = m.kind === 'STATUS_REPORT' || m.from === SC_ADDRESS ? 'MT' : 'MO';
+      // MO terminates at the SMSC: one an older deploy left ACCEPTED (or in the old MO-to-MT relay) is FORWARDED now.
+      if (m.direction === 'MO') { if (['ACCEPTED', ...ACTIVE].includes(m.status)) onMoAccepted(m); continue; }
+      if (m.status !== 'ACCEPTED' && m.status !== 'PENDING') continue;
+      if (expired(m)) { expire(m); continue; }
+      if (m.status === 'ACCEPTED') { m.status = 'PENDING'; hist(m, 'PENDING', 'restart: queued for MT delivery'); }
+      requeue.add(m.to);
+    }
+    saveStore();
+    for (const to of requeue) kick(to);
     // The NRF may load after us or lose its state on a redeploy: heartbeat() re-registers when needed.
     const first = setTimeout(() => { heartbeat().catch(e => console.error(`[${TEAM}] nrf:`, e.message)); }, 3000);
     if (first.unref) first.unref();
@@ -776,5 +1081,5 @@ module.exports = {
   handle,
   // For tests.
   _st: st,
-  _internals: { sweep, kick, nfProfile, resolve, registerInNrf, heartbeat, baseOf, saveStore, metricsSnapshot, metricsText, newMetrics, SC_ADDRESS, NF_ID, NF_TYPE },
+  _internals: { sweep, kick, nfProfile, resolve, registerInNrf, heartbeat, baseOf, saveStore, metricsSnapshot, metricsText, newMetrics, SC_ADDRESS, NF_ID, NF_TYPE, TIMING, MT_LIMITS },
 };

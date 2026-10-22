@@ -15,7 +15,10 @@
       <span class="pill" id="hb">heartbeat …</span>
       <span class="pill">SC <b id="sc">…</b></span>
       <span class="pill">up <b id="up">…</b></span>
+      <span class="pill" id="consistency" title="backend self-checks (GET /api/metrics consistency)">consistency …</span>
+      <span class="pill" id="since" title="counters are persisted from this time">counters since …</span>
     </div>
+    <div class="consfail" id="consfail" hidden></div>
   </div>
   <nav>
     <a href="/t/holminator/test" target="_blank" rel="noopener">test catalogue</a>
@@ -28,12 +31,35 @@
   <h2>Message flow <small id="flowwhat" class="dim"></small>
     <span class="h2ctl"><button type="button" class="link" id="follow" hidden>follow latest</button></span>
   </h2>
-  <div class="flow" id="flow"><div class="empty">no messages yet: send one below</div></div>
+  <div class="flows" id="flow"><div class="empty">no messages yet: send one below</div></div>
   <div class="flownote" id="flownote"></div>
 </section>
 
 <section>
   <div class="kpis" id="kpis"></div>
+</section>
+
+<section class="two metricpanels">
+  <div>
+    <h2>PDUs <small class="dim">SGd/NAS, RP/TP level</small></h2>
+    <table class="pdus">
+      <thead><tr><th>received</th><th class="n">n</th><th>sent</th><th class="n">n</th></tr></thead>
+      <tbody id="pdus"></tbody>
+    </table>
+    <div class="causes">
+      <div><h3>RP-Cause in <small class="dim">from the UE</small></h3><div id="causesin"></div></div>
+      <div><h3>RP-Cause out <small class="dim">to the UE</small></h3><div id="causesout"></div></div>
+    </div>
+  </div>
+  <div>
+    <h2>Status reports <small class="dim">SMS-STATUS-REPORT to the originator</small></h2>
+    <div class="srstats" id="srstats"></div>
+    <h3>by TP-ST</h3>
+    <table class="tpst">
+      <thead><tr><th>TP-ST</th><th>meaning</th><th class="n">n</th></tr></thead>
+      <tbody id="tpst"></tbody>
+    </table>
+  </div>
 </section>
 
 <main>
@@ -65,7 +91,12 @@
         </table>
       </div>
       <div>
-        <h2>Results per operation</h2>
+        <h2>SGd operations</h2>
+        <table class="sgd">
+          <thead><tr><th>in</th><th class="n">n</th><th>out</th><th class="n">n</th></tr></thead>
+          <tbody id="sgdops"></tbody>
+        </table>
+        <h2 class="gap">Results per operation</h2>
         <div id="results"></div>
       </div>
     </section>
@@ -83,6 +114,7 @@
           </select></label>
         </div>
         <label class="wide">text <input name="text" maxlength="160" value="Hello from the SMSC" required></label>
+        <div class="row checks"><label class="cb"><input type="checkbox" name="singleShot"> single-shot (one attempt, no retry or alert wait)</label></div>
         <div class="row btns">
           <button name="send">send and wait for outcome</button>
           <button type="button" class="ghost" id="mtdry">dry run: show SMS-DELIVER</button>
@@ -114,7 +146,7 @@
         </div>
         <label class="wide">supi <input name="supi" value="imsi-001010000000001"></label>
         <label class="wide">text <input name="text" maxlength="160" value="Hello from the test console"></label>
-        <label class="wide">scenario <select name="scenario" id="scenarios"><option value="">real processing (store, then deliver as MT)</option></select></label>
+        <label class="wide">scenario <select name="scenario" id="scenarios"><option value="">real processing (store, RP-ACK, simulated onward delivery)</option></select></label>
         <div class="row checks">
           <label class="cb"><input type="checkbox" name="srr"> TP-SRR status report</label>
           <label class="cb"><input type="checkbox" name="rd"> TP-RD reject dup</label>

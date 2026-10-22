@@ -19,7 +19,7 @@ let rpMrSeq = 0;
 const SC_ADDRESS = '46700000100';
 const rpLayer = require('./rp');
 const log = [];
-const disc = new Map(); // nfType -> { base, ts }
+const disc = new Map(); // nfType -> { bases, ts }
 let registered = false;
 
 const { AsyncLocalStorage } = require('async_hooks');
@@ -119,20 +119,42 @@ async function heartbeat() {
 // NRF type names for peers that TS 29.510 has no type for.
 const NF_TYPE = { SMSC: 'CUSTOM_SMSC' };
 
-// Resolve the base URL of an NF through NRF discovery (cached 60 s).
-async function resolve(nfType) {
+// Resolve the base URLs of all instances of an NF through NRF discovery (cached 60 s).
+async function resolveAll(nfType) {
   const hit = disc.get(nfType);
-  if (hit && Date.now() - hit.ts < 60000) return hit.base;
+  if (hit && Date.now() - hit.ts < 60000) return hit.bases;
   const target = NF_TYPE[nfType] || nfType;
   const r = await call('nrf', 'GET', `${NRF_DISC}/nf-instances?target-nf-type=${target}&requester-nf-type=SMSF`);
-  const inst = r.body && Array.isArray(r.body.nfInstances) ? r.body.nfInstances[0] : null;
-  if (!inst) return null;
-  const svc = (inst.nfServices || [])[0] || {};
-  let base = svc.apiRoot || svc.apiPrefix || '';
-  if (base.startsWith('/')) base = `${HOST}${base}`; // relative apiPrefix: same board
-  base = base.replace(/\/$/, '') || null;
-  if (base) disc.set(nfType, { base, ts: Date.now() });
-  return base;
+  const insts = r.body && Array.isArray(r.body.nfInstances) ? r.body.nfInstances : [];
+  const bases = [];
+  for (const inst of insts) {
+    const svc = (inst.nfServices || [])[0] || {};
+    let base = svc.apiRoot || svc.apiPrefix || '';
+    if (base.startsWith('/')) base = `${HOST}${base}`; // relative apiPrefix: same board
+    base = base.replace(/\/$/, '');
+    if (base && !bases.includes(base)) bases.push(base);
+  }
+  if (bases.length) disc.set(nfType, { bases, ts: Date.now() });
+  return bases;
+}
+
+async function resolve(nfType) {
+  return (await resolveAll(nfType))[0] || null;
+}
+
+// Try each discovered instance in turn; move on when the answer is a transport error, a 5xx or (opt) a 404.
+// Returns { r, base }, or null when NRF knows no instance. A failed round drops the discovery cache.
+async function callEach(nfType, fn, { on404 = false } = {}) {
+  const bases = await resolveAll(nfType);
+  if (!bases.length) return null;
+  let last = null;
+  for (const base of bases) {
+    last = { r: await fn(base), base };
+    const s = last.r.status;
+    if (!(s === 0 || s >= 500 || (on404 && s === 404))) return last;
+  }
+  disc.delete(nfType);
+  return last;
 }
 
 async function activate(req, res, supi) {
@@ -140,16 +162,18 @@ async function activate(req, res, supi) {
   try { b = await readJson(req); } catch { return problem(res, 400, 'INVALID_JSON', 'body is not JSON'); }
   rec('in', 'amf', `PUT ue-contexts/${supi}`, b);
   if (!/^imsi-\d+$/.test(supi)) return problem(res, 400, 'INVALID_SUPI', 'supi must be imsi-<digits>');
-  const udm = await resolve('UDM');
-  if (!udm) return problem(res, 503, 'NF_DISCOVERY_FAILED', 'no UDM found in NRF');
-
   // TS 23.502 4.13.3.1: register in the UDM first, then fetch the SMS subscription data.
-  const reg = await call('udm', 'PUT', `${udm}/nudm-uecm/v1/${supi}/registrations/smsf-3gpp-access`, {
+  // With several UDMs, the one that accepts the registration serves the rest of this UE's procedure.
+  const regBody = {
     smsfInstanceId: NF_ID,
     plmnId: (b.guami && b.guami.plmnId) || b.plmnId || { mcc: '001', mnc: '01' },
     smsfMAPAddress: '46700000999',
     smsfDiameterAddress: { name: 'smsf.krilju', realm: 'workshop' },
-  });
+  };
+  const found = await callEach('UDM', base => call('udm', 'PUT', `${base}/nudm-uecm/v1/${supi}/registrations/smsf-3gpp-access`, regBody), { on404: true });
+  if (!found) return problem(res, 503, 'NF_DISCOVERY_FAILED', 'no UDM found in NRF');
+  const udm = found.base;
+  const reg = found.r;
   if (reg.status === 404) return problem(res, 404, 'USER_UNKNOWN', 'subscriber not found in UDM');
   if (reg.status === 0 || reg.status >= 300) return problem(res, 502, 'UDM_REGISTRATION_FAILED', `UDM answered ${reg.status}`);
 
@@ -164,15 +188,15 @@ async function activate(req, res, supi) {
   const mng = await call('udm', 'GET', `${udm}/nudm-sdm/v2/${supi}/sms-mng-data`);
   const mngData = mng.status === 200 && mng.body ? mng.body : {};
 
-  contexts.set(supi, { supi, gpsi: b.gpsi || null, amfId: b.amfId || null, mng: mngData, since: new Date().toISOString() });
+  contexts.set(supi, { supi, gpsi: b.gpsi || null, amfId: b.amfId || null, udm, mng: mngData, since: new Date().toISOString() });
   return send(res, 201, { smsfInstanceId: NF_ID });
 }
 
 async function deactivate(res, supi) {
   rec('in', 'amf', `DELETE ue-contexts/${supi}`);
   if (!contexts.has(supi)) return problem(res, 404, 'CONTEXT_NOT_FOUND', 'no SMS context for this supi');
+  const udm = contexts.get(supi).udm || await resolve('UDM');
   contexts.delete(supi);
-  const udm = await resolve('UDM');
   if (udm) await call('udm', 'DELETE', `${udm}/nudm-uecm/v1/${supi}/registrations/smsf-3gpp-access`);
   return send(res, 204);
 }
@@ -209,11 +233,12 @@ async function uplinkSms(req, res, supi) {
   // RP-DATA from the UE: the SMSC leg carries the bare TPDU. Anything else is passed on as is.
   const isRpData = rp && rp.type === 'DATA';
   const tpdu = isRpData ? rp.tpdu : hex;
-  const smsc = await resolve('SMSC');
-  if (!smsc) return problem(res, 503, 'NF_DISCOVERY_FAILED', 'no SMSC found in NRF');
-  const r = await call('smsc', 'POST', `${smsc}/smsc/mo-forward-short-message`, {
+  const moBody = {
     supi, msisdn: ctx.gpsi, scAddress: (isRpData && rp.scAddress) || SC_ADDRESS, sms: { hex: tpdu }, smsRecordId: jd.smsRecordId,
-  });
+  };
+  const fwd = await callEach('SMSC', base => call('smsc', 'POST', `${base}/smsc/mo-forward-short-message`, moBody));
+  if (!fwd) return problem(res, 503, 'NF_DISCOVERY_FAILED', 'no SMSC found in NRF');
+  const r = fwd.r;
   const report = r.body && r.body.deliveryReport && r.body.deliveryReport.hex;
   const payload = hexStr => ({ contentType: 'application/vnd.3gpp.sms', hex: hexStr });
   if (r.status === 200 && r.body && r.body.result === 'SUCCESS') {
@@ -241,8 +266,7 @@ async function mtForward(req, res) {
   let ctx = b.supi ? contexts.get(b.supi) : null;
   if (!ctx && b.msisdn) ctx = [...contexts.values()].find(c => c.gpsi && c.gpsi.replace(/^msisdn-/, '') === String(b.msisdn).replace(/^msisdn-/, ''));
   if (!ctx) return send(res, 404, { result: 'UNKNOWN_SUBSCRIBER', cause: 'no SMS context in this SMSF' });
-  const amf = await resolve('AMF');
-  if (!amf) return send(res, 503, { result: 'FAILURE', cause: 'no AMF found in NRF' });
+  if (!(await resolveAll('AMF')).length) return send(res, 503, { result: 'FAILURE', cause: 'no AMF found in NRF' });
   const rpMr = (rpMrSeq = (rpMrSeq + 1) & 0xff);
   const mrKey = `${ctx.supi}:${rpMr}`;
   // Register before the call: the UE's RP-ACK may arrive before the N1N2 answer returns.
@@ -253,11 +277,14 @@ async function mtForward(req, res) {
     if (t.unref) t.unref();
   });
   report.then(() => pendingMr.delete(mrKey));
-  const r = await call('amf', 'POST', `${amf}/namf-comm/v1/ue-contexts/${ctx.supi}/n1-n2-messages`, {
+  const n1n2 = {
     n1MessageContainer: { n1MessageClass: 'SMS', n1MessageContent: { contentId: 'sms' } },
     smsPayload: { contentType: 'application/vnd.3gpp.sms', hex: rpLayer.rpDataToUe(rpMr, b.scAddress || SC_ADDRESS, hex) },
     smsRecordId: id,
-  });
+  };
+  // An AMF that does not know the UE answers 404: try the next one before calling the UE absent.
+  const sent = await callEach('AMF', base => call('amf', 'POST', `${base}/namf-comm/v1/ue-contexts/${ctx.supi}/n1-n2-messages`, n1n2), { on404: true });
+  const r = sent.r;
   if (r.status < 200 || r.status >= 300) {
     pendingMt.delete(id);
     pendingMr.delete(mrKey);

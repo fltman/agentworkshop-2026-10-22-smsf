@@ -1,0 +1,3 @@
+# HIVE Evolution Log
+2026-10-22 09:58 SPAWN: smsf-service (need: SMSF backend, Nsmsf_SMService and relay)
+2026-10-22 09:58 SPAWN: smsf-interop-test (need: contracts and cross-team testing)

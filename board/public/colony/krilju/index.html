@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>krilju SMSF</title>
+<style>body{font:14px monospace;margin:1em}pre{background:#111;color:#cfc;padding:.5em;max-height:60vh;overflow:auto}</style>
+<h3>SMSF (krilju)</h3>
+<div id="st"></div>
+<h4>UE contexts</h4><pre id="ctx"></pre>
+<h4>Message log</h4><pre id="log"></pre>
+<script>
+async function load() {
+  const get = async p => (await fetch('/t/krilju/' + p)).json();
+  try {
+    document.getElementById('st').textContent = JSON.stringify(await get('status'));
+    document.getElementById('ctx').textContent = JSON.stringify(await get('contexts'), null, 1);
+    const l = await get('log');
+    document.getElementById('log').textContent = l.map(e => `${e.ts} ${e.dir} ${e.peer} ${e.what}`).join('\n');
+  } catch (e) { document.getElementById('st').textContent = String(e); }
+}
+load(); setInterval(load, 3000);
+</script>

@@ -64,6 +64,7 @@ global.fetch = async (url, opts = {}) => {
   }
   const bad = Object.keys(failing).find(root => u.startsWith(root + '/'));
   if (bad) return failing[bad] === 0 ? Promise.reject(new Error('ECONNREFUSED')) : json(failing[bad], {});
+  if (u.includes('/sdm-subscriptions')) return method === 'DELETE' ? json(204) : (udmData.noSub ? json(404, {}) : json(201, { subscriptionId: 'sub-1' }));
   if (u.includes('/nudm-uecm/')) return json(method === 'DELETE' ? 204 : (udmData.uecm || 201), {});
   if (u.includes('/sms-mng-data')) return json(200, udmData.mng || {});
   if (u.includes('/sms-data')) return json(udmData.sms.status || 200, udmData.sms.body);
@@ -216,6 +217,44 @@ test('deactivate: removes the context and unregisters at the UDM', async () => {
   assert.strictEqual((await req('DELETE', '/nsmsf-sms/v2/ue-contexts/imsi-001010000000002')).status, 204);
   assert.strictEqual((await req('DELETE', '/nsmsf-sms/v2/ue-contexts/imsi-001010000000002')).status, 404);
   assert.ok(calls.some(c => c.method === 'DELETE' && c.url.includes('/nudm-uecm/')));
+});
+
+// ---- UDM callbacks (TS 29.503 SDM subscription + dereg notification) ----
+const cbSupi = 'imsi-001010000000012';
+test('callbacks: activation subscribes with a callback and passes the dereg callback URI', async () => {
+  okUdm();
+  assert.strictEqual((await activate(cbSupi, 'msisdn-46700000012')).status, 201);
+  const sub = calls.filter(c => c.method === 'POST' && c.url.endsWith(`/nudm-sdm/v2/${cbSupi}/sdm-subscriptions`)).pop();
+  assert.ok(sub.body.callbackReference.endsWith(`/nudm-callback/sdm/${cbSupi}`));
+  const reg = calls.filter(c => c.method === 'PUT' && c.url.includes('/nudm-uecm/')).pop();
+  assert.ok(reg.body.deregCallbackUri.endsWith(`/nudm-callback/dereg/${cbSupi}`));
+});
+
+test('callbacks: SDM notification re-reads the data; barring updates the context, loss of SMS removes it', async () => {
+  udmData.mng = { moSmsBarringAll: true };
+  assert.strictEqual((await req('POST', `/nudm-callback/sdm/${cbSupi}`, { notifyItems: [] })).status, 204);
+  assert.strictEqual((await req('POST', `/nsmsf-sms/v2/ue-contexts/${cbSupi}/sendsms`, { jsonData: { smsPayload: { hex: '00' } } })).body.cause, 'MO_SMS_BARRED');
+  udmData.sms = { body: { smsSubscribed: false } };
+  assert.strictEqual((await req('POST', `/nudm-callback/sdm/${cbSupi}`, {})).status, 204);
+  assert.strictEqual((await req('POST', `/nudm-callback/sdm/${cbSupi}`, {})).status, 404);
+});
+
+test('callbacks: dereg notification drops the context; unknown UE gets 404', async () => {
+  okUdm();
+  await activate(cbSupi, 'msisdn-46700000012');
+  assert.strictEqual((await req('POST', `/nudm-callback/dereg/${cbSupi}`, { deregReason: 'SUBSCRIPTION_WITHDRAWN' })).status, 204);
+  assert.strictEqual((await req('POST', `/nudm-callback/dereg/${cbSupi}`, {})).status, 404);
+});
+
+test('callbacks: a UDM without subscriptions does not break activation; deactivate removes a subscription', async () => {
+  udmData = { sms: { body: { smsSubscribed: true } }, mng: {}, noSub: true };
+  assert.strictEqual((await activate(cbSupi, 'msisdn-46700000012')).status, 201);
+  await req('DELETE', `/nsmsf-sms/v2/ue-contexts/${cbSupi}`);
+  assert.ok(!calls.some(c => c.method === 'DELETE' && c.url.includes(`/sdm-subscriptions/`) && c.url.includes(cbSupi) && calls.indexOf(c) > calls.length - 3));
+  okUdm();
+  await activate(cbSupi, 'msisdn-46700000012');
+  await req('DELETE', `/nsmsf-sms/v2/ue-contexts/${cbSupi}`);
+  assert.ok(calls.some(c => c.method === 'DELETE' && c.url.endsWith(`/nudm-sdm/v2/${cbSupi}/sdm-subscriptions/sub-1`)));
 });
 
 // ---- several instances of the same NF ----

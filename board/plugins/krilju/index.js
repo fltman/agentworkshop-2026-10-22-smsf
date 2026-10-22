@@ -15,6 +15,7 @@ const NF_ID = '6f1c2c1e-0000-4000-8000-0000006b7269'; // stable across restarts,
 const TR1M_MS = Number(process.env.SMSF_TR1M_MS) || 35000;
 const MT_REPLY_MS = Number(process.env.SMSF_MT_REPLY_MS) || 15000;
 const MO_SMSC_MS = Number(process.env.SMSF_MO_SMSC_MS) || 15000; // the UE waits TR1M for our RP-ACK/ERROR
+const callbacks = { subscribed: 0, subscribeUnsupported: 0, sdmNotify: 0, deregNotify: 0 };
 const rpTimers = { mtReplyDeadline: 0, tr1mExpired: 0, lateReport: 0 };
 
 const contexts = new Map(); // supi -> { supi, gpsi, amfId, since }
@@ -188,6 +189,7 @@ async function activate(req, res, supi) {
     plmnId: (b.guami && b.guami.plmnId) || b.plmnId || { mcc: '001', mnc: '01' },
     smsfMAPAddress: '46700000999',
     smsfDiameterAddress: { name: 'smsf.krilju', realm: 'workshop' },
+    deregCallbackUri: `${SELF_BASE}/nudm-callback/dereg/${supi}`,
   };
   const found = await callEach('UDM', base => call('udm', 'PUT', `${base}/nudm-uecm/v1/${supi}/registrations/smsf-3gpp-access`, regBody), { on404: true });
   if (!found) return problem(res, 503, 'NF_DISCOVERY_FAILED', 'no UDM found in NRF');
@@ -207,7 +209,16 @@ async function activate(req, res, supi) {
   const mng = await call('udm', 'GET', `${udm}/nudm-sdm/v2/${supi}/sms-mng-data`);
   const mngData = mng.status === 200 && mng.body ? mng.body : {};
 
-  contexts.set(supi, { supi, gpsi: b.gpsi || null, amfId: b.amfId || null, udm, mng: mngData, since: new Date().toISOString() });
+  // TS 29.503 Nudm_SDM Subscribe: be told when the SMS subscription data changes. A UDM without it answers 404/501 and we carry on.
+  const sub = await call('udm', 'POST', `${udm}/nudm-sdm/v2/${supi}/sdm-subscriptions`, {
+    nfInstanceId: NF_ID,
+    callbackReference: `${SELF_BASE}/nudm-callback/sdm/${supi}`,
+    monitoredResourceUris: [`/nudm-sdm/v2/${supi}/sms-data`, `/nudm-sdm/v2/${supi}/sms-mng-data`],
+  });
+  let subId = null;
+  if (sub.status === 201 || sub.status === 200) { callbacks.subscribed++; subId = (sub.body && sub.body.subscriptionId) || true; } else callbacks.subscribeUnsupported++;
+
+  contexts.set(supi, { supi, gpsi: b.gpsi || null, amfId: b.amfId || null, udm, mng: mngData, subId, since: new Date().toISOString() });
   return send(res, 201, { smsfInstanceId: NF_ID });
 }
 
@@ -215,8 +226,35 @@ async function deactivate(res, supi) {
   rec('in', 'amf', `DELETE ue-contexts/${supi}`);
   if (!contexts.has(supi)) return problem(res, 404, 'CONTEXT_NOT_FOUND', 'no SMS context for this supi');
   const udm = contexts.get(supi).udm || await resolve('UDM');
+  const subId = contexts.get(supi).subId;
   contexts.delete(supi);
+  if (udm && typeof subId === 'string') await call('udm', 'DELETE', `${udm}/nudm-sdm/v2/${supi}/sdm-subscriptions/${encodeURIComponent(subId)}`);
   if (udm) await call('udm', 'DELETE', `${udm}/nudm-uecm/v1/${supi}/registrations/smsf-3gpp-access`);
+  return send(res, 204);
+}
+
+// Callbacks from the UDM. The notification body is not trusted for content: on a data change we read the data again.
+async function sdmNotify(req, res, supi) {
+  try { await readJson(req); } catch { /* an empty or odd body still means "something changed" */ }
+  rec('in', 'udm', `POST nudm-callback/sdm/${supi}`);
+  const ctx = contexts.get(supi);
+  if (!ctx) return problem(res, 404, 'CONTEXT_NOT_FOUND', 'no SMS context for this supi');
+  callbacks.sdmNotify++;
+  const [sms, mng] = await Promise.all([
+    call('udm', 'GET', `${ctx.udm}/nudm-sdm/v2/${supi}/sms-data`),
+    call('udm', 'GET', `${ctx.udm}/nudm-sdm/v2/${supi}/sms-mng-data`),
+  ]);
+  if (sms.status === 200 && sms.body && sms.body.smsSubscribed !== true) contexts.delete(supi);
+  else if (mng.status === 200 && mng.body) ctx.mng = mng.body;
+  return send(res, 204);
+}
+
+async function deregNotify(req, res, supi) {
+  let b = {};
+  try { b = await readJson(req); } catch { /* reason is optional for us */ }
+  rec('in', 'udm', `POST nudm-callback/dereg/${supi}`, b);
+  if (!contexts.delete(supi)) return problem(res, 404, 'CONTEXT_NOT_FOUND', 'no SMS context for this supi');
+  callbacks.deregNotify++;
   return send(res, 204);
 }
 
@@ -335,6 +373,7 @@ function routeOf(method, path) {
 function prometheus() {
   const out = [`smsf_uptime_seconds ${Math.round((Date.now() - startedAt) / 1000)}`,
     `smsf_ue_contexts ${contexts.size}`, `smsf_registered_in_nrf ${registered ? 1 : 0}`, `smsf_pending_mt ${pendingMt.size}`,
+    ...Object.entries(callbacks).map(([k, v]) => `smsf_callback_total{event="${k}"} ${v}`),
     ...Object.entries(rpTimers).map(([k, v]) => `smsf_rp_timer_total{event="${k}"} ${v}`)];
   for (const [k, v] of inbound) for (const [st, n] of Object.entries(v.byStatus)) out.push(`smsf_inbound_total{route="${k}",status="${st}"} ${n}`);
   for (const [k, v] of outbound) for (const [st, n] of Object.entries(v.byStatus)) out.push(`smsf_outbound_total{peer="${k}",status="${st}"} ${n}`);
@@ -377,6 +416,8 @@ async function handleInner(req, res, { path }) {
       if (m[2] && req.method === 'POST') return uplinkSms(req, res, supi);
       return problem(res, 405, 'METHOD_NOT_ALLOWED', 'see CONTRACT.md');
     }
+    const cb = path.match(/^\/nudm-callback\/(sdm|dereg)\/([^/]+)$/);
+    if (cb && req.method === 'POST') return (cb[1] === 'sdm' ? sdmNotify : deregNotify)(req, res, decodeURIComponent(cb[2]));
     if (req.method === 'POST' && path === '/smsc/mt-forward-short-message') return mtForward(req, res);
     if (req.method === 'GET' && path === '/log') {
       const lim = Math.min(500, Number(new URL(req.url, 'http://x').searchParams.get('limit')) || 100);
@@ -385,7 +426,7 @@ async function handleInner(req, res, { path }) {
     if (req.method === 'GET' && path === '/metrics') {
       return send(res, 200, {
         uptimeSeconds: Math.round((Date.now() - startedAt) / 1000), nfInstanceId: NF_ID, registeredInNrf: registered,
-        ueContexts: contexts.size, pendingMt: pendingMt.size, rpTimers, inbound: table(inbound), outbound: table(outbound),
+        ueContexts: contexts.size, pendingMt: pendingMt.size, rpTimers, callbacks, inbound: table(inbound), outbound: table(outbound),
       });
     }
     if (req.method === 'GET' && path === '/metrics.prom') {

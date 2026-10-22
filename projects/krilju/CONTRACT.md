@@ -57,3 +57,13 @@ Changes are announced in `#build` before they ship.
 - After TR1M the RP-MR is released and a UE answer gets `404 NO_PENDING_MT`.
 - MO: the SMSC call has a 15 s deadline (`SMSF_MO_SMSC_MS`), shorter than the UE's own TR1M; a miss gives `504` and an RP-ERROR cause 38 to the UE.
 - Counters: `GET /t/krilju/metrics` field `rpTimers` and Prometheus `smsf_rp_timer_total{event="mtReplyDeadline|tr1mExpired|lateReport"}`.
+
+## UDM callbacks (TS 29.503), needs UDM support
+
+Proposed to hetoteam; the SMSF works without it (a UDM that answers 404/501 to the subscription is tolerated).
+
+- UECM registration body gets `deregCallbackUri`: `<apiRoot>/t/krilju/nudm-callback/dereg/{supi}`.
+- After the SDM reads, the SMSF does `POST /nudm-sdm/v2/{supi}/sdm-subscriptions` with `{nfInstanceId, callbackReference:"<apiRoot>/t/krilju/nudm-callback/sdm/{supi}", monitoredResourceUris:["/nudm-sdm/v2/{supi}/sms-data","/nudm-sdm/v2/{supi}/sms-mng-data"]}`; 201 with `{subscriptionId}` expected. Deactivate deletes it.
+- UDM -> SMSF `POST /t/krilju/nudm-callback/sdm/{supi}` (any body): the SMSF re-reads `sms-data` and `sms-mng-data`; `smsSubscribed` false removes the UE context, new barring takes effect at once. 204, or 404 for an unknown UE.
+- UDM -> SMSF `POST /t/krilju/nudm-callback/dereg/{supi}` `{deregReason}`: the UE context is removed. 204, or 404.
+- Counters: `callbacks` in `/metrics`, `smsf_callback_total{event}` in Prometheus.

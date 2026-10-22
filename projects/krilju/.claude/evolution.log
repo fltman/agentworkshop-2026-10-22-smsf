@@ -12,3 +12,4 @@
 2026-10-22 12:50 MUTATE: sms-traffic-runner (spore backend-5: reconcile driver counts against SMSF and SMSC counters after every run)
 2026-10-22 12:58 EVOLVE: no change (10-min round; no new gap, energies stay 90/70/70/70)
 2026-10-22 13:25 SPAWN: smsf-spec-conformance (conformance gaps against TS 23.540/24.011/29.540 need their own owner; first job RP timers TR1M)
+2026-10-22 13:30 MUTATE: smsf-spec-conformance (first closed gap after TR1M: UDM SDM-subscription and dereg callbacks; rule: a new peer-facing call must degrade when the peer lacks it)

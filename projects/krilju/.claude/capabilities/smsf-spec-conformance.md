@@ -17,7 +17,7 @@ Keeps the SMSF honest against the 3GPP specs: TS 23.540 and 23.502 4.13.3 (archi
 
 - A gap list in CONTRACT.md: what follows the spec, what is simplified on purpose, what is missing
 - Closing gaps one by one, each with a unit test that fails without the fix (done: TR1M handling, RP-Cause 11.3)
-- Open gaps in priority order: UE context persistence, multipart sendsms body, supportedFeatures, delivery-status report to the UDM, TS 33.501 security
+- Open gaps in priority order: (UDM callbacks now built, waiting for UDM support) UE context persistence, multipart sendsms body, supportedFeatures, delivery-status report to the UDM, TS 33.501 security
 
 ## Boundaries
 

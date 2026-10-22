@@ -71,3 +71,15 @@ test('events: calls touching UDM or NRF are signalling, the SMS chain is sms', (
   assert.equal(ev.kindOf({ from: 'SMSF', to: 'SMSC' }), 'sms');
   assert.equal(ev.kindOf({ from: 'AMF', to: 'SMSF' }), 'sms');
 });
+
+test('events: registration procedures get readable names and count as signalling', () => {
+  const amf = { team: 'tompa', node: 'AMF' };
+  const reg = ev.normalize(amf, { dir: 'in', peer: 'smsf', method: 'PUT', path: 'https://x/t/krilju/nsmsf-sms/v2/ue-contexts/imsi-001010000000004', status: 201 });
+  assert.equal(reg.label, 'REGISTER – PUT /nsmsf-sms/v2/ue-contexts/{supi}');
+  assert.equal(ev.kindOf(reg), 'signal');
+  const ue = ev.normalize(amf, { dir: 'in', peer: 'ue', method: 'POST', path: '/ue/imsi-001010000000003/deregister', status: 200 });
+  assert.deepEqual([ue.from, ue.to, ue.label], ['UE', 'AMF', 'DEREGISTER – POST /ue/{supi}/deregister']);
+  const mo = ev.normalize(amf, { dir: 'in', peer: 'smsf', method: 'POST', path: 'https://x/t/krilju/nsmsf-sms/v2/ue-contexts/imsi-001010000000001/sendsms', status: 200 });
+  assert.equal(ev.kindOf(mo), 'sms');
+  assert.equal(ev.nameOf('PUT /nudm-uecm/v1/{supi}/registrations/smsf-3gpp-access'), 'UDM REG – PUT /nudm-uecm/v1/{supi}/registrations/smsf-3gpp-access');
+});

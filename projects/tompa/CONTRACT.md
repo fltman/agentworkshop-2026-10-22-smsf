@@ -88,7 +88,7 @@ the same identities and holds only UE state (registered, reachable, inbox). SMS 
 
 ## Logs
 
-`GET /log` returns the latest messages in and out, newest first: `{ts, dir:"in"|"out", peer, method, path, status, body, diag?}`.
+`GET /log` returns the latest messages in and out, newest first: `{ts, dir:"in"|"out", peer, method, path, status, body, diag?}`. UE actions show as `peer:"trigger"` (HTTP trigger) or `peer:"ue"` (load generator and scenarios, logged once with the answer's status).
 `diag` is the boundary decoder's verdict on a message from a peer: `{verdict:"ok"|"expected"|"fault", hop, owner, finding, expected}`.
 
 `GET /faults` lists the peer faults seen, de-duplicated: `{owner, hop, finding, expected, count, firstTs, lastTs, lastLogId, report}`.

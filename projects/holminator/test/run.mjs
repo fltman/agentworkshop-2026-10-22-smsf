@@ -535,7 +535,7 @@ await t('GET /kpi: common shape, requests and errors derived from answers and pe
   for (const f of ['nf', 'up', 'requests', 'errors', 'latencyMs', 'extra']) assert.ok(f in k0, `field ${f}`);
   assert.equal(k0.nf, 'SMSC'); assert.equal(k0.up, true);
   for (const f of ['requests', 'errors', 'latencyMs']) assert.equal(typeof k0[f], 'number', f);
-  assert.deepEqual(Object.keys(k0.extra).sort(), ['alerts_received', 'mo_accepted', 'mt_delivered', 'mt_failed', 'registeredInNrf', 'status_reports_sent', 'waiting']);
+  assert.deepEqual(Object.keys(k0.extra).sort(), ['alerts_received', 'consistent', 'mo_accepted', 'mt_delivered', 'mt_failed', 'pdus_in', 'pdus_out', 'registeredInNrf', 'status_reports_sent', 'waiting']);
   const m = (await j('GET', '/api/metrics')).body;
   for (const f of ['mo_accepted', 'mt_delivered', 'mt_failed', 'status_reports_sent', 'alerts_received']) assert.equal(k0.extra[f], m.counters[f] || 0, f);
   assert.equal(k0.extra.registeredInNrf, m.nrf.registered);
@@ -671,6 +671,69 @@ await t('tile: MO flow ends at the SMSC, MT flow runs SMSC->UDM->SMSF->AMF->UE w
   const html = fs.readFileSync(path.join(root, 'board/public/colony/holminator/index.html'), 'utf8');
   assert.match(html, /<form id="mtform"[\s\S]*name="singleShot"[\s\S]*<\/form>/, 'MT form offers singleShot');
   assert.match(app, /singleShot: f\.singleShot\.checked/, 'POST /api/mt sends singleShot');
+});
+await t('tile: PDU, RP-Cause, status report, SGd and consistency panels read /api/metrics defensively ("–" when missing)', async () => {
+  const vm = await import('node:vm');
+  const app = fs.readFileSync(path.join(root, 'board/public/colony/holminator/app.js'), 'utf8');
+  const a = app.indexOf('// ---------- flow model (pure'), b = app.indexOf('// ---------- end flow model');
+  const ctx = vm.createContext({});
+  vm.runInContext(`${app.slice(a, b)};this.api={pduTable,rpCauses,srPanel,sgdOps,consistencyBadge,countersSince,stInfo,DASH};`, ctx);
+  const { pduTable, rpCauses, srPanel, sgdOps, consistencyBadge, countersSince, stInfo, DASH } = ctx.api;
+  assert.equal(DASH, '–');
+  const cells = t => t.groups.flatMap(g => g.rows.flatMap(r => [r.in, r.out].filter(Boolean)));
+
+  // Older backend: every panel shows "–", nothing is a made-up 0.
+  const old = { counters: {}, messages: {} };
+  assert.equal(pduTable(old).known, false);
+  assert.ok(cells(pduTable(old)).length >= 9 && cells(pduTable(old)).every(c => c.v === '–'));
+  assert.equal(rpCauses(old).in, null); assert.equal(rpCauses(old).out, null);
+  assert.ok(srPanel(old).fields.every(f => f.v === '–')); assert.equal(srPanel(old).byTpSt, null);
+  assert.ok(sgdOps(old).out.every(o => o.v === '–') && sgdOps(old).in.length === 2);
+  assert.equal(consistencyBadge(old).state, 'unknown'); assert.match(consistencyBadge(old).text, /–/);
+  assert.equal(countersSince(old), null);
+
+  const m = {
+    since: '2026-10-22T08:00:00.000Z',
+    pdus: { in: { 'RP-DATA/SMS-SUBMIT': 5, 'RP-ACK/SMS-DELIVER-REPORT': 3, 'none/no-report': 1, 'RP-DATA/SMMA': 2 },
+      out: { 'RP-ACK/SMS-SUBMIT-REPORT': 4, 'RP-ERROR/SMS-SUBMIT-REPORT': 0, 'RP-DATA/SMS-DELIVER': 4, 'RP-DATA/SMS-STATUS-REPORT': 1 } },
+    rpCauses: { in: { '22 MEMORY_CAPACITY_EXCEEDED': 1, '111 PROTOCOL_ERROR': 2, '41 TEMPORARY_FAILURE': 0 }, out: { '42 CONGESTION': 0 } },
+    statusReports: { generated: 2, sent: 1, delivered: 1, failed: 0, expired: 0, byTpSt: { '0x00': 1, '0x46': 2, '0x9a': 1 } },
+    sgd: { operationsOut: { 'SRI-for-SM': 4, 'MT-Forward-SM': 4, NFRegister: 1 }, operationsIn: { 'MO-Forward-SM': 5, 'Alert-SC': 0 } },
+    consistency: [{ name: 'pdus-match-counters', ok: true }, { name: 'sr-sum', ok: false, detail: 'generated 2 != sent+failed+expired+waiting 1' }],
+  };
+  const pt = pduTable(m);
+  const find = label => cells(pt).find(c => c.label === label);
+  assert.equal(pt.known, true);
+  assert.equal(pt.groups[0].grp, 'MO'); assert.equal(pt.groups[1].grp, 'MT');
+  assert.equal(pt.groups[0].rows[0].in.label, 'RP-DATA / SMS-SUBMIT'); assert.equal(pt.groups[0].rows[0].in.v, 5);
+  assert.equal(pt.groups[0].rows[0].out.v, 4, 'MO row pairs SUBMIT in with SUBMIT-REPORT ack out');
+  assert.equal(find('RP-ERROR / SMS-SUBMIT-REPORT').v, 0, 'a real 0 stays 0');
+  assert.equal(find('RP-ACK / STATUS-REPORT-ACK').v, '–', 'a missing key is "–"');
+  assert.equal(find('none / no-report').v, 1);
+  assert.equal(find('RP-DATA / SMMA').v, 2, 'unknown backend keys still show, as other');
+  const rc = rpCauses(m);
+  assert.equal(rc.in.map(c => c.cause).join('|'), '111 PROTOCOL_ERROR|22 MEMORY_CAPACITY_EXCEEDED', 'most frequent first, pre-seeded zeros hidden');
+  assert.equal(rc.out.length, 0);
+  const sp = srPanel(m);
+  assert.equal(sp.fields.map(f => f.k).join(), 'generated,sent,delivered,failed,expired,waiting');
+  assert.equal(sp.fields.find(f => f.k === 'waiting').v, '–'); assert.equal(sp.fields.find(f => f.k === 'failed').v, 0);
+  assert.equal(sp.byTpSt.map(r => `${r.code} ${r.name} ${r.n}`).join('|'),
+    '0x46 SM validity period expired 2|0x00 received by SME 1|0x9a permanent (reserved/SC specific) 1');
+  assert.equal(sp.byTpSt[1].cls, 'ok'); assert.equal(sp.byTpSt[0].cls, 'bad');
+  assert.equal(stInfo('0x22').cls, 'warn'); assert.equal(stInfo(0).code, '0x00');
+  // The tile's TP-ST names cover every value the SC codec can send.
+  for (const [k, v] of Object.entries(tpdu.ST)) assert.ok(!/reserved/.test(stInfo(v).name), `TP-ST ${k} has a name on the tile`);
+  const so = sgdOps(m);
+  assert.equal(so.out.map(o => `${o.op}=${o.v}`).join(), 'SRI-for-SM=4,MT-Forward-SM=4,Report-SM-Delivery-Status=–,NFDiscover=–,NFRegister=1,NFUpdate=–');
+  assert.equal(so.in.map(o => `${o.op}=${o.v}`).join(), 'MO-Forward-SM=5,Alert-SC=0');
+  const cb = consistencyBadge(m);
+  assert.equal(cb.state, 'bad'); assert.equal(cb.failed.length, 1); assert.match(cb.text, /sr-sum/); assert.match(cb.failed[0].detail, /generated 2/);
+  assert.equal(consistencyBadge({ consistency: [{ name: 'x', ok: true }] }).state, 'ok');
+  assert.equal(countersSince(m), '2026-10-22T08:00:00.000Z');
+  assert.equal(countersSince({ metrics: { since: 'T' } }), 'T', 'metrics.since also read');
+  const html = fs.readFileSync(path.join(root, 'board/public/colony/holminator/index.html'), 'utf8');
+  for (const id of ['pdus', 'causesin', 'causesout', 'srstats', 'tpst', 'sgdops', 'consistency', 'consfail', 'since'])
+    assert.ok(html.includes(`id="${id}"`), `tile has #${id}`);
 });
 await t('POST /test/decode decodes RP-ACK with SUBMIT-REPORT and honours kind/direction hints', async () => {
   const r = await j('POST', '/test/decode', { hex: '03014109010062012280055500' });
@@ -1006,6 +1069,167 @@ await t('metrics: MO counted as mo_received/mo_accepted/mo_forwarded; mt_origina
   assert.ok(all.every(x => x.direction === 'MO' || x.direction === 'MT'), 'every record has an explicit direction');
   assert.ok(all.filter(x => x.direction === 'MT').every(x => x.kind === 'STATUS_REPORT' || x.history[0].detail.startsWith('originated by the SC API')), 'MT only from /api/mt or status reports');
   assert.ok(all.filter(x => x.direction === 'MO').every(x => !x.attempts), 'no MO was ever attempted as MT');
+});
+
+// ---------- metrics: complete (every PDU, RP-Cause, status report, SGd operation), consistent, persisted ----------
+{
+  // A fresh module instance on its own dataDir and HTTP port, like a restarted process.
+  const modPath = path.join(root, 'board/plugins/holminator/index.js');
+  const fresh = async dir => {
+    const cached = require.cache[require.resolve(modPath)];
+    delete require.cache[require.resolve(modPath)];
+    const p = require(modPath);
+    require.cache[require.resolve(modPath)] = cached;
+    p.init({ dataDir: dir });
+    const s = http.createServer(async (req, res) => {
+      const url = new URL(req.url, 'http://x');
+      const handled = await p.handle(req, res, { path: url.pathname.replace(/^\/t\/holminator/, '') || '/', url });
+      if (!handled && !res.headersSent) { res.writeHead(404); res.end(); }
+    });
+    await new Promise(r => s.listen(0, r));
+    const b = `http://127.0.0.1:${s.address().port}/t/holminator`;
+    const jj = async (method, p2, body) => {
+      const r = await fetch(b + p2, { method, headers: { 'content-type': 'application/json' }, body: body && JSON.stringify(body) });
+      return { status: r.status, body: await r.json().catch(() => r.status) };
+    };
+    const close = () => { for (const tm of p._st.timers) clearInterval(tm); s.close(); };
+    return { p, j: jj, close };
+  };
+  const PIN = ['RP-DATA/SMS-SUBMIT', 'RP-ACK/SMS-DELIVER-REPORT', 'RP-ACK/STATUS-REPORT-ACK', 'RP-ERROR/SMS-DELIVER-REPORT', 'none/no-report'];
+  const POUT = ['RP-ACK/SMS-SUBMIT-REPORT', 'RP-ERROR/SMS-SUBMIT-REPORT', 'RP-DATA/SMS-DELIVER', 'RP-DATA/SMS-STATUS-REPORT'];
+  const OUT_OPS = ['SRI-for-SM', 'MT-Forward-SM', 'Report-SM-Delivery-Status', 'NFDiscover', 'NFRegister', 'NFUpdate'];
+  const zeroed = keys => Object.fromEntries(keys.map(k => [k, 0]));
+  const dir3 = fs.mkdtempSync(path.join(os.tmpdir(), 'holminator-metrics-'));
+
+  await t('metrics: on a fresh start every counter, PDU, RP-Cause, status report and SGd key is present and 0', async () => {
+    const dir0 = fs.mkdtempSync(path.join(os.tmpdir(), 'holminator-metrics0-'));
+    const f = await fresh(dir0);
+    try {
+      const m = (await f.j('GET', '/api/metrics')).body;
+      assert.ok(!Number.isNaN(Date.parse(m.since)), 'since is an ISO time');
+      for (const k of ['mo_received', 'mo_accepted', 'mo_rejected', 'mo_forwarded', 'mo_dry_runs', 'mt_originated', 'mt_attempts', 'mt_forward_not_sent',
+        'mt_delivered', 'mt_failed', 'mt_expired', 'status_reports_generated', 'status_reports_sent', 'status_reports_failed', 'status_reports_expired',
+        'alerts_received', 'sri_requests', 'udm_delivery_reports', 'store_evicted', 'requests_in', 'answers_error']) assert.equal(m.counters[k], 0, k);
+      assert.ok(Object.values(m.counters).every(v => v === 0), 'every pre-seeded counter is 0');
+      assert.deepEqual(m.pdus, { in: zeroed(PIN), out: zeroed(POUT) });
+      for (const d of ['in', 'out']) {
+        assert.equal(m.rpCauses[d]['22 MEMORY_CAPACITY_EXCEEDED'], 0);
+        assert.equal(m.rpCauses[d]['111 PROTOCOL_ERROR_UNSPECIFIED'], 0);
+        assert.equal(Object.keys(m.rpCauses[d]).length, Object.keys(tpdu.RP_CAUSE).length);
+        assert.ok(Object.values(m.rpCauses[d]).every(v => v === 0));
+      }
+      const { byTpSt, ...sr } = m.statusReports;
+      assert.deepEqual(sr, { generated: 0, sent: 0, delivered: 0, failed: 0, expired: 0, waiting: 0 });
+      for (const k of ['0x00', '0x46', '0x60', '0x62', '0x65']) assert.equal(byTpSt[k], 0, k);
+      assert.ok(Object.values(byTpSt).every(v => v === 0));
+      assert.deepEqual(m.sgd.operationsOut, zeroed(OUT_OPS));
+      assert.deepEqual(m.sgd.operationsIn, { 'MO-Forward-SM': 0, 'Alert-SC': 0 });
+      assert.deepEqual(m.sgd.results, m.results);
+      assert.deepEqual(m.consistency.map(c => c.name), ['mo_pdus', 'mt_attempts_forwarded', 'mt_attempts_answered', 'status_reports', 'mo_store']);
+      assert.ok(m.consistency.every(c => c.ok && typeof c.detail === 'string'), JSON.stringify(m.consistency));
+      const text = f.p._internals.metricsText();
+      assert.match(text, /smsc_pdus_total\{dir="in",type="RP-DATA\/SMS-SUBMIT"\} 0/);
+      assert.match(text, /smsc_rp_causes_total\{dir="in",cause="22 MEMORY_CAPACITY_EXCEEDED"\} 0/);
+      assert.match(text, /smsc_sgd_operations_total\{dir="out",operation="MT-Forward-SM"\} 0/);
+      assert.match(text, /smsc_consistency_ok\{check="mo_pdus"\} 1/);
+      assert.match(text, /smsc_store_evicted_total 0/);
+    } finally { f.close(); fs.rmSync(dir0, { recursive: true, force: true }); }
+  });
+
+  let after = null;
+  await t('metrics: MO+SRR, MO rejected, MT delivered, MT RP-ERROR 22, MT no report -> exact PDUs, causes, status reports, all consistent', async () => {
+    const f = await fresh(dir3);
+    try {
+      smsfRules['46700000343'] = [502, { result: 'FAILURE', cause: 'UE answered RP-ERROR', deliveryReport: { hex: '04050116' } }];
+      smsfRules['46700000344'] = [502, { result: 'FAILURE', cause: 'no answer from the UE' }];
+      const mo = await f.j('POST', '/smsc/mo-forward-short-message', moBody({ msisdn: '46700000340', sms: { hex: subHex({ mr: 210, to: '46700000341', srr: true }) } }));
+      assert.equal(mo.status, 200);
+      const rej = await f.j('POST', '/smsc/mo-forward-short-message', moBody({ msisdn: '46700000345', scAddress: '46700000999', sms: { hex: subHex({ mr: 211, to: '46700000341' }) } }));
+      assert.equal(rej.status, 403);
+      for (const to of ['46700000342', '46700000343', '46700000344']) assert.equal((await f.j('POST', '/api/mt?wait=1', { to, text: `metrics ${to}` })).status, 200);
+      const get = id => f.p._st.messages.find(x => x.id === id);
+      await waitFor(() => { const x = get(get(mo.body.messageId).statusReportId || ''); return x && x.status === 'DELIVERED'; });
+      await waitFor(() => f.p._st.messages.filter(x => x.direction === 'MT').every(x => ['DELIVERED', 'WAITING'].includes(x.status)));
+      const m = (await f.j('GET', '/api/metrics')).body;
+      assert.deepEqual(m.pdus.in, { 'RP-DATA/SMS-SUBMIT': 2, 'RP-ACK/SMS-DELIVER-REPORT': 1, 'RP-ACK/STATUS-REPORT-ACK': 1, 'RP-ERROR/SMS-DELIVER-REPORT': 1, 'none/no-report': 1 });
+      assert.deepEqual(m.pdus.out, { 'RP-ACK/SMS-SUBMIT-REPORT': 1, 'RP-ERROR/SMS-SUBMIT-REPORT': 1, 'RP-DATA/SMS-DELIVER': 3, 'RP-DATA/SMS-STATUS-REPORT': 1 });
+      assert.deepEqual(Object.entries(m.rpCauses.in).filter(([, v]) => v), [['22 MEMORY_CAPACITY_EXCEEDED', 1]]);
+      assert.deepEqual(Object.entries(m.rpCauses.out).filter(([, v]) => v), [['21 SHORT_MESSAGE_TRANSFER_REJECTED', 1]]);
+      const { byTpSt, ...sr } = m.statusReports;
+      assert.deepEqual(sr, { generated: 1, sent: 1, delivered: 1, failed: 0, expired: 0, waiting: 0 });
+      assert.deepEqual(Object.entries(byTpSt).filter(([, v]) => v), [['0x00', 1]]);
+      const c = m.counters;
+      assert.deepEqual([c.mo_received, c.mo_accepted, c.mo_rejected, c.mo_forwarded], [2, 1, 1, 1]);
+      assert.deepEqual([c.mt_originated, c.mt_attempts, c.mt_forward_not_sent, c.mt_delivered, c.status_reports_sent], [4, 4, 0, 1, 1]);
+      for (const k of ['SRI-for-SM', 'MT-Forward-SM']) assert.equal(m.sgd.operationsOut[k], 4, k);
+      assert.equal(m.sgd.operationsOut['Report-SM-Delivery-Status'], 1, 'only RP-ERROR 22 is reported to the UDM');
+      assert.ok(m.sgd.operationsOut.NFDiscover >= 1);
+      assert.deepEqual(m.sgd.operationsIn, { 'MO-Forward-SM': 2, 'Alert-SC': 0 });
+      assert.ok(m.consistency.every(x => x.ok), JSON.stringify(m.consistency, null, 1));
+      const k = (await f.j('GET', '/kpi')).body.extra;
+      assert.deepEqual([k.pdus_in, k.pdus_out, k.consistent], [6, 6, true]);
+      after = m;
+    } finally {
+      f.close();
+      delete smsfRules['46700000343']; delete smsfRules['46700000344'];
+    }
+  });
+
+  await t('metrics: counters, PDUs, causes, TP-ST and SGd operations survive a restart (store.json), since is kept', async () => {
+    assert.ok(after, 'needs the previous test');
+    const saved = JSON.parse(fs.readFileSync(path.join(dir3, 'store.json'), 'utf8'));
+    assert.ok(saved.metrics && saved.metrics.pdus, 'metrics are in store.json');
+    const f = await fresh(dir3);
+    try {
+      const m = (await f.j('GET', '/api/metrics')).body;
+      assert.equal(m.since, after.since);
+      assert.deepEqual(m.pdus, after.pdus);
+      assert.deepEqual(m.rpCauses, after.rpCauses);
+      assert.deepEqual(m.statusReports.byTpSt, after.statusReports.byTpSt);
+      assert.deepEqual(m.sgd.operationsIn, after.sgd.operationsIn);
+      for (const k of ['mo_received', 'mo_accepted', 'mo_rejected', 'mo_forwarded', 'mt_originated', 'mt_attempts', 'mt_delivered', 'status_reports_generated', 'status_reports_sent']) {
+        assert.equal(m.counters[k], after.counters[k], k);
+      }
+      assert.deepEqual(m.sgd.results['SRI-for-SM'], after.sgd.results['SRI-for-SM']);
+      assert.ok(m.consistency.every(x => x.ok), JSON.stringify(m.consistency, null, 1));
+    } finally { f.close(); fs.rmSync(dir3, { recursive: true, force: true }); }
+  });
+}
+
+await t('metrics: each consistency check reports ok:false with a useful detail when its own counter is skewed, the others stay ok', async () => {
+  const modPath = path.join(root, 'board/plugins/holminator/index.js');
+  const dirC = fs.mkdtempSync(path.join(os.tmpdir(), 'holminator-consistency-'));
+  const cached = require.cache[require.resolve(modPath)];
+  delete require.cache[require.resolve(modPath)];
+  const p = require(modPath);
+  require.cache[require.resolve(modPath)] = cached;
+  try {
+    p.init({ dataDir: dirC });
+    const mx = p._st.metrics;
+    const checks = () => Object.fromEntries(p._internals.metricsSnapshot().consistency.map(c => [c.name, c]));
+    const skews = {
+      mo_pdus: [mx.pdus.in, 'RP-DATA/SMS-SUBMIT', /^1 != 0: in RP-DATA\/SMS-SUBMIT/],
+      mt_attempts_forwarded: [mx.pdus.out, 'RP-DATA/SMS-DELIVER', /^0 != 1: mt_attempts == out RP-DATA/],
+      mt_attempts_answered: [mx.pdus.in, 'none/no-report', /^0 != 1: mt_attempts == in RP-ACK/],
+      status_reports: [mx.counters, 'status_reports_generated', /^1 != 0: generated == delivered/],
+      mo_store: [mx.counters, 'mo_received', /^1 != 0: mo_received == MO records/],
+    };
+    assert.ok(Object.values(checks()).every(c => c.ok), 'all ok before skewing');
+    assert.deepEqual(Object.keys(checks()), Object.keys(skews), 'every check is exercised');
+    for (const [name, [map, key, detail]] of Object.entries(skews)) {
+      map[key]++;
+      const cs = checks();
+      assert.equal(cs[name].ok, false, `${name} must fail when ${key} is skewed`);
+      assert.match(cs[name].detail, detail, `${name} detail`);
+      for (const [other, c] of Object.entries(cs)) if (other !== name) assert.equal(c.ok, true, `${other} stays ok while ${name} is skewed`);
+      assert.match(p._internals.metricsText(), new RegExp(`smsc_consistency_ok\\{check="${name}"\\} 0`));
+      map[key]--;
+    }
+    assert.ok(Object.values(checks()).every(c => c.ok), 'all ok again after restoring');
+  } finally {
+    for (const tm of p._st.timers) clearInterval(tm);
+    fs.rmSync(dirC, { recursive: true, force: true });
+  }
 });
 
 srv.close(); fake.close();

@@ -46,6 +46,55 @@ function renderHeader(m) {
   hb.textContent = m.nrf.lastHeartbeatAt ? `heartbeat ${m.nrf.lastHeartbeatStatus} ${ago(m.nrf.lastHeartbeatAt)}` : 'heartbeat: none yet';
   hb.className = 'pill ' + (!m.nrf.lastHeartbeatAt ? '' : hbOk ? 'ok' : 'warn');
   $('up').textContent = secs(m.uptimeS * 1000);
+  const cb = consistencyBadge(m), cp = $('consistency');
+  cp.textContent = cb.text;
+  cp.className = 'pill ' + (cb.state === 'ok' ? 'ok' : cb.state === 'bad' ? 'bad' : '');
+  const cf = $('consfail'); cf.replaceChildren(); cf.hidden = !cb.failed.length;
+  for (const f of cb.failed) { const d = el('div'); d.append(el('b', null, f.name), f.detail ? ` — ${f.detail}` : ''); cf.append(d); }
+  const since = countersSince(m);
+  $('since').textContent = since ? `counters since ${new Date(since).toLocaleString()}` : `counters since ${DASH}`;
+  $('since').title = since ? `counters are persisted from ${since} (${ago(since)})` : 'the backend does not report when its counters started';
+}
+
+const numTd = v => el('td', `n${v === DASH ? ' dim' : ''}`, v);
+function renderPanels(m) {
+  const pt = pduTable(m), tb = $('pdus'); tb.replaceChildren();
+  for (const g of pt.groups) {
+    const h = el('tr', 'grp'); const th = el('td', null); th.colSpan = 4;
+    if (g.grp) th.append(el('span', `tag ${g.grp}`, g.grp));
+    th.append(g.title.replace(/^(MO|MT) · /, '')); h.append(th); tb.append(h);
+    for (const r of g.rows) {
+      const tr = el('tr');
+      tr.append(el('td', 'pdu', r.in ? r.in.label : ''), r.in ? numTd(r.in.v) : el('td'), el('td', 'pdu', r.out ? r.out.label : ''), r.out ? numTd(r.out.v) : el('td'));
+      tb.append(tr);
+    }
+  }
+  const rc = rpCauses(m);
+  for (const [id, list] of [['causesin', rc.in], ['causesout', rc.out]]) {
+    const box = $(id); box.replaceChildren();
+    if (!list) { box.append(el('div', 'dim', DASH)); continue; }
+    if (!list.length) { box.append(el('div', 'dim', 'none')); continue; }
+    const dl = el('dl', 'kv');
+    for (const { cause, n } of list) dl.append(el('dt', null, cause), el('dd', 'n', n));
+    box.append(dl);
+  }
+
+  const sp = srPanel(m), ss = $('srstats'); ss.replaceChildren();
+  for (const f of sp.fields) {
+    const d = el('div', `srs ${f.cls}${f.v === DASH ? ' unknown' : f.v ? '' : ' zero'}`);
+    d.append(el('span', 'v', f.v), el('span', 'l', f.k)); d.title = f.hint;
+    ss.append(d);
+  }
+  const tt = $('tpst'); tt.replaceChildren();
+  if (!sp.byTpSt || !sp.byTpSt.length) { const tr = el('tr'); const td = el('td', 'empty', sp.byTpSt ? 'no status reports yet' : DASH); td.colSpan = 3; tr.append(td); tt.append(tr); }
+  else for (const r of sp.byTpSt) { const tr = el('tr'); tr.append(el('td', `c-${r.cls}`, r.code), el('td', null, r.name), numTd(r.n)); tt.append(tr); }
+
+  const so = sgdOps(m), sb = $('sgdops'); sb.replaceChildren();
+  for (let i = 0; i < Math.max(so.in.length, so.out.length); i++) {
+    const a = so.in[i], b = so.out[i], tr = el('tr');
+    tr.append(el('td', 'peer', a ? a.op : ''), a ? numTd(a.v) : el('td'), el('td', 'peer', b ? b.op : ''), b ? numTd(b.v) : el('td'));
+    sb.append(tr);
+  }
 }
 
 function renderKpis(m) {
@@ -242,6 +291,96 @@ function kpiCards(m, msgs) {
     { grp: 'MT', label: 'Alert-SC received', v: c('alerts_received'), cls: 'mt', subs: [[c('udm_delivery_reports'), 'ReportSM-DeliveryStatus'], [c('alerts_redelivering'), 'redelivered']] },
     { grp: '', label: 'in store', v: ms.total || 0, cls: '', subs: [[bd.MO || 0, 'MO'], [bd.MT || 0, 'MT'], [c('test_requests'), 'test calls']] },
   ];
+}
+// ---------- metrics panels (pure): PDUs, RP-Causes, status reports, SGd operations, consistency ----------
+// A missing key means the backend is older than these panels: show "–", never a made-up 0.
+const DASH = '–';
+const num = v => (typeof v === 'number' && isFinite(v) ? v : DASH);
+const countersSince = m => (m && (m.since || (m.metrics && m.metrics.since) || m.countersSince)) || null;
+
+// TP-Status, TS 23.040 9.2.3.15. 0x00-0x1F completed, 0x20-0x3F temporary (SC still trying), 0x40+ permanent.
+const ST_NAMES = {
+  0x00: 'received by SME', 0x01: 'forwarded, delivery unconfirmed', 0x02: 'replaced by SC',
+  0x20: 'congestion (still trying)', 0x21: 'SME busy (still trying)', 0x22: 'no response from SME (still trying)',
+  0x23: 'service rejected (still trying)', 0x24: 'QoS not available (still trying)', 0x25: 'error in SME (still trying)',
+  0x40: 'remote procedure error', 0x41: 'incompatible destination', 0x42: 'connection rejected by SME', 0x43: 'not obtainable',
+  0x44: 'QoS not available', 0x45: 'no interworking available', 0x46: 'SM validity period expired',
+  0x47: 'SM deleted by originating SME', 0x48: 'SM deleted by SC administration', 0x49: 'SM does not exist',
+  0x60: 'congestion (stopped)', 0x61: 'SME busy (stopped)', 0x62: 'no response from SME (stopped)',
+  0x63: 'service rejected (stopped)', 0x64: 'QoS not available (stopped)', 0x65: 'error in SME (stopped)',
+};
+const stCode = k => { const n = typeof k === 'number' ? k : Number(String(k).trim()); return Number.isInteger(n) && n >= 0 && n <= 255 ? n : null; };
+function stInfo(k) {
+  const n = stCode(k);
+  if (n === null) return { code: String(k), name: 'not a TP-ST value', cls: 'bad' };
+  const name = ST_NAMES[n] || (n < 0x20 ? 'completed (reserved/SC specific)' : n < 0x40 ? 'temporary (reserved/SC specific)' : 'permanent (reserved/SC specific)');
+  return { code: `0x${n.toString(16).padStart(2, '0')}`, name, cls: n < 0x20 ? 'ok' : n < 0x40 ? 'warn' : 'bad' };
+}
+
+// RP/TP PDUs the SMSC receives and sends, paired per direction of the SM: MO (UE -> SMSC) and MT (SMSC -> UE).
+const PDU_GROUPS = [
+  { grp: 'MO', title: 'MO · SMS-SUBMIT and its report', in: ['RP-DATA/SMS-SUBMIT'], out: ['RP-ACK/SMS-SUBMIT-REPORT', 'RP-ERROR/SMS-SUBMIT-REPORT'] },
+  { grp: 'MT', title: 'MT · SMS-DELIVER, SMS-STATUS-REPORT and the UE answer',
+    in: ['RP-ACK/SMS-DELIVER-REPORT', 'RP-ERROR/SMS-DELIVER-REPORT', 'RP-ACK/STATUS-REPORT-ACK', 'none/no-report'],
+    out: ['RP-DATA/SMS-DELIVER', 'RP-DATA/SMS-STATUS-REPORT'] },
+];
+function pduTable(m) {
+  const p = m && m.pdus;
+  const side = d => (p && p[d] && typeof p[d] === 'object' ? p[d] : null);
+  const pin = side('in'), pout = side('out');
+  const cell = (obj, key) => (key ? { label: key.replace('/', ' / '), v: obj ? num(obj[key]) : DASH } : null);
+  const groups = PDU_GROUPS.map(g => {
+    const rows = [];
+    for (let i = 0; i < Math.max(g.in.length, g.out.length); i++) rows.push({ in: cell(pin, g.in[i]), out: cell(pout, g.out[i]) });
+    return { grp: g.grp, title: g.title, rows };
+  });
+  // Keys the backend added that this table does not know yet still show, as "other".
+  const known = new Set(PDU_GROUPS.flatMap(g => [...g.in, ...g.out]));
+  const extraIn = Object.keys(pin || {}).filter(k => !known.has(k)), extraOut = Object.keys(pout || {}).filter(k => !known.has(k));
+  if (extraIn.length || extraOut.length) {
+    const rows = [];
+    for (let i = 0; i < Math.max(extraIn.length, extraOut.length); i++) rows.push({ in: cell(pin, extraIn[i]), out: cell(pout, extraOut[i]) });
+    groups.push({ grp: '', title: 'other', rows });
+  }
+  return { known: !!(pin || pout), groups };
+}
+// RP-Cause breakdown per side, most frequent first; the backend pre-seeds every cause at 0, so only non-zero ones
+// show. null for a side the backend does not report.
+function rpCauses(m) {
+  const r = m && m.rpCauses;
+  const side = d => (r && r[d] && typeof r[d] === 'object' ? Object.entries(r[d]).filter(([, n]) => n !== 0).map(([cause, n]) => ({ cause, n: num(n) })).sort((a, b) => (Number(b.n) || 0) - (Number(a.n) || 0)) : null);
+  return { in: side('in'), out: side('out') };
+}
+const SR_FIELDS = [['generated', '', 'status report records made (TP-SRR outcomes)'], ['sent', 'sr', 'MT-Forward attempts carrying an SMS-STATUS-REPORT'],
+  ['delivered', 'ok', 'acknowledged by the UE (RP-ACK)'], ['failed', 'bad', 'permanent failure'], ['expired', 'bad', 'validity period ended'], ['waiting', 'warn', 'in the store, still to be delivered']];
+function srPanel(m) {
+  const s = m && m.statusReports && typeof m.statusReports === 'object' ? m.statusReports : null;
+  const fields = SR_FIELDS.map(([k, cls, hint]) => ({ k, cls, hint, v: s ? num(s[k]) : DASH }));
+  const bt = s && s.byTpSt && typeof s.byTpSt === 'object' ? s.byTpSt : null;
+  const byTpSt = bt ? Object.entries(bt).map(([k, n]) => ({ ...stInfo(k), n: num(n) })).sort((a, b) => (Number(b.n) || 0) - (Number(a.n) || 0) || a.code.localeCompare(b.code)) : null;
+  return { known: !!s, fields, byTpSt };
+}
+const SGD_OPS = {
+  in: ['MO-Forward-SM', 'Alert-SC'],
+  out: ['SRI-for-SM', 'MT-Forward-SM', 'Report-SM-Delivery-Status', 'NFDiscover', 'NFRegister', 'NFUpdate'],
+};
+function sgdOps(m) {
+  const g = m && m.sgd && typeof m.sgd === 'object' ? m.sgd : null;
+  const side = (key, order) => {
+    const o = g && g[key] && typeof g[key] === 'object' ? g[key] : null;
+    const keys = [...order, ...Object.keys(o || {}).filter(k => !order.includes(k))];
+    // An operation value may be a count or {count|total, ...}: show the count.
+    const val = v => (v && typeof v === 'object' ? num(v.count ?? v.total) : num(v));
+    return keys.map(op => ({ op, v: o ? val(o[op]) : DASH }));
+  };
+  return { known: !!g, in: side('operationsIn', SGD_OPS.in), out: side('operationsOut', SGD_OPS.out) };
+}
+function consistencyBadge(m) {
+  const c = m && m.consistency;
+  if (!Array.isArray(c)) return { state: 'unknown', text: `consistency ${DASH}`, failed: [] };
+  const failed = c.filter(x => !x || x.ok !== true).map(x => ({ name: (x && x.name) || '?', detail: (x && x.detail) || '' }));
+  if (!failed.length) return { state: 'ok', text: `consistent (${c.length} check${c.length === 1 ? '' : 's'})`, failed };
+  return { state: 'bad', text: `inconsistent: ${failed.map(f => f.name).join(', ')}`, failed };
 }
 // ---------- end flow model ----------
 
@@ -652,7 +791,7 @@ async function tick() {
         .then(r => (r.ok ? r.json() : null)).catch(() => null);
       if (one && one.id === selectedId) messages.unshift(one); else selectedId = null;
     }
-    renderHeader(m); renderKpis(m); renderPeersResults(m);
+    renderHeader(m); renderKpis(m); renderPanels(m); renderPeersResults(m);
     renderMessages(); renderFlow();
     await pollLog();
   } catch (e) {

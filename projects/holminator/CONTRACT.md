@@ -145,10 +145,67 @@ before reporting `ABSENT_SUBSCRIBER` and waiting for the next alert. `400 MISSIN
 | `GET /api/messages/<id>` | One message with its history |
 | `GET /log?limit=<n>` | Shared call-flow log, newest first: `{ id, ts, dir, peer, method, path, status, body, ms? }`. Answers we give have `method: null` and the operation name as `path` |
 | `GET /api/log?since=<n>` | Incoming and outgoing messages: `{ id, ts, dir, peer, what, status, body, ms? }` |
-| `GET /api/metrics` | Counters, results per operation, per-peer in/out/errors/latency, NRF health, messages by status and by direction. MO counters: `mo_received` (every MO request), `mo_accepted`, `mo_rejected`, `mo_forwarded`, `mo_expired`. MT counters: `mt_originated` (only `/api/mt` plus status reports), `mt_attempts`, `mt_delivered`, `mt_failed`, `mt_expired`, `status_reports_generated`, `status_reports_sent` |
-| `GET /metrics` | The same in Prometheus text format (`smsc_*`) |
-| `GET /kpi` | Common KPI summary (tompa, #build 142): `{ nf: "SMSC", up: true, requests, errors, latencyMs, extra: { mo_accepted, mt_delivered, mt_failed, waiting, status_reports_sent, alerts_received, registeredInNrf } }`. `requests`: inbound peer requests we answered; `errors`: our answers with status >= 400 plus outbound peer errors (no answer or 5xx); `latencyMs`: average outbound peer latency (0 before the first call); `waiting`: messages in WAITING now. Counters reset on restart |
+| `GET /api/metrics` | Counters, PDUs, RP-Causes, status reports, SGd operations and self-checks; schema below. Persisted in `store.json` with the messages, so they survive a deploy; `since` is when they started counting, `startedAt` is this process |
+| `GET /metrics` | The same in Prometheus text format (`smsc_*`): `smsc_<counter>_total`, `smsc_pdus_total{dir,type}`, `smsc_rp_causes_total{dir,cause}`, `smsc_status_reports_total{outcome}`, `smsc_status_reports_waiting`, `smsc_status_reports_by_tp_st_total{tp_st}`, `smsc_sgd_operations_total{dir,operation}`, `smsc_consistency_ok{check}` |
+| `GET /kpi` | Common KPI summary (tompa, #build 142): `{ nf: "SMSC", up: true, requests, errors, latencyMs, extra: { mo_accepted, mt_delivered, mt_failed, waiting, status_reports_sent, alerts_received, registeredInNrf, pdus_in, pdus_out, consistent } }`. `requests`: inbound peer requests we answered; `errors`: our answers with status >= 400 plus outbound peer errors (no answer or 5xx); `latencyMs`: average outbound peer latency (0 before the first call); `waiting`: messages in WAITING now; `pdus_in`/`pdus_out`: totals of `pdus.in`/`pdus.out`; `consistent`: every consistency check is ok. Counters persist across restarts |
 | `GET /status` | `{ nfInstanceId, registeredInNrf, messages }` |
+
+### `GET /api/metrics` schema
+
+Every key below exists from the start with value 0 (no key appears only after its first use).
+
+```
+{ nf, team, nfInstanceId, scAddress, startedAt, uptimeS, since, nrf: {...},
+  counters: { <name>: n },              // all pre-seeded, see list
+  results: { <operation>: { <result>: n } },
+  peers: { <peer>: { in, out, errors, calls, latencyMsSum, latencyMsMax, latencyMsAvg } },
+  messages: { total, byStatus, byDirection },
+  pdus: {
+    in:  { "RP-DATA/SMS-SUBMIT", "RP-ACK/SMS-DELIVER-REPORT", "RP-ACK/STATUS-REPORT-ACK",
+           "RP-ERROR/SMS-DELIVER-REPORT", "none/no-report" },
+    out: { "RP-ACK/SMS-SUBMIT-REPORT", "RP-ERROR/SMS-SUBMIT-REPORT", "RP-DATA/SMS-DELIVER", "RP-DATA/SMS-STATUS-REPORT" } },
+  rpCauses: { in: { "22 MEMORY_CAPACITY_EXCEEDED": n, ... }, out: { ... } },   // every TS 24.011 8.2.5.4 cause
+  statusReports: { generated, sent, delivered, failed, expired, waiting, byTpSt: { "0x00": n, ... } },
+  sgd: { results,                      // same object as top-level results
+         operationsOut: { "SRI-for-SM", "MT-Forward-SM", "Report-SM-Delivery-Status", "NFDiscover", "NFRegister", "NFUpdate" },
+         operationsIn:  { "MO-Forward-SM", "Alert-SC" } },
+  consistency: [ { name, ok, detail } ] }
+```
+
+- `pdus.in["RP-DATA/SMS-SUBMIT"]`: every MO request. `pdus.out` SUBMIT-REPORT: one RP-ACK per accepted MO (dry runs
+  too) or one RP-ERROR per rejected MO (with or without a TP-FCS).
+- `pdus.out["RP-DATA/SMS-DELIVER"]` and `["RP-DATA/SMS-STATUS-REPORT"]`: one per MT-Forward sent. Its answer counts in
+  `pdus.in` by the RP message in `deliveryReport`: RP-ACK (`SMS-DELIVER-REPORT` for an SMS, `STATUS-REPORT-ACK` for a
+  status report), RP-ERROR (any cause), or `none/no-report` when there is no deliveryReport (or no answer).
+- `rpCauses.in`: the cause in a UE RP-ERROR. `rpCauses.out`: the RP-Cause the SMSF should give the UE for our MO
+  rejection: 5555 `SC_CONGESTION` gives 42, any other 5555 gives 21, 5004 gives 95, 5005 gives 96, 5552 gives 69, and
+  5012 gives 38.
+- `statusReports`:
+  - `generated`: records made for TP-SRR.
+  - `sent`: MT-Forward attempts that carry one.
+  - `delivered`: acknowledged by the UE, the same as the counter `status_reports_sent`.
+  - `failed`, `expired`.
+  - `waiting`: currently PENDING, DELIVERING or WAITING.
+  - `byTpSt`: generated per TP-ST.
+- Counters:
+  - General: `requests_in`, `answers_error`, `test_requests`, `store_evicted`.
+  - MO: `mo_received`, `mo_accepted`, `mo_rejected`, `mo_dry_runs`, `mo_duplicates_accepted`, `mo_forwarded`, `mo_expired`.
+  - MT: `mt_originated`, `mt_attempts`, `mt_forward_not_sent` (an attempt that ended before the MT-Forward: no UDM,
+    SRI failure, SMSF not found), `mt_delivered`, `mt_failed`, `mt_expired`, `mt_absent`, `mt_retries_scheduled`,
+    `mt_rp_error_temporary`, `mt_attempts_exhausted`, `mt_alert_fast_retries`.
+  - UDM and alerts: `sri_requests`, `udm_delivery_reports`, `alerts_received`, `alerts_redelivering`.
+  - Status reports: `status_reports_generated`, `status_reports_sent`, `status_reports_failed`, `status_reports_expired`.
+  - NRF: `nrf_register_attempts`, `nrf_registrations`, `nrf_heartbeats_ok`, `nrf_heartbeats_failed`,
+    `nrf_discoveries`, `nrf_discoveries_empty`, `nrf_discovery_cache_hits`.
+- `consistency`. Attempts still in flight are added on the right-hand side, so the checks also hold mid-attempt.
+
+  | name | check |
+  | --- | --- |
+  | `mo_pdus` | in `RP-DATA/SMS-SUBMIT` == out `RP-ACK/SMS-SUBMIT-REPORT` + out `RP-ERROR/SMS-SUBMIT-REPORT` |
+  | `mt_attempts_forwarded` | `mt_attempts` == out `RP-DATA/SMS-DELIVER` + out `RP-DATA/SMS-STATUS-REPORT` + `mt_forward_not_sent` |
+  | `mt_attempts_answered` | `mt_attempts` == in RP-ACK (both) + in RP-ERROR + in `none/no-report` + `mt_forward_not_sent` |
+  | `status_reports` | `generated` == `delivered` + `failed` + `expired` + `waiting` (only reports generated since `since`) |
+  | `mo_store` | `mo_received` == MO records stored since `since` + `mo_rejected` + `mo_dry_runs`. If `store_evicted` > 0 this check is skipped and reported as ok, with the reason in `detail` |
 
 Tile: `https://smsf.torget.bjarby.com/colony/holminator/`: metrics, message store with history, live log and a
 test console.

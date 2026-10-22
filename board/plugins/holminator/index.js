@@ -30,22 +30,69 @@ const st = {
   disc: new Map(), // nfType or nfType/instanceId -> { base, ts }
   dataDir: null,
   timers: [],
-  metrics: newMetrics(),
+  metrics: null, // newMetrics(), set below once the key lists exist
   inflight: new Set(), // recipients with an SMS-DELIVER outstanding: only one at a time per MS (TS 23.040 6.2)
   lastScts: new Map(), // recipient -> last TP-SCTS second used, so timestamps stay unique per MS
 };
 
-// Counters reset on restart; message totals by status come from the persisted store instead.
+// Every known counter, PDU, RP-Cause, TP-ST and SGd operation key starts at 0, so a missing key is never a silent 0.
+// Counters are persisted in store.json with the messages (saveStore/loadStore); since is when they started counting.
+const COUNTERS = [
+  'requests_in', 'answers_error', 'test_requests', 'store_evicted',
+  'mo_received', 'mo_accepted', 'mo_rejected', 'mo_dry_runs', 'mo_duplicates_accepted', 'mo_forwarded', 'mo_expired',
+  'mt_originated', 'mt_attempts', 'mt_forward_not_sent', 'mt_delivered', 'mt_failed', 'mt_expired', 'mt_absent',
+  'mt_retries_scheduled', 'mt_rp_error_temporary', 'mt_attempts_exhausted', 'mt_alert_fast_retries',
+  'sri_requests', 'udm_delivery_reports', 'alerts_received', 'alerts_redelivering',
+  'status_reports_generated', 'status_reports_sent', 'status_reports_failed', 'status_reports_expired',
+  'nrf_register_attempts', 'nrf_registrations', 'nrf_heartbeats_ok', 'nrf_heartbeats_failed',
+  'nrf_discoveries', 'nrf_discoveries_empty', 'nrf_discovery_cache_hits',
+];
+const PDUS_IN = ['RP-DATA/SMS-SUBMIT', 'RP-ACK/SMS-DELIVER-REPORT', 'RP-ACK/STATUS-REPORT-ACK', 'RP-ERROR/SMS-DELIVER-REPORT', 'none/no-report'];
+const PDUS_OUT = ['RP-ACK/SMS-SUBMIT-REPORT', 'RP-ERROR/SMS-SUBMIT-REPORT', 'RP-DATA/SMS-DELIVER', 'RP-DATA/SMS-STATUS-REPORT'];
+const OPS_OUT = ['SRI-for-SM', 'MT-Forward-SM', 'Report-SM-Delivery-Status', 'NFDiscover', 'NFRegister', 'NFUpdate'];
+const OPS_IN = ['MO-Forward-SM', 'Alert-SC'];
+// "22 MEMORY_CAPACITY_EXCEEDED": number plus the TS 24.011 8.2.5.4 name in upper snake case.
+const rpCauseKey = c => `${c} ${String(tpdu.RP_CAUSE[c] || 'Unknown RP-Cause').toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, '')}`;
+const tpStKey = v => `0x${Number(v).toString(16).padStart(2, '0')}`;
+const zeros = keys => Object.fromEntries(keys.map(k => [k, 0]));
 function newMetrics() {
+  const now = new Date().toISOString();
+  const causes = Object.keys(tpdu.RP_CAUSE).map(Number).map(rpCauseKey);
   return {
-    startedAt: new Date().toISOString(),
-    counters: {},
+    startedAt: now, // this process
+    since: now, // when the persisted counters started counting (kept across restarts)
+    counters: zeros(COUNTERS),
     results: {}, // operation -> result -> count, for every answer we give and every answer we get
     peers: {}, // peer -> { in, out, errors, latencyMsSum, latencyMsMax, calls }
     nrf: { lastHeartbeatAt: null, lastHeartbeatStatus: null, lastRegisteredAt: null },
+    pdus: { in: zeros(PDUS_IN), out: zeros(PDUS_OUT) },
+    rpCauses: { in: zeros(causes), out: zeros(causes) },
+    byTpSt: zeros([...new Set([...Object.values(tpdu.ST), 0x60].map(tpStKey))].sort()),
+    operationsOut: zeros(OPS_OUT),
+    operationsIn: zeros(OPS_IN),
   };
 }
+st.metrics = newMetrics();
+// Persisted parts of st.metrics, merged over fresh pre-seeded defaults on load.
+const PERSISTED = ['since', 'counters', 'results', 'peers', 'pdus', 'rpCauses', 'byTpSt', 'operationsOut', 'operationsIn'];
+function restoreMetrics(saved) {
+  const m = newMetrics();
+  if (!saved || typeof saved !== 'object') return m;
+  if (saved.since) m.since = saved.since;
+  for (const k of ['counters', 'results', 'peers', 'byTpSt', 'operationsOut', 'operationsIn']) Object.assign(m[k], saved[k] || {});
+  for (const k of ['pdus', 'rpCauses']) for (const d of ['in', 'out']) Object.assign(m[k][d], (saved[k] && saved[k][d]) || {});
+  return m;
+}
 function inc(name, n = 1) { st.metrics.counters[name] = (st.metrics.counters[name] || 0) + n; }
+function bump(map, key, n = 1) { map[key] = (map[key] || 0) + n; }
+function pdu(dir, key) { bump(st.metrics.pdus[dir], key); }
+function rpCause(dir, c) { if (c !== null && c !== undefined) bump(st.metrics.rpCauses[dir], rpCauseKey(c)); }
+// SGd/NRF operation names per Diameter-style operation; call() passes its op label.
+const OP_NAME = { 'MT-Forward-Short-Message': 'MT-Forward-SM', 'NFUpdate (heartbeat)': 'NFUpdate' };
+function countOp(dir, op) { bump(dir === 'out' ? st.metrics.operationsOut : st.metrics.operationsIn, OP_NAME[op] || op); }
+// In-flight MT attempts, so the consistency checks hold while an attempt runs: counted but no forward sent yet
+// (openNoFwd), forward sent but no answer yet (openFwd). Not persisted: a restart ends every attempt.
+const mtOpen = { noFwd: 0, fwd: 0 };
 function countResult(op, result) {
   const r = st.metrics.results[op] || (st.metrics.results[op] = {});
   r[result] = (r[result] || 0) + 1;
@@ -68,12 +115,14 @@ function loadStore() {
     const s = JSON.parse(fs.readFileSync(f, 'utf8'));
     st.messages = Array.isArray(s.messages) ? s.messages : [];
     st.msgSeq = s.msgSeq || st.messages.length;
+    if (s.metrics) st.metrics = { ...restoreMetrics(s.metrics), startedAt: st.metrics.startedAt, nrf: st.metrics.nrf };
   } catch (e) { console.error(`[${TEAM}] store:`, e.message); }
 }
 function saveStore() {
   const f = storeFile();
   if (!f) return;
-  try { fs.writeFileSync(f, JSON.stringify({ msgSeq: st.msgSeq, messages: st.messages })); }
+  const metrics = Object.fromEntries(PERSISTED.map(k => [k, st.metrics[k]]));
+  try { fs.writeFileSync(f, JSON.stringify({ msgSeq: st.msgSeq, messages: st.messages, metrics })); }
   catch (e) { console.error(`[${TEAM}] store:`, e.message); }
 }
 
@@ -104,6 +153,7 @@ async function call(peer, method, url, body, { quiet = false, op = null } = {}) 
     if (op) countResult(op, status === 0 ? 'NO_ANSWER' : ((json && json.result) || String(status)));
     return ms;
   };
+  if (op) countOp('out', op);
   try {
     const r = await fetch(url, {
       method,
@@ -228,7 +278,7 @@ function inbound(peer, what, body) {
 
 function saveMessage(m) {
   st.messages.push(m);
-  if (st.messages.length > STORE_MAX) st.messages.shift();
+  if (st.messages.length > STORE_MAX) { st.messages.shift(); inc('store_evicted'); }
   saveStore();
   return m;
 }
@@ -268,6 +318,17 @@ const MO_SCENARIOS = {
   NO_ANSWER: { delayMs: 30000, what: 'SUCCESS after 30 s, past every caller timeout' },
 };
 
+// Every MO answer is one RP-ACK or RP-ERROR towards the UE (the SMSF builds the RP layer from our answer). The
+// RP-Cause it would carry for a rejection (TS 24.011 8.2.5.4), by our Diameter result: 5004 -> 95 semantically incorrect,
+// 5005 -> 96 invalid mandatory information, 5552 -> 69 facility not implemented, 5012 -> 38 network out of order,
+// 5555 -> 42 congestion for SC_CONGESTION, else 21 short message transfer rejected.
+const MO_RP_CAUSE = { 5004: 95, 5005: 96, 5552: 69, 5012: 38 };
+function moRejected(cause) {
+  inc('mo_rejected');
+  pdu('out', 'RP-ERROR/SMS-SUBMIT-REPORT');
+  rpCause('out', cause);
+}
+
 const sameAddr = (a, b) => tpdu.digitsOf(a) === tpdu.digitsOf(b);
 const sleep = ms => new Promise(r => { const t = setTimeout(r, ms); if (t.unref) t.unref(); });
 const flag = (url, name) => !!url && ['1', 'true', 'yes'].includes(String(url.searchParams.get(name) || '').toLowerCase());
@@ -281,15 +342,17 @@ async function moForward(req, res, url) {
   const dryRun = flag(url, 'dryRun');
   let b;
   inc('mo_received');
+  pdu('in', 'RP-DATA/SMS-SUBMIT');
+  countOp('in', 'MO-Forward-SM');
   if (scenarioName || dryRun) inc('test_requests');
   try { b = await readJson(req); } catch {
     inbound('smsf', 'POST /smsc/mo-forward-short-message', 'invalid JSON');
-    inc('mo_rejected');
+    moRejected(95);
     return reply(res, 'smsf', what, 400, { result: 'UNEXPECTED_DATA_VALUE', diameterResultCode: 5004, detail: 'body is not JSON' });
   }
   inbound('smsf', `POST /smsc/mo-forward-short-message${scenarioName ? ` [scenario ${scenarioName}]` : ''}${dryRun ? ' [dry run]' : ''}`, b);
-  const bad = (status, body) => { inc('mo_rejected'); return reply(res, 'smsf', what, status, body); };
-  const fail = (cause, fcs, detail) => { inc('mo_rejected'); return moFailure(res, cause, fcs, detail); };
+  const bad = (status, body) => { moRejected(MO_RP_CAUSE[body.diameterResultCode] || 111); return reply(res, 'smsf', what, status, body); };
+  const fail = (cause, fcs, detail) => { moRejected(cause === 'SC_CONGESTION' ? 42 : 21); return moFailure(res, cause, fcs, detail); };
 
   let sc = null;
   if (scenarioName) {
@@ -347,6 +410,7 @@ async function moForward(req, res, url) {
   const report = { hex: tpdu.bytesToHex(tpdu.encodeSubmitReportAck(now)) };
   if (dryRun) {
     inc('mo_dry_runs');
+    pdu('out', 'RP-ACK/SMS-SUBMIT-REPORT');
     return reply(res, 'smsf', what, 200, {
       result: 'SUCCESS', diameterResultCode: 2001, messageId: null, dryRun: true, deliveryReport: report,
       decoded: { from, supi, to, text: s.text, mr: s.mr, srr: s.srr, rd: s.rd, dcs: s.dcs, rpWrapped: !!mo.rp, vpFormat: s.vpFormat, singleShot: !!s.singleShot, expiresAt },
@@ -368,6 +432,7 @@ async function moForward(req, res, url) {
   });
 
   inc('mo_accepted');
+  pdu('out', 'RP-ACK/SMS-SUBMIT-REPORT');
   reply(res, 'smsf', what, 200, {
     result: 'SUCCESS', diameterResultCode: 2001, messageId: msg.id, deliveryReport: report,
   });
@@ -455,7 +520,25 @@ function kick(to) {
 
 function expired(m) { return m.expiresAt && Date.now() > Date.parse(m.expiresAt); }
 
+// Wrapper so every counted attempt ends in exactly one of: forward answered (pdus.in) or mt_forward_not_sent.
 async function attemptMt(m) {
+  const a = { counted: false, sent: false, answered: false };
+  try { return await attemptMtOnce(m, a); } finally {
+    if (a.counted && !a.sent) { mtOpen.noFwd--; inc('mt_forward_not_sent'); }
+    if (a.sent && !a.answered) { mtOpen.fwd--; pdu('in', 'none/no-report'); }
+  }
+}
+
+// Which RP message came back in the MT-Forward answer (TS 24.011 7.3): counted per PDU, RP-ERROR also per cause.
+function countMtAnswer(m, fwd) {
+  const hex = fwd.body && fwd.body.deliveryReport && fwd.body.deliveryReport.hex;
+  const mti = hex && /^[0-9a-f]{2}/i.test(hex) ? parseInt(hex.slice(0, 2), 16) & 7 : -1;
+  if (mti === 2 || mti === 3) return pdu('in', m.kind === 'STATUS_REPORT' ? 'RP-ACK/STATUS-REPORT-ACK' : 'RP-ACK/SMS-DELIVER-REPORT');
+  if (mti === 4 || mti === 5) { pdu('in', 'RP-ERROR/SMS-DELIVER-REPORT'); return rpCause('in', tpdu.rpErrorCause(hex)); }
+  return pdu('in', 'none/no-report');
+}
+
+async function attemptMtOnce(m, a) {
   if (m.direction === 'MO') return onMoAccepted(m); // an MO never goes out as MT (legacy relay records)
   if (expired(m)) return expire(m);
   m.attempts = (m.attempts || 0) + 1;
@@ -464,6 +547,7 @@ async function attemptMt(m) {
   m.viaAlert = false;
   setStatus(m, 'DELIVERING', `attempt ${m.attempts}`);
   inc('mt_attempts');
+  a.counted = true; mtOpen.noFwd++;
 
   const udm = await resolve('UDM');
   if (!udm) return retryLater(m, 'no UDM in the NRF');
@@ -493,9 +577,13 @@ async function attemptMt(m) {
   const more = st.messages.some(x => x !== m && x.to === m.to && x.status === 'PENDING');
   const hex = tpdu.bytesToHex(buildMtTpdu(m, more));
   m.tpduHex = hex;
+  pdu('out', m.kind === 'STATUS_REPORT' ? 'RP-DATA/SMS-STATUS-REPORT' : 'RP-DATA/SMS-DELIVER');
+  a.sent = true; mtOpen.noFwd--; mtOpen.fwd++;
   const fwd = await call('smsf', 'POST', `${smsf}/smsc/mt-forward-short-message`, {
     supi, msisdn: m.to, scAddress: SC_ADDRESS, sms: { hex }, smsRecordId: `${m.id}-${m.attempts}`, moreMessagesToSend: more,
   }, { op: 'MT-Forward-Short-Message' });
+  a.answered = true; mtOpen.fwd--;
+  countMtAnswer(m, fwd);
   const fr = fwd.body && fwd.body.result;
   if (fwd.body && fwd.body.deliveryReport && fwd.body.deliveryReport.hex) m.deliveryReportHex = fwd.body.deliveryReport.hex;
   hist(m, 'MT-Forward-Short-Message', `${fwd.status} ${fr || fwd.error || ''}`.trim());
@@ -585,7 +673,7 @@ function fail(m, stValue, detail) {
 
 function expire(m) {
   setStatus(m, 'EXPIRED', `validity period ended ${m.expiresAt}`);
-  inc(m.direction === 'MO' ? 'mo_expired' : 'mt_expired');
+  inc(m.direction === 'MO' ? 'mo_expired' : m.kind === 'STATUS_REPORT' ? 'status_reports_expired' : 'mt_expired');
   statusReport(m, tpdu.ST.VALIDITY_PERIOD_EXPIRED);
 }
 
@@ -603,6 +691,7 @@ function statusReport(orig, stValue) {
     history: [{ ts: now.toISOString(), event: 'PENDING', detail: `TP-ST 0x${stValue.toString(16).padStart(2, '0')} for ${orig.id}` }],
   });
   inc('status_reports_generated');
+  bump(st.metrics.byTpSt, tpStKey(stValue));
   inc('mt_originated');
   orig.statusReportId = sr.id;
   saveStore();
@@ -642,6 +731,7 @@ async function alertServiceCentre(req, res) {
   const what = 'Alert-Service-Centre';
   let b;
   inc('alerts_received');
+  countOp('in', 'Alert-SC');
   try { b = await readJson(req); } catch {
     inbound('udm', 'POST /smsc/alert-service-centre', 'invalid JSON');
     return reply(res, 'udm', what, 400, { result: 'UNEXPECTED_DATA_VALUE', diameterResultCode: 5004, detail: 'body is not JSON' });
@@ -716,11 +806,56 @@ function metricsSnapshot() {
     nf: 'SMSC', team: TEAM, nfInstanceId: NF_ID, scAddress: SC_ADDRESS,
     startedAt: st.metrics.startedAt, uptimeS: Math.round((Date.now() - Date.parse(st.metrics.startedAt)) / 1000),
     nrf: { team: NRF_TEAM, registered: st.registered, ...st.metrics.nrf },
+    since: st.metrics.since,
     counters: { ...st.metrics.counters },
     results: st.metrics.results,
     peers,
     messages: { total: st.messages.length, byStatus, byDirection },
+    pdus: { in: { ...st.metrics.pdus.in }, out: { ...st.metrics.pdus.out } },
+    rpCauses: { in: { ...st.metrics.rpCauses.in }, out: { ...st.metrics.rpCauses.out } },
+    statusReports: statusReportStats(),
+    sgd: { results: st.metrics.results, operationsOut: { ...st.metrics.operationsOut }, operationsIn: { ...st.metrics.operationsIn } },
+    consistency: consistency(),
   };
+}
+
+const sinceCounting = m => !m.submittedAt || Date.parse(m.submittedAt) >= Date.parse(st.metrics.since);
+function statusReportStats() {
+  const c = st.metrics.counters;
+  return {
+    generated: c.status_reports_generated, // SMS-STATUS-REPORT records made (TP-SRR outcomes)
+    sent: st.metrics.pdus.out['RP-DATA/SMS-STATUS-REPORT'], // MT-Forward attempts carrying one
+    delivered: c.status_reports_sent, // acknowledged by the UE (the counter keeps its old name)
+    failed: c.status_reports_failed,
+    expired: c.status_reports_expired,
+    waiting: st.messages.filter(m => m.kind === 'STATUS_REPORT' && ACTIVE.includes(m.status)).length, // current
+    byTpSt: { ...st.metrics.byTpSt },
+  };
+}
+
+// Self-checks over the counters: every PDU in has its PDU out, every MT attempt ends in an answer or a reason.
+// Attempts still running are counted as open (mtOpen), so the checks also hold mid-attempt.
+function consistency() {
+  const c = st.metrics.counters, pin = st.metrics.pdus.in, pout = st.metrics.pdus.out;
+  const out = [];
+  const chk = (name, left, right, detail) => out.push({ name, ok: left === right, detail: `${left} ${left === right ? '==' : '!='} ${right}: ${detail}` });
+  chk('mo_pdus', pin['RP-DATA/SMS-SUBMIT'], pout['RP-ACK/SMS-SUBMIT-REPORT'] + pout['RP-ERROR/SMS-SUBMIT-REPORT'],
+    'in RP-DATA/SMS-SUBMIT == out RP-ACK + RP-ERROR SMS-SUBMIT-REPORT');
+  const fwds = pout['RP-DATA/SMS-DELIVER'] + pout['RP-DATA/SMS-STATUS-REPORT'];
+  chk('mt_attempts_forwarded', c.mt_attempts, fwds + c.mt_forward_not_sent + mtOpen.noFwd,
+    `mt_attempts == out RP-DATA SMS-DELIVER + SMS-STATUS-REPORT (${fwds}) + mt_forward_not_sent (${c.mt_forward_not_sent}) + starting now (${mtOpen.noFwd})`);
+  const answers = pin['RP-ACK/SMS-DELIVER-REPORT'] + pin['RP-ACK/STATUS-REPORT-ACK'] + pin['RP-ERROR/SMS-DELIVER-REPORT'] + pin['none/no-report'];
+  chk('mt_attempts_answered', c.mt_attempts, answers + c.mt_forward_not_sent + mtOpen.noFwd + mtOpen.fwd,
+    `mt_attempts == in RP-ACK (both) + RP-ERROR + none/no-report (${answers}) + mt_forward_not_sent (${c.mt_forward_not_sent}) + in flight (${mtOpen.noFwd + mtOpen.fwd})`);
+  const sr = statusReportStats();
+  const srWaiting = st.messages.filter(m => m.kind === 'STATUS_REPORT' && ACTIVE.includes(m.status) && sinceCounting(m)).length;
+  chk('status_reports', sr.generated, sr.delivered + sr.failed + sr.expired + srWaiting,
+    `generated == delivered + failed + expired + waiting (${srWaiting} generated since ${st.metrics.since})`);
+  const moStored = st.messages.filter(m => m.direction === 'MO' && sinceCounting(m)).length;
+  if (c.store_evicted) out.push({ name: 'mo_store', ok: true, detail: `not checked: ${c.store_evicted} message(s) evicted from the store (max ${STORE_MAX})` });
+  else chk('mo_store', c.mo_received, moStored + c.mo_rejected + c.mo_dry_runs,
+    `mo_received == MO records stored since ${st.metrics.since} (${moStored}) + mo_rejected (${c.mo_rejected}) + mo_dry_runs (${c.mo_dry_runs})`);
+  return out;
 }
 
 // GET /kpi: the common KPI summary every NF team offers (tompa, #build 142). Derived from the metrics above.
@@ -744,6 +879,9 @@ function kpi() {
       status_reports_sent: c.status_reports_sent || 0,
       alerts_received: c.alerts_received || 0,
       registeredInNrf: st.registered,
+      pdus_in: Object.values(st.metrics.pdus.in).reduce((s, v) => s + v, 0),
+      pdus_out: Object.values(st.metrics.pdus.out).reduce((s, v) => s + v, 0),
+      consistent: consistency().every(x => x.ok),
     },
   };
 }
@@ -798,6 +936,15 @@ function metricsText() {
     line('peer_latency_ms_sum', { peer }, p.latencyMsSum);
   }
   for (const [s, v] of Object.entries(m.messages.byStatus)) line('messages', { status: s }, v);
+  for (const dir of ['in', 'out']) {
+    for (const [type, v] of Object.entries(m.pdus[dir])) line('pdus_total', { dir, type }, v);
+    for (const [cause, v] of Object.entries(m.rpCauses[dir])) line('rp_causes_total', { dir, cause }, v);
+  }
+  for (const [k, v] of Object.entries(m.statusReports)) if (k !== 'byTpSt') line(k === 'waiting' ? 'status_reports_waiting' : 'status_reports_total', k === 'waiting' ? {} : { outcome: k }, v);
+  for (const [tpSt, v] of Object.entries(m.statusReports.byTpSt)) line('status_reports_by_tp_st_total', { tp_st: tpSt }, v);
+  for (const [operation, v] of Object.entries(m.sgd.operationsOut)) line('sgd_operations_total', { dir: 'out', operation }, v);
+  for (const [operation, v] of Object.entries(m.sgd.operationsIn)) line('sgd_operations_total', { dir: 'in', operation }, v);
+  for (const ck of m.consistency) line('consistency_ok', { check: ck.name }, ck.ok ? 1 : 0);
   return out.join('\n') + '\n';
 }
 

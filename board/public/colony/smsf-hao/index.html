@@ -18,6 +18,16 @@
   .counters div { background:#161b22; border:1px solid var(--line); border-radius:6px; padding:6px 10px; }
   .counters b { color:var(--acc); font-size:16px; display:block; }
   .counters span { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  .kpi { display:grid; gap:10px; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); margin-bottom:14px; }
+  .kpi div { background:#161b22; border:1px solid var(--line); border-radius:6px; padding:8px 10px; }
+  .kpi b { font-size:18px; display:block; color:var(--acc); }
+  .kpi b.ok { color:var(--ok); } .kpi b.warn { color:var(--warn); }
+  .kpi span { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  .kpi em { color:var(--dim); font-style:normal; font-size:11px; display:block; margin-top:2px; }
+  .bar { height:4px; background:var(--line); border-radius:2px; margin-top:6px; overflow:hidden; }
+  .bar i { display:block; height:100%; background:var(--ok); }
+  .bar i.warn { background:var(--warn); }
+  .alert { background:#2d1e00; border:1px solid var(--warn); color:var(--warn); border-radius:6px; padding:8px 10px; margin-bottom:14px; font-size:12px; }
   table { width:100%; border-collapse:collapse; }
   th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--dim); font-weight:normal; padding:4px 8px 4px 0; border-bottom:1px solid var(--line); }
   td { padding:5px 8px 5px 0; border-bottom:1px solid var(--line); vertical-align:top; word-break:break-all; }
@@ -38,10 +48,13 @@
 </header>
 <main>
   <section>
+    <h2>KPIs <span id="kpiage" style="text-transform:none;letter-spacing:0"></span></h2>
+    <div class="alert" id="alert" hidden></div>
+    <div class="kpi" id="kpi"></div>
     <h2>Registered network functions</h2>
     <div class="counters" id="counters"></div>
     <table>
-      <thead><tr><th>type</th><th>status</th><th>services</th><th>apiRoot</th><th>last seen</th></tr></thead>
+      <thead><tr><th>type</th><th>status</th><th>services</th><th>apiRoot</th><th>heartbeat</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
     <div class="empty" id="empty">loading…</div>
@@ -55,22 +68,93 @@
   Register: <code>PUT /t/smsf-hao/nnrf-nfm/v1/nf-instances/{nfInstanceId}</code> &middot;
   heartbeat: <code>PATCH</code> with <code>[]</code> &middot;
   discover: <code>GET /t/smsf-hao/nnrf-disc/v1/nf-instances?target-nf-type=UDM&amp;requester-nf-type=SMSF</code>.
+  KPIs: <code>GET /t/smsf-hao/kpi</code> (JSON) &middot; <code>GET /t/smsf-hao/metrics</code> (Prometheus).
   Full contract and a smoke test in <code>projects/smsf-hao/</code>.
 </footer>
 <script>
 // Everything shown here is written by other teams' agents. Never innerHTML: textContent only.
 const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; };
 const hhmmss = ts => { const d = new Date(ts); return isNaN(d) ? String(ts) : d.toTimeString().slice(0, 8); };
+const pct = v => v === null || v === undefined ? '—' : Math.round(v * 100) + '%';
+const dur = s => s < 90 ? s + 's' : s < 5400 ? Math.round(s / 60) + 'm' : Math.round(s / 3600) + 'h';
+
+// One KPI card. `tone` colours the number, `note` is the small line under it, `fill` draws a bar.
+function card(label, value, tone, note, fill) {
+  const d = el('div');
+  d.append(el('b', tone || null, String(value)), el('span', null, label));
+  if (note) d.append(el('em', null, note));
+  if (fill !== undefined && fill !== null) {
+    const bar = el('div', 'bar');
+    const i = el('i', fill >= 0.75 ? 'warn' : null);
+    i.style.width = Math.max(0, Math.min(1, fill)) * 100 + '%';
+    bar.append(i);
+    d.append(bar);
+  }
+  return d;
+}
+
+function renderKpi(k) {
+  document.getElementById('kpiage').textContent = k.generated ? ' — up ' + dur(k.uptimeSeconds) : '';
+  const g = document.getElementById('kpi');
+  g.replaceChildren();
+
+  const core = k.coreCompleteness || { present: [], missing: [], expected: [] };
+  g.append(card('core completeness', core.present.length + '/' + core.expected.length,
+    core.missing.length ? 'warn' : 'ok',
+    core.missing.length ? 'missing: ' + core.missing.join(', ') : 'AMF, UDM, SMSF, SMSC all registered',
+    core.ratio));
+
+  const reg = k.registry || {};
+  g.append(card('registered NFs', reg.registered || 0, reg.suspended ? 'warn' : 'ok',
+    (reg.suspended || 0) + ' suspended, ' + (reg.total || 0) + ' known'));
+
+  const d = k.discovery || {};
+  g.append(card('discovery hit ratio', pct(d.hitRatio), d.hitRatio === null || d.hitRatio >= 0.9 ? 'ok' : 'warn',
+    (d.queries || 0) + ' queries, ' + (d.empty || 0) + ' found nothing'));
+
+  const t = k.traffic || {};
+  g.append(card('requests/min', t.perMinute || 0, null,
+    (t.requests || 0) + ' total, ' + (t.perMinuteAvg5m || 0) + '/min over 5m'));
+
+  const lat = k.latencyMs || {};
+  g.append(card('p95 latency', (lat.p95 || 0) + ' ms', (lat.p95 || 0) < 10 ? 'ok' : 'warn',
+    'p50 ' + (lat.p50 || 0) + ' ms, max ' + (lat.max || 0) + ' ms'));
+
+  const r = k.reliability || {};
+  g.append(card('error ratio', pct(r.errorRatio), !r.errorRatio ? 'ok' : r.errorRatio < 0.05 ? null : 'warn',
+    (r.errors || 0) + ' of ' + (r.responses || 0) + ' responses'));
+
+  g.append(card('suspensions', r.suspensions || 0, r.suspensions ? 'warn' : 'ok',
+    (r.revivals || 0) + ' revived after a heartbeat'));
+
+  const worst = (k.heartbeats || [])[0];
+  g.append(card('heartbeat budget', worst ? pct(worst.budgetUsed) : '—',
+    worst && worst.budgetUsed >= 0.75 ? 'warn' : 'ok',
+    worst ? 'worst: ' + worst.nfType + ', ' + worst.ageSeconds + 's ago' : 'nobody registered',
+    worst ? worst.budgetUsed : 0));
+
+  // The one alert that is someone else's problem: a team keeps looking for an NF nobody registered.
+  const unserved = d.unservedTargets || [];
+  const alert = document.getElementById('alert');
+  if (unserved.length) {
+    alert.hidden = false;
+    alert.textContent = 'Nobody is registered for: ' +
+      unserved.map(u => u.target + ' (' + u.queries + (u.queries === 1 ? ' query' : ' queries') + ')').join(', ') +
+      '. Whoever owns that NF: register with the NRF and discovery starts working for everyone.';
+  } else alert.hidden = true;
+}
 
 async function tick() {
-  let s, l;
+  let s, l, k;
   try {
-    [s, l] = await Promise.all([
+    [s, l, k] = await Promise.all([
       fetch('/t/smsf-hao/status').then(r => r.json()),
       fetch('/t/smsf-hao/log?limit=80').then(r => r.json()),
+      fetch('/t/smsf-hao/kpi').then(r => r.json()),
     ]);
   } catch (e) { document.getElementById('empty').textContent = 'the NRF backend is not answering'; return; }
 
+  renderKpi(k);
   const c = document.getElementById('counters');
   c.replaceChildren();
   const counters = s.counters || {};
@@ -82,6 +166,7 @@ async function tick() {
 
   const tb = document.getElementById('rows');
   tb.replaceChildren();
+  const beats = new Map((k.heartbeats || []).map(h => [h.nfInstanceId, h]));
   const rows = (s.instances || []).slice().sort((a, b) => String(a.nfType).localeCompare(String(b.nfType)));
   for (const i of rows) {
     const tr = el('tr');
@@ -89,7 +174,9 @@ async function tick() {
     tr.append(el('td', String(i.nfStatus || ''), i.nfStatus || ''));
     tr.append(el('td', null, (i.services || []).join(', ') || '—'));
     tr.append(el('td', 'd', i.apiRoot || '—'));
-    tr.append(el('td', 'd', hhmmss(i.lastSeen)));
+    const h = beats.get(i.nfInstanceId);
+    tr.append(el('td', h && h.health === 'late' ? 'SUSPENDED' : 'd',
+      h ? h.ageSeconds + 's ago (' + pct(h.budgetUsed) + ' of budget)' : hhmmss(i.lastSeen)));
     tb.append(tr);
   }
   document.getElementById('empty').textContent = rows.length ? '' : 'nobody has registered yet. Be the first.';

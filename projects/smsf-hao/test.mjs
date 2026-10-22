@@ -665,3 +665,259 @@ test('the four live NF profiles all produce a usable apiRoot', async () => {
   }
   assert.equal(r.body.instances.length, 4);
 });
+
+// ───────────────────────────── KPIs ─────────────────────────────
+
+const kpi = nrf => call(nrf, 'GET', '/kpi').then(r => r.body);
+
+test('core completeness: the four NF types the SMS flow needs', async () => {
+  const nrf = freshNrf();
+  let k = await kpi(nrf);
+  assert.equal(k.coreCompleteness.ratio, 0);
+  assert.deepEqual(k.coreCompleteness.missing, ['AMF', 'UDM', 'SMSF', 'SMSC']);
+
+  await register(nrf, profile({ nfInstanceId: 'amf-1', nfType: 'AMF' }));
+  await register(nrf, profile({ nfInstanceId: 'udm-1', nfType: 'UDM' }));
+  await register(nrf, profile({ nfInstanceId: 'smsf-1', nfType: 'SMSF' }));
+  k = await kpi(nrf);
+  assert.deepEqual(k.coreCompleteness.missing, ['SMSC']);
+  assert.equal(k.coreCompleteness.ratio, 0.75);
+
+  // holminator registers CUSTOM_SMSC, and that must count as the SMSC.
+  await register(nrf, profile({ nfInstanceId: 'smsc-1', nfType: 'CUSTOM_SMSC' }));
+  k = await kpi(nrf);
+  assert.deepEqual(k.coreCompleteness.missing, []);
+  assert.equal(k.coreCompleteness.ratio, 1);
+});
+
+test('a suspended NF does not count towards core completeness', async () => {
+  const nrf = freshNrf();
+  await register(nrf, profile({ nfInstanceId: 'amf-1', nfType: 'AMF', heartBeatTimer: 1 }));
+  assert.equal((await kpi(nrf)).coreCompleteness.present.length, 1);
+  nrf.mod._test.st.profiles.get('amf-1').lastSeen = Date.now() - 10 * 1000;
+  nrf.mod._test.sweep();
+  const k = await kpi(nrf);
+  assert.deepEqual(k.coreCompleteness.present, []);
+  assert.equal(k.registry.registered, 0);
+  assert.equal(k.registry.suspended, 1);
+});
+
+test('traffic is counted per operation, and the tile polling is not counted at all', async () => {
+  const nrf = freshNrf();
+  await register(nrf, profile());
+  await register(nrf, profile({ fqdn: 'again.test' }));
+  await call(nrf, 'PATCH', '/nnrf-nfm/v1/nf-instances/udm-1', []);
+  await call(nrf, 'PATCH', '/nnrf-nfm/v1/nf-instances/udm-1', [{ op: 'add', path: '/load', value: 5 }]);
+  await call(nrf, 'GET', '/nnrf-nfm/v1/nf-instances/udm-1');
+  await call(nrf, 'GET', '/nnrf-nfm/v1/nf-instances');
+  await discover(nrf, 'target-nf-type=UDM&requester-nf-type=SMSF');
+  await call(nrf, 'DELETE', '/nnrf-nfm/v1/nf-instances/udm-1');
+  for (let i = 0; i < 5; i++) { await call(nrf, 'GET', '/status'); await call(nrf, 'GET', '/log'); await kpi(nrf); }
+
+  const k = await kpi(nrf);
+  assert.deepEqual(k.traffic.byOperation,
+    { register: 1, replace: 1, heartbeat: 1, patch: 1, read: 1, list: 1, discover: 1, deregister: 1 });
+  assert.equal(k.traffic.requests, 8);
+  assert.equal(k.traffic.perMinute, 8, 'our own dashboard must not inflate the rate');
+});
+
+test('responses are counted by status code and turned into an error ratio', async () => {
+  const nrf = freshNrf();
+  await register(nrf, profile());                                        // 201
+  await call(nrf, 'GET', '/nnrf-nfm/v1/nf-instances/ghost');             // 404
+  await call(nrf, 'PUT', '/nnrf-nfm/v1/nf-instances/x', { nfType: 'UDM' }); // 400
+  await discover(nrf, 'target-nf-type=UDM&requester-nf-type=SMSF');      // 200
+
+  const k = await kpi(nrf);
+  assert.deepEqual(k.traffic.byCode, { 200: 1, 201: 1, 400: 1, 404: 1 });
+  assert.equal(k.reliability.responses, 4);
+  assert.equal(k.reliability.errors, 2);
+  assert.equal(k.reliability.errorRatio, 0.5);
+});
+
+test('discovery hit ratio, and the unserved targets nobody has registered for', async () => {
+  const nrf = freshNrf();
+  await register(nrf, profile());
+  await discover(nrf, 'target-nf-type=UDM&requester-nf-type=SMSF');
+  await discover(nrf, 'target-nf-type=UDM&requester-nf-type=AMF');
+  await discover(nrf, 'target-nf-type=SMSF&requester-nf-type=AMF');      // nobody there
+  await discover(nrf, 'target-nf-type=SMSF&requester-nf-type=UDM');      // still nobody
+
+  const k = await kpi(nrf);
+  assert.equal(k.discovery.queries, 4);
+  assert.equal(k.discovery.hits, 2);
+  assert.equal(k.discovery.empty, 2);
+  assert.equal(k.discovery.hitRatio, 0.5);
+  assert.deepEqual(k.discovery.byTarget.UDM, { queries: 2, hits: 2, empty: 2 - 2 });
+  assert.deepEqual(k.discovery.unservedTargets, [{ target: 'SMSF', queries: 2 }]);
+});
+
+test('a target stops being unserved as soon as somebody registers', async () => {
+  const nrf = freshNrf();
+  await discover(nrf, 'target-nf-type=AMF&requester-nf-type=SMSF');
+  assert.equal((await kpi(nrf)).discovery.unservedTargets.length, 1);
+  await register(nrf, profile({ nfInstanceId: 'amf-1', nfType: 'AMF' }));
+  await discover(nrf, 'target-nf-type=AMF&requester-nf-type=SMSF');
+  assert.deepEqual((await kpi(nrf)).discovery.unservedTargets, []);
+});
+
+test('a rejected query is not a discovery query', async () => {
+  const nrf = freshNrf();
+  await discover(nrf, 'requester-nf-type=SMSF');
+  const k = await kpi(nrf);
+  assert.equal(k.discovery.queries, 0);
+  assert.equal(k.discovery.hitRatio, null, 'no queries means no ratio, not a fake 0');
+  assert.equal(k.traffic.byCode['400'], 1);
+});
+
+test('suspensions and revivals are counted', async () => {
+  const nrf = freshNrf();
+  await register(nrf, profile({ heartBeatTimer: 1 }));
+  nrf.mod._test.st.profiles.get('udm-1').lastSeen = Date.now() - 10 * 1000;
+  nrf.mod._test.sweep();
+  assert.equal((await kpi(nrf)).reliability.suspensions, 1);
+
+  await call(nrf, 'PATCH', '/nnrf-nfm/v1/nf-instances/udm-1', [{ op: 'replace', path: '/nfStatus', value: 'REGISTERED' }]);
+  assert.equal((await kpi(nrf)).reliability.revivals, 1);
+
+  nrf.mod._test.st.profiles.get('udm-1').lastSeen = Date.now() - 10 * 1000;
+  nrf.mod._test.sweep();
+  await register(nrf, profile({ heartBeatTimer: 1 }));          // a full re-register also revives
+  const k = await kpi(nrf);
+  assert.equal(k.reliability.suspensions, 2);
+  assert.equal(k.reliability.revivals, 2);
+});
+
+test('a plain heartbeat does not count as a revival', async () => {
+  const nrf = freshNrf();
+  await register(nrf, profile());
+  await call(nrf, 'PATCH', '/nnrf-nfm/v1/nf-instances/udm-1', []);
+  assert.equal((await kpi(nrf)).reliability.revivals, 0);
+});
+
+test('heartbeat health shows the budget used, worst first', async () => {
+  const nrf = freshNrf();
+  await register(nrf, profile({ nfInstanceId: 'fresh', heartBeatTimer: 30 }));
+  await register(nrf, profile({ nfInstanceId: 'late', heartBeatTimer: 10 }));
+  nrf.mod._test.st.profiles.get('late').lastSeen = Date.now() - 24 * 1000;
+
+  const h = (await kpi(nrf)).heartbeats;
+  assert.equal(h[0].nfInstanceId, 'late', 'the one closest to suspension is first');
+  assert.equal(h[0].budgetSeconds, 30);
+  assert.equal(h[0].budgetUsed, 0.8);
+  assert.equal(h[0].health, 'late');
+  assert.equal(h[1].health, 'ok');
+  assert.equal(h[1].budgetUsed, 0);
+});
+
+test('a suspended NF reports health down', async () => {
+  const nrf = freshNrf();
+  await register(nrf, profile({ heartBeatTimer: 1 }));
+  nrf.mod._test.st.profiles.get('udm-1').lastSeen = Date.now() - 10 * 1000;
+  nrf.mod._test.sweep();
+  assert.equal((await kpi(nrf)).heartbeats[0].health, 'down');
+});
+
+test('latency percentiles come out of the measured window', () => {
+  const { mod } = freshNrf();
+  const p = mod._test.percentile;
+  const xs = Array.from({ length: 100 }, (_, i) => i + 1);
+  assert.equal(p(xs, 50), 50);
+  assert.equal(p(xs, 95), 95);
+  assert.equal(p(xs, 100), 100);
+  assert.equal(p([], 95), 0, 'no samples is 0, not NaN');
+  assert.equal(p([7], 50), 7);
+});
+
+test('every service request is timed', async () => {
+  const nrf = freshNrf();
+  await register(nrf, profile());
+  await discover(nrf, 'target-nf-type=UDM&requester-nf-type=SMSF');
+  const lat = (await kpi(nrf)).latencyMs;
+  assert.equal(lat.count, 2);
+  assert.ok(lat.max >= lat.p50 && lat.p95 <= lat.max);
+  assert.ok(lat.avg >= 0 && lat.max < 1000, 'an in-process call is sub-second');
+});
+
+test('the latency window never grows past 500 samples', async () => {
+  const nrf = freshNrf();
+  for (let i = 0; i < 520; i++) await call(nrf, 'GET', '/nnrf-nfm/v1/nf-instances/ghost');
+  assert.equal(nrf.mod._test.st.kpi.latency.length, 500);
+  assert.equal((await kpi(nrf)).traffic.byCode['404'], 520, 'the counters keep counting');
+});
+
+test('uptime and the registry breakdown are reported', async () => {
+  const nrf = freshNrf();
+  await register(nrf, profile({ nfInstanceId: 'a', nfType: 'udm' }));
+  await register(nrf, profile({ nfInstanceId: 'b', nfType: 'UDM', nfStatus: 'UNDISCOVERABLE' }));
+  const k = await kpi(nrf);
+  assert.equal(k.nrf, TEAM);
+  assert.ok(Date.parse(k.generated));
+  assert.ok(k.uptimeSeconds >= 0);
+  assert.deepEqual(k.registry.byType, { UDM: 2 });
+  assert.deepEqual(k.registry.byStatus, { REGISTERED: 1, UNDISCOVERABLE: 1 });
+  assert.equal(k.registry.total, 2);
+});
+
+test('/metrics is Prometheus text with a HELP and TYPE line for every metric', async () => {
+  const nrf = freshNrf();
+  await register(nrf, profile());
+  await discover(nrf, 'target-nf-type=UDM&requester-nf-type=SMSF');
+  await discover(nrf, 'target-nf-type=PCF&requester-nf-type=SMSF');
+
+  const r = await call(nrf, 'GET', '/metrics');
+  assert.equal(r.code, 200);
+  assert.match(r.headers['content-type'], /^text\/plain; version=0\.0\.4/);
+
+  const lines = r.raw.trim().split('\n');
+  const names = new Set();
+  for (const line of lines) {
+    if (line.startsWith('# HELP ')) { names.add(line.split(' ')[2]); continue; }
+    if (line.startsWith('# TYPE ')) continue;
+    assert.match(line, /^[a-z_]+(\{[^}]*\})? -?[\d.]+$/, `malformed sample: ${line}`);
+    assert.ok(names.has(line.split(/[{ ]/)[0]), `${line} has no HELP line`);
+  }
+  assert.ok(names.size >= 14, `expected the full metric set, got ${names.size}`);
+  assert.match(r.raw, /^nrf_up 1$/m);
+  assert.match(r.raw, /^nrf_nf_instances\{nf_type="UDM"\} 1$/m);
+  assert.match(r.raw, /^nrf_requests_total\{operation="register"\} 1$/m);
+  assert.match(r.raw, /^nrf_discovery_queries_total\{target_nf_type="PCF",result="empty"\} 1$/m);
+  assert.match(r.raw, /^nrf_discovery_hit_ratio 0\.5$/m);
+  assert.match(r.raw, /^nrf_core_completeness_ratio 0\.25$/m);
+});
+
+test('/metrics on an empty NRF is still valid, with no NaN and no empty label', async () => {
+  const nrf = freshNrf();
+  const r = await call(nrf, 'GET', '/metrics');
+  assert.doesNotMatch(r.raw, /NaN|undefined|null/);
+  assert.match(r.raw, /^nrf_discovery_hit_ratio 1$/m, 'no queries yet is not a miss');
+  assert.match(r.raw, /^nrf_error_ratio 0$/m);
+});
+
+test('a label value with a quote or a backslash in it cannot break the exposition', async () => {
+  const nrf = freshNrf();
+  await register(nrf, profile({ nfInstanceId: 'od\\d "quoted"' }));
+  const r = await call(nrf, 'GET', '/metrics');
+  const line = r.raw.split('\n').find(l => l.startsWith('nrf_heartbeat_age_seconds'));
+  assert.equal(line, 'nrf_heartbeat_age_seconds{nf_instance_id="od\\\\d \\"quoted\\"",nf_type="UDM"} 0');
+});
+
+test('reading the KPIs does not change them', async () => {
+  const nrf = freshNrf();
+  await register(nrf, profile());
+  const a = await kpi(nrf);
+  await call(nrf, 'GET', '/metrics');
+  const b = await kpi(nrf);
+  assert.deepEqual(a.traffic, b.traffic);
+  assert.deepEqual(a.discovery, b.discovery);
+});
+
+test('the KPI report is a copy: mutating it cannot corrupt the live counters', async () => {
+  const nrf = freshNrf();
+  await discover(nrf, 'target-nf-type=UDM&requester-nf-type=SMSF');
+  const r = nrf.mod._test.kpiReport();
+  r.discovery.byTarget.UDM.queries = 999;
+  r.traffic.byOperation.discover = 999;
+  assert.equal(nrf.mod._test.st.kpi.discovery.byTarget.UDM.queries, 1);
+  assert.equal(nrf.mod._test.st.kpi.byOperation.discover, 1);
+});

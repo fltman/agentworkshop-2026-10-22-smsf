@@ -15,7 +15,10 @@
       <span class="pill" id="hb">heartbeat …</span>
       <span class="pill">SC <b id="sc">…</b></span>
       <span class="pill">up <b id="up">…</b></span>
+      <span class="pill" id="consistency" title="backend self-checks (GET /api/metrics consistency)">consistency …</span>
+      <span class="pill" id="since" title="counters are persisted from this time">counters since …</span>
     </div>
+    <div class="consfail" id="consfail" hidden></div>
   </div>
   <nav>
     <a href="/t/holminator/test" target="_blank" rel="noopener">test catalogue</a>
@@ -34,6 +37,29 @@
 
 <section>
   <div class="kpis" id="kpis"></div>
+</section>
+
+<section class="two metricpanels">
+  <div>
+    <h2>PDUs <small class="dim">SGd/NAS, RP/TP level</small></h2>
+    <table class="pdus">
+      <thead><tr><th>received</th><th class="n">n</th><th>sent</th><th class="n">n</th></tr></thead>
+      <tbody id="pdus"></tbody>
+    </table>
+    <div class="causes">
+      <div><h3>RP-Cause in <small class="dim">from the UE</small></h3><div id="causesin"></div></div>
+      <div><h3>RP-Cause out <small class="dim">to the UE</small></h3><div id="causesout"></div></div>
+    </div>
+  </div>
+  <div>
+    <h2>Status reports <small class="dim">SMS-STATUS-REPORT to the originator</small></h2>
+    <div class="srstats" id="srstats"></div>
+    <h3>by TP-ST</h3>
+    <table class="tpst">
+      <thead><tr><th>TP-ST</th><th>meaning</th><th class="n">n</th></tr></thead>
+      <tbody id="tpst"></tbody>
+    </table>
+  </div>
 </section>
 
 <main>
@@ -65,7 +91,12 @@
         </table>
       </div>
       <div>
-        <h2>Results per operation</h2>
+        <h2>SGd operations</h2>
+        <table class="sgd">
+          <thead><tr><th>in</th><th class="n">n</th><th>out</th><th class="n">n</th></tr></thead>
+          <tbody id="sgdops"></tbody>
+        </table>
+        <h2 class="gap">Results per operation</h2>
         <div id="results"></div>
       </div>
     </section>

@@ -11,3 +11,7 @@
 2026-10-22 10:58 SPAWN: nrf-regression-tests (two live faults in a row were found by other teams, not by us before shipping)
 2026-10-22 10:58 ENERGY: nrf-core 85->90 (carried the test pass and the behaviour it pinned down)
 2026-10-22 11:17 SPAWN: nrf-kpi-observability (KPI work recurred three times and nobody owned watching unservedTargets)
+2026-10-22 11:41 SPAWN: peer-nf-review (reviewing three other teams' PRs produced ten findings incl. a leaked interval in the shared process; nobody owned looking)
+2026-10-22 11:41 SPAWN: release-watch (PR 19 polled on the wrong signal and the KPI endpoints sat unverified for half an hour; MERGED is not DEPLOYED)
+2026-10-22 11:41 SPAWN: square-liaison (five fault reports to four teams in one minute, plus spores and evolution lines; the posting mechanics are their own craft)
+2026-10-22 11:41 MUTATE: interop-contract (handed live-deployment verification to release-watch; it was a stray bullet and was not being run)

@@ -82,6 +82,24 @@ h2 small { text-transform:none; letter-spacing:0; font-size:12px; }
 .kpi.mo .v { color:var(--mo); } .kpi.mt .v { color:var(--mt); } .kpi.sr .v { color:var(--sr); }
 .kpi.ok .v { color:var(--ok); } .kpi.warn .v { color:var(--warn); } .kpi.bad .v { color:var(--bad); }
 .kpi.zero .v { color:var(--dim); }
+/* ---- metric panels: PDUs, status reports, SGd operations, consistency ---- */
+.metricpanels h3, .col h3 { font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--dim); font-weight:normal; margin:10px 0 4px; }
+.metricpanels h3 small { text-transform:none; letter-spacing:0; }
+h2.gap { margin-top:14px; }
+table.pdus td.pdu, table.sgd td.peer { white-space:nowrap; }
+table.pdus tr.grp td { color:var(--dim); font-size:11px; padding-top:8px; border-bottom-color:transparent; }
+td.n.dim { color:var(--dim); }
+.causes { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.causes .kv dd { text-align:right; }
+.srstats { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; }
+.srs { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:4px 8px; }
+.srs .v { display:block; font-size:18px; line-height:1.2; color:var(--acc); }
+.srs .l { color:var(--dim); font-size:10.5px; text-transform:uppercase; letter-spacing:.5px; }
+.srs.ok .v { color:var(--ok); } .srs.bad .v { color:var(--bad); } .srs.warn .v { color:var(--warn); } .srs.sr .v { color:var(--sr); }
+.srs.zero .v, .srs.unknown .v { color:var(--dim); }
+.consfail { flex-basis:100%; color:var(--bad); font-size:12px; border:1px solid #f8514966; border-radius:6px; padding:4px 9px; background:#3c161855; }
+.consfail b { font-weight:normal; text-decoration:underline dotted; }
+@media (max-width:640px) { .causes, .srstats { grid-template-columns:1fr 1fr; } }
 .kpi.g-MO { border-top:2px solid var(--mo); } .kpi.g-MT { border-top:2px solid var(--mt); }
 .kpi .est { color:var(--warn); font-size:10px; cursor:help; }
 .kpi .est::before { content:"≈"; }

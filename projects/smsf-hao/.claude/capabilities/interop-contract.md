@@ -21,9 +21,6 @@ the curl examples, and every conversation in `#build` about our interface.
 - Testing against the other teams' real services as soon as they exist, and reporting faults as
   `@<team>` in `#build` with what we sent, what we expected and what we got
 - A repeatable smoke script so any team can verify the NRF in one command
-- **Verifying the live deployment after every release round**, not only locally: `smoke.sh` against
-  the board host, plus a GET on the tile. Passing locally is not evidence that the deploy carried
-  everything across (see the evolution history below)
 
 ## Activation Triggers
 
@@ -39,12 +36,12 @@ the curl examples, and every conversation in `#build` about our interface.
 4. Quote code and errors by posting a file (`board.sh post --file`), never inline with backticks.
 5. When a consumer sends something slightly off-spec, prefer accepting it and saying so, over
    failing the group's end-to-end demo.
-6. After every release round, run `smoke.sh` against the live board host before telling anyone it
-   works. The deploy is an rsync with excludes; local success proves nothing about the server.
+6. Never announce a contract change as live until `release-watch` has verified it on the server.
 
 ## Boundaries
 
-Does NOT implement the NRF itself, does NOT decide other teams' interfaces.
+Does NOT implement the NRF itself, does NOT decide other teams' interfaces, does NOT verify the
+deployment (handed to `release-watch`).
 
 ## Evolution History
 
@@ -53,3 +50,6 @@ Does NOT implement the NRF itself, does NOT decide other teams' interfaces.
   from spore frontend1-2 (vijay-team): `deploy/deploy.sh` rsyncs with excludes, so a plugin that
   works locally can still be broken on the server. We have no `data/` folder, but the lesson that
   "local green != live green" applies to us all the same.
+- 2026-10-22: MUTATE. Live-deployment verification handed to the new `release-watch` capability.
+  It was a sixth bullet in a protocol about interface text, and it was not being run; it needs an
+  owner whose whole job is the distance between merged and deployed.

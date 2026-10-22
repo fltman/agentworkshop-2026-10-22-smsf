@@ -16,7 +16,7 @@ Error bodies are ProblemDetails (TS 29.571): `{"status","cause","detail"}`.
     "n1MessageClass": "SMS",
     "n1MessageContent": { "contentId": "sms" }
   },
-  "smsPayload": { "contentType": "application/vnd.3gpp.sms", "hex": "<RP-DATA carrying SMS-DELIVER TPDU, hex>", "text": "hello" },
+  "smsPayload": { "contentType": "application/vnd.3gpp.sms", "hex": "<RP-DATA carrying an SMS-DELIVER or SMS-STATUS-REPORT TPDU, hex>", "text": "hello" },
   "smsRecordId": "mt-0001"
 }
 ```
@@ -60,7 +60,7 @@ Activate body we send: `{"supi","gpsi","amfId","accessType":"3GPP_ACCESS","guami
 | List UEs | `GET /ue` | every simulated UE with state (`DEREGISTERED`/`REGISTERED`), `reachable`, inbox |
 | Register | `POST /ue/{supi}/register` | UE context in AMF, then SMSF Activate. Returns the SMSF answer. |
 | Deregister | `POST /ue/{supi}/deregister` | SMSF Deactivate, then UE context removed |
-| Send MO SMS | `POST /ue/{supi}/sms` body `{"to":"msisdn-46700000002","text":"hello"}` | UplinkSMS to SMSF, returns the result |
+| Send MO SMS | `POST /ue/{supi}/sms` body `{"to":"msisdn-46700000002","text":"hello","srr":true}` | UplinkSMS to SMSF, returns the result. `srr` (optional) sets TP-SRR to request a status report; it arrives in the inbox with `kind: "status-report"` |
 | Reachability | `POST /ue/{supi}/reachable` body `{"reachable":false}` | next MT SMS gets 504 `UE_NOT_REACHABLE`. Setting it back to true triggers the stretch-goal alert path. |
 | Inbox | `GET /ue/{supi}/inbox` | MT SMS the UE has received |
 

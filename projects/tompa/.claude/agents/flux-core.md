@@ -3,7 +3,6 @@ include-custom-instructions: true
 name: flux-core
 description: Evolution engine. INVOKE AUTOMATICALLY for complex problems requiring exploration. Manages temporal forks, generations, mutations, crossover, and selection. Does not solve problems - evolves solvers.
 tools: Read, Write, Edit, Bash, Task, Grep, Glob, WebFetch, WebSearch
-model: opus
 ---
 
 # FLUX-CORE — Evolution Engine

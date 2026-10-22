@@ -271,7 +271,7 @@ async function moSms(req, res, ue) {
   if (ue.state !== 'REGISTERED') return problem(res, 409, 'UE_NOT_REGISTERED', 'register the UE first');
   if (!ue.smsActive) return problem(res, 409, 'SMS_NOT_ACTIVE', 'SMS over NAS is not active for this UE');
   const rpMr = nextMr();
-  const hexPayload = sms.moSubmit({ rpMr, tpMr: rpMr, scAddress: SC_ADDRESS, to: b.to, text: b.text });
+  const hexPayload = sms.moSubmit({ rpMr, tpMr: rpMr, scAddress: SC_ADDRESS, to: b.to, text: b.text, srr: b.srr === true });
   const smsRecordId = `mo-${TEAM}-${Date.now()}-${rpMr}`;
   kpis.mo.attempts++;
   const r = await uplink(ue, smsRecordId, hexPayload, b.text);
@@ -321,7 +321,7 @@ async function n1n2(req, res, supi) {
   let parseError = null;
   try { parsed = sms.parseMt(hexPayload); } catch (e) { parseError = e.message; }
   if (parsed) {
-    ue.inbox.unshift({ ts: new Date().toISOString(), smsRecordId: b.smsRecordId || null, from: parsed.from,
+    ue.inbox.unshift({ ts: new Date().toISOString(), smsRecordId: b.smsRecordId || null, kind: parsed.kind, from: parsed.from,
       text: parsed.text !== null ? parsed.text : (b.smsPayload.text || null), scAddress: parsed.scAddress, hex: hexPayload });
     ue.inbox.length = Math.min(ue.inbox.length, 20);
   }

@@ -12,3 +12,5 @@
 2026-10-22 10:55 EVOLVE: 05f8eb0a-α gen-002 → gen-003 (64 → 66, self 78 discounted: in-sample, held-out scoring + own-uplink self-check, defensive 0.6, testing 0.8)
 2026-10-22 10:55 EVOLVE: 05f8eb0a-β gen-002 → gen-003 (unscored → 56, unproven: approved live run gate, step 4 vacuous pass removed, cleanup + traffic isolation)
 2026-10-22 10:55 EVOLVE: 05f8eb0a-γ gen-001 → gen-002 (61, auto-diagnose joined trace in α diag shape, holminator counter witness, analytical 0.7)
+2026-10-22 10:58 CROSS: 05f8eb0a-α × β → δ (α gen-003 diagnose.js as verdict engine + β gen-003 live 6-step scenario driver; analytical 0.7, methodical 0.7, defensive 0.6, creative 0.3, api-design 0.8, testing 0.8; provisional 61, unscored until approved live run; parents stay active)
+2026-10-22 11:02 SPAWN: agents boundary-decoder (α), scenario-runner (β), trace-correlator (γ) as real subagents; flux-core model pin removed (spore smsf-9 from holminator)

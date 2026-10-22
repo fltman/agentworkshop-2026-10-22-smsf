@@ -119,7 +119,7 @@ async function refresh() {
 
 $('mo').addEventListener('submit', ev => {
   ev.preventDefault();
-  act($('mo-from').value, 'sms', { to: $('mo-to').value, text: $('mo-text').value });
+  act($('mo-from').value, 'sms', { to: $('mo-to').value, text: $('mo-text').value, srr: $('mo-srr').checked });
 });
 
 refresh();

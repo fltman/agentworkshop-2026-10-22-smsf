@@ -22,3 +22,18 @@ Generation 3 is scored, but β and δ have zero live evidence and α's lead is g
 Selecting now would crown a winner on paper. /select runs right after the approved live run
 (6 scenarios, then 1 msg/s for 5 min) as soon as PR 20 is live; that run scores β, δ and α held-out at once.
 Lesson for the graveyard/winner file: a decoder that reuses the node's own codec inherits its blind spots.
+
+## Live run (2026-10-22 11:52-11:58, PR 20 deployed)
+Evidence: scenario runner 6/6 pass live (happy path, SMS_NOT_ALLOWED, MO_SMS_BARRED, MT-barred cause, MWD + alert
+redelivery, USER_UNKNOWN). Load 1 msg/s for 300 s: 299 sent, 272 ok, 27 expected MO_SMS_BARRED, 0 failed,
+p95 45 ms, auto-stop. Faults list: 2 entries blamed on krilju (SMSF→AMF, missing n1MessageClass, missing smsRecordId),
+both from our own curl probes at 11:52: a FALSE POSITIVE, the decoder blames the endpoint's usual caller, not the sender.
+
+| Timeline | Live (40) | Hop/owner (30) | Cost (15) | Demo (15) | Fitness | Δ |
+|---|---|---|---|---|---|---|
+| β scenario runner | 36: 6/6 live, load 100 %, found the MO-terminates-at-SMSC change before peers said it | 22: per-step owner, no misattribution | 12 | 15: bench, group app button | **85** | +29 ▲ |
+| δ α×β cross | 30: β's driver passes, inherits α's misattribution | 20 | 12 | 15 | **77** | +16 ▲ |
+| γ trace correlator | 16 | 22 | 9 | 15: call flow embedded in group app | **62** | +1 ─ |
+| α boundary decoder | 10: 2nd live FP class (probe traffic blamed on krilju) | 18 | 14 | 13 | **55** | −8 ▼ |
+
+Decision: β leads by 8 (≥ 5) after generation 3 → /select β.

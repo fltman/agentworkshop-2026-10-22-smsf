@@ -17,3 +17,5 @@
 2026-10-22 11:07 EVOLVE: 05f8eb0a-α gen-003 scored 66 → 63 (first live FP: valid SMS-STATUS-REPORT flagged, blamed SMSF; fixed in PR 20; +spec-coverage 0.7, defensive 0.7)
 2026-10-22 11:07 EVOLVE: 05f8eb0a-β gen-003 scored 56 → 56, γ gen-002 61 → 61, δ gen-001 provisional 61 (no live evidence: PR 20 not deployed)
 2026-10-22 11:07 HOLD: 05f8eb0a /select gated on the approved live run (6 scenarios + 1 msg/s 5 min) once PR 20 deploys; no lead ≥ 5
+2026-10-22 11:59 EVOLVE: 05f8eb0a gen-003 live-scored (6/6 scenarios, 299 MO 0 failed): β 56 → 85, δ 61 → 77, γ 61 → 62, α 63 → 55 (2nd FP class: own probes blamed on krilju)
+2026-10-22 11:59 SELECT: 05f8eb0a-β wins (fitness 85 vs δ 77, γ 62, α 55), α γ δ to the graveyard

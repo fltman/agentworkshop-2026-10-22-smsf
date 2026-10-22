@@ -16,6 +16,7 @@ function mtRpData(rpMr, from, text) {
 }
 
 const seen = []; // requests the stub SMSF received
+const nrfSeen = []; // requests the stub NRF (nnrf-nfm) received
 let firstSmsfDown = false; // discovery returns two SMSFs and the first answers 503
 let stub; let amf; let plugin;
 
@@ -43,7 +44,7 @@ test.before(async () => {
       return out(200, { nfInstances: firstSmsfDown ? [inst('/smsf'), inst('/smsf2')] : [inst('/smsf')] });
     }
     if (firstSmsfDown && req.url.startsWith('/smsf/')) { seen.push({ method: req.method, url: req.url, body: b }); return out(503, { cause: 'SYSTEM_FAILURE' }); }
-    if (req.url.startsWith('/t/smsf-hao/nnrf-nfm/')) return out(201, b);
+    if (req.url.startsWith('/t/smsf-hao/nnrf-nfm/')) { nrfSeen.push({ method: req.method, url: req.url, body: b }); return out(req.method === 'DELETE' ? 204 : 201, b); }
     seen.push({ method: req.method, url: req.url, body: b });
     if (req.method === 'PUT' && req.url.endsWith('imsi-001010000000003')) return out(403, { status: 403, cause: 'SMS_NOT_ALLOWED' });
     if (req.method === 'PUT') return out(201, b);
@@ -230,4 +231,47 @@ test('SMSF failover: a 503 from the first discovered SMSF moves on to the next, 
     await api('POST', `/ue/${UE2}/sms`, { to: 'msisdn-46700000001', text: 'via smsf2' });
     assert.ok(seen.slice(mark)[0].url.startsWith('/smsf2/'), 'the UE uses the SMSF that took its registration');
   } finally { firstSmsfDown = false; }
+});
+
+test('status reports warm-up so a restart is not mistaken for a fault', async () => {
+  const s = (await api('GET', '/status')).body;
+  assert.ok(['nrf-pending', 'restoring-ues', 'ready'].includes(s.warmup.state));
+  assert.strictEqual(typeof s.uptimeS, 'number');
+  assert.ok(s.startedAt);
+});
+
+test('second AMF instance: serves n1n2 under /amf2; the fault switch fails one instance and moves activation to the other', async () => {
+  const UE2 = 'imsi-001010000000002';
+  await api('POST', `/ue/${UE2}/register`);
+  const ok = await api('POST', `/amf2/namf-comm/v1/ue-contexts/${UE2}/n1-n2-messages`, {
+    n1MessageContainer: { n1MessageClass: 'SMS' }, smsRecordId: 'amf2-1', smsPayload: { hex: mtRpData(11, '46700000001', 'via amf2').rp } });
+  assert.ok(ok.status < 300, `amf2 n1n2 answered ${ok.status}`);
+
+  const view = (await api('GET', '/amf')).body;
+  assert.deepStrictEqual(view.map(a => a.n), [1, 2]);
+  assert.notStrictEqual(view[0].nfInstanceId, view[1].nfInstanceId);
+  assert.ok(view[1].apiRoot.endsWith('/t/tompa/amf2'));
+
+  try {
+    const f = await api('POST', '/amf/1/fault', { mode: '503', ttlS: 60 });
+    assert.strictEqual(f.body[0].fault, '503');
+    assert.ok(f.body[1].serving);
+    const r = await n1n2(UE2, mtRpData(12, '46700000001', 'x').rp, 'amf1-down');
+    assert.strictEqual(r.status, 503);
+    const mark = seen.length;
+    await api('POST', `/ue/${UE2}/register`);
+    const put = seen.slice(mark).find(x => x.method === 'PUT');
+    assert.strictEqual(put.body.amfId, view[1].nfInstanceId, 'activation names the healthy instance');
+
+    await api('POST', '/amf/2/fault', { mode: 'down', ttlS: 60 });
+    await sleep(100);
+    assert.ok(nrfSeen.some(x => x.method === 'DELETE' && x.url.endsWith(view[1].nfInstanceId)), 'down leaves the NRF');
+    assert.strictEqual((await api('POST', '/amf/2/fault', { mode: 'sideways' })).status, 400);
+  } finally {
+    await api('POST', '/amf/1/fault', { mode: 'ok' });
+    await api('POST', '/amf/2/fault', { mode: 'ok' });
+  }
+  await sleep(100);
+  assert.ok(nrfSeen.some(x => x.method === 'PUT' && x.url.endsWith(view[1].nfInstanceId)), 'ok re-registers');
+  assert.ok((await api('GET', '/amf')).body.every(a => a.fault === 'ok'));
 });

@@ -88,6 +88,8 @@ the same identities and holds only UE state (registered, reachable, inbox). SMS 
 
 ## Logs
 
+`GET /status` returns NRF state, SMSF in use, UE counts and `warmup: {state: "nrf-pending"|"restoring-ues"|"ready", uesToRestore}` with `startedAt`/`uptimeS`: right after a release round the AMF re-registers and restores UEs, so check `warmup.state` before reporting a fault.
+
 `GET /log` returns the latest messages in and out, newest first: `{ts, dir:"in"|"out", peer, method, path, status, body, diag?}`. UE actions show as `peer:"trigger"` (HTTP trigger) or `peer:"ue"` (load generator and scenarios, logged once with the answer's status).
 `diag` is the boundary decoder's verdict on a message from a peer: `{verdict:"ok"|"expected"|"fault", hop, owner, finding, expected}`.
 
@@ -114,6 +116,21 @@ Each step: `{step, name, expected, got, verdict: "pass"|"fail"|"skip", hop, owne
 
 AMF, nfInstanceId `7a3e0c1d-0000-4000-8000-00000000a3f0`, one service `namf-comm` with `apiRoot`
 `https://smsf.torget.bjarby.com/t/tompa` and `apiPrefix` `/t/tompa`. Heartbeat every 30 s.
+
+## Second AMF instance and fault switch (for SMSF failover tests)
+
+A second AMF in the same AMF set (`amfSetId 001`, GUAMI amfId `cafe01`) shares the UEs with the first:
+nfInstanceId `7a3e0c1d-0000-4000-8000-00000000a3f1`, `apiRoot` `https://smsf.torget.bjarby.com/t/tompa/amf2`.
+It serves the same N1N2MessageTransfer under `/t/tompa/amf2/namf-comm/v1/...`.
+
+- `GET /amf`: both instances `[{n, nfInstanceId, apiRoot, guami, nrf, fault, faultRemainingS, serving}]` (also in `/status` as `instances`).
+- `POST /amf/{1|2}/fault {"mode": "503"|"down"|"ok", "ttlS": 300}`:
+  - `503`: stays in the NRF, but its N1N2 answers 503 `SYSTEM_FAILURE`.
+  - `down`: deregisters from the NRF (DELETE), and N1N2 answers 503.
+  - `ok`: back to normal, re-registers.
+  - A fault always expires by itself after `ttlS` (10 to 900 s, default 300).
+- Activation (`PUT .../ue-contexts/{supi}`) names the first healthy instance in `amfId` and `guami`.
+- A simulated outage is logged with `body.simulated` and is never reported as a fault in the SMSF.
 
 ## Open questions
 

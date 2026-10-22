@@ -9,7 +9,9 @@ const FEEDS = [
   { team: 'krilju', node: 'SMSF', url: '/t/krilju/log?limit=200' },
   { team: 'hetoteam', node: 'UDM', url: '/t/hetoteam/log' },
   { team: 'holminator', node: 'SMSC', url: '/t/holminator/log' },
+  { team: 'smsf-hao', node: 'NRF', url: '/t/smsf-hao/log?limit=300' },
 ];
+const NF_TYPE = { AMF: 'AMF', SMSF: 'SMSF', UDM: 'UDM', SMSC: 'SMSC', CUSTOM_SMSC: 'SMSC' };
 
 function shortPath(p) {
   return String(p || '').replace(/https?:\/\/[^/\s]+/g, '').replace(/^\/t\/[^/]+/, '').split('?')[0]
@@ -28,7 +30,22 @@ function callerIsSelf(feed, e, fromText) {
   return e.dir === 'out';
 }
 
+// The NRF logs no peer, only its answers: "204 heartbeat SMSF <id>", "200 SearchResult" + "... for SMSF".
+function normalizeNrf(e) {
+  const m = String(e.text || '').match(/^(\d{3}) (.*)$/);
+  if (e.dir !== 'out' || !m) return null;
+  const who = `${m[2]} ${e.detail || ''}`.match(/\b(CUSTOM_SMSC|SMSF|AMF|UDM|SMSC)\b(?![\s\S]*\bfor\b)|\bfor (CUSTOM_SMSC|SMSF|AMF|UDM|SMSC)\b/);
+  const from = who && NF_TYPE[who[2] || who[1]];
+  if (!from) return null;
+  const status = Number(m[1]);
+  const disc = /SearchResult/.test(m[2]);
+  const target = disc && String(e.detail || '').match(/of (\w+)/);
+  const label = disc ? `discovery ${target ? target[1] : ''}`.trim() : m[2].replace(/\s+[0-9a-f-]{36}$/, '');
+  return { ts: e.ts, from, to: 'NRF', status, ok: status < 400, label };
+}
+
 function normalize(feed, e) {
+  if (feed.node === 'NRF') return normalizeNrf(e);
   const node = feed.node;
   const peer = PEER[e && e.peer];
   if (!peer || peer === node) return null;

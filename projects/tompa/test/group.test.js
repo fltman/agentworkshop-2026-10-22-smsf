@@ -56,3 +56,11 @@ test('looks: flip order, hash pinning and arcade scoring', () => {
   s = arcade.scoreHit(s, false);
   assert.equal(s.combo, 0); assert.equal(s.best, 10); assert.equal(s.lost, 1);
 });
+
+test('events: NRF log lines become calls from the requesting NF', () => {
+  const nrf = { team: 'smsf-hao', node: 'NRF' };
+  assert.deepEqual(ev.normalize(nrf, { dir: 'out', text: '200 SearchResult', detail: '1 instance(s) of CUSTOM_SMSC for SMSF' }),
+    { ts: undefined, from: 'SMSF', to: 'NRF', status: 200, ok: true, label: 'discovery CUSTOM_SMSC' });
+  assert.equal(ev.normalize(nrf, { dir: 'out', text: '204 heartbeat CUSTOM_SMSC 6f1c2c1e-0000-4000-8000-0000686f6c6d' }).from, 'SMSC');
+  assert.equal(ev.normalize(nrf, { dir: 'in', text: 'GET nnrf-disc nf-instances' }), null);
+});

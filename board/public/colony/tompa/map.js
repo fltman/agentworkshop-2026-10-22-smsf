@@ -71,7 +71,7 @@ if (typeof window !== 'undefined') {
 
   // A poll brings up to 3 s of calls at once; replay them spread over that time so they read as traffic.
   window.CoreFeed.subscribe((fresh, first) => {
-    const list = first ? fresh.slice(-60) : fresh;
+    const list = fresh; // first poll: count the whole log window, animate only the newest 8
     list.forEach((i, n) => {
       const replay = !first || n >= list.length - 8;
       if (!replay) return show(i, false);

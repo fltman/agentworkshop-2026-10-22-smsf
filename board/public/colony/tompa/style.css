@@ -1,5 +1,6 @@
 :root { --bg: #0f1419; --card: #182029; --fg: #e6edf3; --dim: #8b98a5; --ok: #3fb950; --warn: #d29922; --bad: #f85149; --acc: #58a6ff; }
 * { box-sizing: border-box; }
+a { color: #ffd479; } a:visited { color: #f0c060; } a:hover { color: #fff; }
 body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
 header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 h1 { font-size: 20px; margin: 0; } h1 small, h2 small { color: var(--dim); font-weight: normal; font-size: 13px; }

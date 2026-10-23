@@ -81,6 +81,14 @@ function mtFaultSince(s, logId, supi) {
   return e ? e.diag : null;
 }
 
+// An N1N2 for this UE since logId that our own AMF fault switch refused: our simulated outage, never a peer fault.
+function simulatedOutageSince(s, logId, supi) {
+  if (!s.deps.logSince) return null;
+  const e = (s.deps.logSince(logId) || []).find(x => x.dir === 'in' && x.body && x.body.simulated &&
+    String(x.path || '').endsWith(`/ue-contexts/${supi}/n1-n2-messages`));
+  return e ? e.body.simulated : null;
+}
+
 async function happyPath(s) {
   for (const n of [1, 2]) {
     const f = await ensureActive(s, n);
@@ -94,6 +102,8 @@ async function happyPath(s) {
   await mtLeg(s, 2, text);
   const hit = await waitInbox(s, UE(2), text);
   if (hit) { s.mtWorks = true; return pass(`MO 200, MT RP-DATA delivered to UE2 from ${hit.from || '?'}`); }
+  const sim = simulatedOutageSince(s, logId, UE(2));
+  if (sim) return skip(`MO 200, MT reached the AMF but was refused by ${sim}`);
   s.mtWorks = false;
   const d = mtFaultSince(s, logId, UE(2));
   if (d) return fail(`MO 200, MT reached the AMF but ${d.finding}`, d.hop, d.owner, moSent(UE(1), MSISDN(2)), { expectedDetail: d.expected });

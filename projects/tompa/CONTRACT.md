@@ -88,6 +88,8 @@ the same identities and holds only UE state (registered, reachable, inbox). SMS 
 
 ## Logs
 
+`GET /status` returns NRF state, SMSF in use, UE counts and `warmup: {state: "nrf-pending"|"restoring-ues"|"ready", uesToRestore}` with `startedAt`/`uptimeS`: right after a release round the AMF re-registers and restores UEs, so check `warmup.state` before reporting a fault.
+
 `GET /log` returns the latest messages in and out, newest first: `{ts, dir:"in"|"out", peer, method, path, status, body, diag?}`. UE actions show as `peer:"trigger"` (HTTP trigger) or `peer:"ue"` (load generator and scenarios, logged once with the answer's status).
 `diag` is the boundary decoder's verdict on a message from a peer: `{verdict:"ok"|"expected"|"fault", hop, owner, finding, expected}`.
 
@@ -110,10 +112,35 @@ Each step: `{step, name, expected, got, verdict: "pass"|"fail"|"skip", hop, owne
 #build fault report for failing steps (never posted automatically). `skip` means inconclusive or not supported yet
 (for example MWD/alert pending). Tile: `/colony/tompa/scenario.html`.
 
+## End-to-end health
+
+`GET /health` returns `{checkedAt, summary: {verdict: "green"|"amber"|"red", bad, warming, chain}, nfs, canary}`.
+`nfs` has one entry per NF `{team, node, verdict: "up"|"warming"|"degraded"|"down", inNrf, evidence}`, built from
+each team's own `GET /t/<team>/status` and checked against the NRF's instance list (`lastSeen` older than 90 s means
+degraded). An NF younger than 60 s, or one whose `warmup.state` is not `ready`, is warming, not faulty.
+`POST /health/canary` runs scenario step 1 (UE1 to UE2 through the whole chain): at most once per 30 s (429
+otherwise), skipped while an NF is warming. An MT refused by our own fault switch is a skip that names tompa, never a
+fault in a peer. Tile: `/colony/tompa/health.html`.
+
 ## NRF profile
 
 AMF, nfInstanceId `7a3e0c1d-0000-4000-8000-00000000a3f0`, one service `namf-comm` with `apiRoot`
 `https://smsf.torget.bjarby.com/t/tompa` and `apiPrefix` `/t/tompa`. Heartbeat every 30 s.
+
+## Second AMF instance and fault switch (for SMSF failover tests)
+
+A second AMF in the same AMF set (`amfSetId 001`, GUAMI amfId `cafe01`) shares the UEs with the first:
+nfInstanceId `7a3e0c1d-0000-4000-8000-00000000a3f1`, `apiRoot` `https://smsf.torget.bjarby.com/t/tompa/amf2`.
+It serves the same N1N2MessageTransfer under `/t/tompa/amf2/namf-comm/v1/...`.
+
+- `GET /amf`: both instances `[{n, nfInstanceId, apiRoot, guami, nrf, fault, faultRemainingS, serving}]` (also in `/status` as `instances`).
+- `POST /amf/{1|2}/fault {"mode": "503"|"down"|"ok", "ttlS": 300}`:
+  - `503`: stays in the NRF, but its N1N2 answers 503 `SYSTEM_FAILURE`.
+  - `down`: deregisters from the NRF (DELETE), and N1N2 answers 503.
+  - `ok`: back to normal, re-registers.
+  - A fault always expires by itself after `ttlS` (10 to 900 s, default 300).
+- Activation (`PUT .../ue-contexts/{supi}`) names the first healthy instance in `amfId` and `guami`.
+- A simulated outage is logged with `body.simulated` and is never reported as a fault in the SMSF.
 
 ## Open questions
 

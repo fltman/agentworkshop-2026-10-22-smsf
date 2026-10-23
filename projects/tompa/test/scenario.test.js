@@ -78,6 +78,17 @@ test('MT that never arrives fails step 1 on the MT leg after the timeout, and ma
   assert.strictEqual(s4.verdict, 'skip');
 });
 
+test('MT refused by our own AMF fault switch is a skip naming us, never a krilju fault', async () => {
+  const deps = core({ dropMt: true });
+  deps.lastLogId = () => 0;
+  deps.logSince = () => [{ dir: 'in', path: '/amf2/namf-comm/v1/ue-contexts/imsi-001010000000002/n1-n2-messages', status: 503,
+    body: { simulated: 'tompa fault switch: AMF 1 503' } }];
+  const s1 = (await createRunner(deps, { ...clock(), mtTimeoutMs: 1000 }).run(1)).steps[0];
+  assert.strictEqual(s1.verdict, 'skip');
+  assert.strictEqual(s1.owner, null);
+  assert.match(s1.got, /tompa fault switch/);
+});
+
 test('MT delivered to the MT-barred UE4 is an SMSC fault; a busy runner refuses a second run', async () => {
   const deps = core();
   const send = deps.sendSms;

@@ -5,6 +5,7 @@ const sms = require('./sms');
 const diagnose = require('./diagnose');
 const scenario = require('./scenario');
 const traffic = require('./traffic');
+const health = require('./health');
 const fs = require('node:fs');
 const nodePath = require('node:path');
 
@@ -19,6 +20,8 @@ const SELF_BASE = `${HOST}/t/${TEAM}`;
 const NF_ID = '7a3e0c1d-0000-4000-8000-00000000a3f0'; // stable across restarts, so the NRF sees one AMF
 const PLMN = { mcc: '001', mnc: '01' };
 const GUAMI = { plmnId: PLMN, amfId: 'cafe00' };
+const NF_ID2 = '7a3e0c1d-0000-4000-8000-00000000a3f1';
+const GUAMI2 = { plmnId: PLMN, amfId: 'cafe01' };
 const SC_ADDRESS = process.env.TOMPA_SC_ADDRESS || '46700000100'; // holminator's SMSC address
 const HEARTBEAT_S = 30;
 
@@ -183,45 +186,72 @@ async function call(peer, method, url, body, type = 'application/json') {
 
 // ---------- NRF: register, heartbeat, discover ----------
 
-function profile() {
+// Two AMF instances in one AMF set share the UE population, so an SMSF can fail over between them (krilju #build 236).
+// Instance 2 lives under /t/tompa/amf2. A fault switch fails one instance on demand; it always expires on its own.
+const FAULT_MODES = ['ok', '503', 'down'];
+const MAX_FAULT_S = 900;
+const amfs = [
+  { n: 1, id: NF_ID, guami: GUAMI, prefix: `/t/${TEAM}`, nrf, fault: 'ok', faultUntil: 0 },
+  { n: 2, id: NF_ID2, guami: GUAMI2, prefix: `/t/${TEAM}/amf2`, nrf: { registered: false, lastStatus: null }, fault: 'ok', faultUntil: 0 },
+];
+function faultOf(a) {
+  if (a.fault !== 'ok' && Date.now() >= a.faultUntil) { a.fault = 'ok'; a.faultUntil = 0; }
+  return a.fault;
+}
+// New registrations are served by the first healthy instance; the SMSF learns it from amfId in the activation.
+const servingAmf = () => amfs.find(a => faultOf(a) === 'ok') || amfs[0];
+
+function profile(a = amfs[0]) {
   return {
-    nfInstanceId: NF_ID,
+    nfInstanceId: a.id,
     nfType: 'AMF',
     nfStatus: 'REGISTERED',
     fqdn: new URL(HOST).hostname,
     heartBeatTimer: HEARTBEAT_S,
     plmnList: [PLMN],
-    amfInfo: { amfSetId: '001', amfRegionId: 'ca', guamiList: [GUAMI] },
+    amfInfo: { amfSetId: '001', amfRegionId: 'ca', guamiList: [a.guami] },
     nfServices: [{
-      serviceInstanceId: 'namf-comm-1',
+      serviceInstanceId: `namf-comm-${a.n}`,
       serviceName: 'namf-comm',
       versions: [{ apiVersionInUri: 'v1', apiFullVersion: '1.0.0' }],
       scheme: new URL(HOST).protocol.replace(':', ''),
       nfServiceStatus: 'REGISTERED',
       // apiRoot carries the full address; apiPrefix stays a path (smsf-hao #build 120).
-      apiRoot: SELF_BASE,
-      apiPrefix: `/t/${TEAM}`,
+      apiRoot: `${HOST}${a.prefix}`,
+      apiPrefix: a.prefix,
     }],
   };
 }
 
-async function registerInNrf() {
-  const r = await call('nrf', 'PUT', `${NRF_NFM}/nf-instances/${NF_ID}`, profile());
-  nrf.lastStatus = r.status;
-  nrf.registered = r.status === 200 || r.status === 201;
-  if (nrf.registered) kpis.nrf.registrations++;
-  return nrf.registered;
+async function registerInNrf(a = amfs[0]) {
+  const st = a.nrf;
+  const r = await call('nrf', 'PUT', `${NRF_NFM}/nf-instances/${a.id}`, profile(a));
+  st.lastStatus = r.status;
+  st.registered = r.status === 200 || r.status === 201;
+  if (st.registered) kpis.nrf.registrations++;
+  return st.registered;
 }
 
-async function heartbeat() {
-  if (!nrf.registered) return registerInNrf();
-  const r = await call('nrf', 'PATCH', `${NRF_NFM}/nf-instances/${NF_ID}`,
+async function heartbeatOne(a) {
+  const st = a.nrf;
+  if (faultOf(a) === 'down') {
+    // A "down" instance leaves the NRF once and stays silent until the switch is reset or expires.
+    if (st.registered) { await call('nrf', 'DELETE', `${NRF_NFM}/nf-instances/${a.id}`); st.registered = false; }
+    return false;
+  }
+  if (!st.registered) return registerInNrf(a);
+  const r = await call('nrf', 'PATCH', `${NRF_NFM}/nf-instances/${a.id}`,
     [{ op: 'replace', path: '/nfStatus', value: 'REGISTERED' }], 'application/json-patch+json');
-  nrf.lastStatus = r.status;
-  if (r.status === 404) { kpis.nrf.heartbeatsFailed++; nrf.registered = false; return registerInNrf(); }
+  st.lastStatus = r.status;
+  if (r.status === 404) { kpis.nrf.heartbeatsFailed++; st.registered = false; return registerInNrf(a); }
   const ok = r.status >= 200 && r.status < 300;
   if (ok) kpis.nrf.heartbeatsOk++; else kpis.nrf.heartbeatsFailed++;
   return ok;
+}
+
+async function heartbeat() {
+  const [first] = await Promise.all(amfs.map(heartbeatOne));
+  return first;
 }
 
 function baseOf(inst, serviceName) {
@@ -282,7 +312,7 @@ function ueOr404(res, supi) {
 
 async function activateSms(ue) {
   const r = await callSmsf(ue, 'PUT', '', {
-    supi: ue.supi, gpsi: ue.gpsi, amfId: NF_ID, accessType: '3GPP_ACCESS', guami: GUAMI,
+    supi: ue.supi, gpsi: ue.gpsi, amfId: servingAmf().id, accessType: '3GPP_ACCESS', guami: servingAmf().guami,
   }, 'activate');
   ue.smsActive = r.status === 200 || r.status === 201;
   ue.lastSmsf = { op: 'activate', status: r.status, body: r.body };
@@ -368,9 +398,15 @@ async function setReachable(req, res, ue) {
 
 // ---------- Namf_Communication: N1N2MessageTransfer ----------
 
-async function n1n2(req, res, supi) {
+async function n1n2(req, res, supi, a = amfs[0]) {
   let b;
-  const n1n2Path = `/namf-comm/v1/ue-contexts/${supi}/n1-n2-messages`;
+  const n1n2Path = `${a.n === 1 ? '' : '/amf2'}/namf-comm/v1/ue-contexts/${supi}/n1-n2-messages`;
+  if (faultOf(a) !== 'ok') {
+    // Our own simulated outage: logged as such, never judged as a peer fault.
+    rec('in', 'smsf', 'POST', n1n2Path, 503, { simulated: `tompa fault switch: AMF ${a.n} ${a.fault}` });
+    kpis.mt.simulatedOutage = (kpis.mt.simulatedOutage || 0) + 1;
+    return problem(res, 503, 'SYSTEM_FAILURE', `AMF instance ${a.n} is failed on purpose (tompa fault switch, mode ${a.fault})`);
+  }
   try { b = await readJson(req); } catch (e) {
     judge(rec('in', 'smsf', 'POST', n1n2Path, null, null), diagnose.n1n2(null));
     return bodyProblem(res, e);
@@ -461,6 +497,13 @@ const load = traffic.createGenerator({
   setTimer: (fn, ms) => { const t = setInterval(fn, ms); if (t.unref) t.unref(); return t; },
 });
 
+function amfView() {
+  return amfs.map(a => ({ n: a.n, nfInstanceId: a.id, apiRoot: `${HOST}${a.prefix}`, guami: a.guami,
+    nrf: { registered: a.nrf.registered, lastStatus: a.nrf.lastStatus }, fault: faultOf(a),
+    faultRemainingS: a.fault === 'ok' ? 0 : Math.max(0, Math.round((a.faultUntil - Date.now()) / 1000)),
+    serving: servingAmf() === a }));
+}
+
 // ---------- routing ----------
 
 module.exports = {
@@ -483,10 +526,25 @@ module.exports = {
   },
 
   async handle(req, res, { path }) {
-    const n = path.match(/^\/namf-comm\/v1\/ue-contexts\/([^/]+)\/n1-n2-messages$/);
+    const n = path.match(/^(\/amf2)?\/namf-comm\/v1\/ue-contexts\/([^/]+)\/n1-n2-messages$/);
     if (n) {
       if (req.method !== 'POST') return problem(res, 405, 'METHOD_NOT_ALLOWED', 'POST only');
-      return n1n2(req, res, decodeURIComponent(n[1]));
+      return n1n2(req, res, decodeURIComponent(n[2]), amfs[n[1] ? 1 : 0]);
+    }
+    if (path.startsWith('/amf2/')) return problem(res, 404, 'RESOURCE_NOT_FOUND', 'AMF instance 2 serves namf-comm only');
+
+    if (req.method === 'GET' && path === '/amf') return send(res, 200, amfView());
+    const f = path.match(/^\/amf\/([12])\/fault$/);
+    if (f && req.method === 'POST') {
+      let b = {};
+      try { b = await readJson(req); } catch (e) { return bodyProblem(res, e); }
+      if (!FAULT_MODES.includes(b.mode)) return problem(res, 400, 'INVALID_MSG_FORMAT', `mode must be one of ${FAULT_MODES.join(', ')}`);
+      const a = amfs[Number(f[1]) - 1];
+      const ttlS = Math.min(MAX_FAULT_S, Math.max(10, Number(b.ttlS) || 300));
+      rec('in', 'trigger', 'POST', `${path} mode=${b.mode}`, null, null);
+      a.fault = b.mode; a.faultUntil = b.mode === 'ok' ? 0 : Date.now() + ttlS * 1000;
+      heartbeatOne(a).catch(e => console.error(`[${TEAM}] nrf:`, e.message));
+      return send(res, 200, amfView());
     }
 
     if (req.method === 'GET' && path === '/ue') return send(res, 200, [...ues.values()]);
@@ -533,10 +591,67 @@ module.exports = {
     if (req.method === 'GET' && path === '/faults') {
       return send(res, 200, [...faults.values()].sort((a, b) => (a.lastTs < b.lastTs ? 1 : -1)));
     }
-    if (req.method === 'GET' && (path === '/status' || path === '/')) {
-      return send(res, 200, { nf: 'AMF', team: TEAM, nfInstanceId: NF_ID, nrf: { registered: nrf.registered, lastStatus: nrf.lastStatus },
-        smsf: smsfCache && smsfCache.base, ues: ues.size, registered: [...ues.values()].filter(x => x.state === 'REGISTERED').length });
+    if (req.method === 'GET' && path === '/health') return send(res, 200, await healthView());
+    if (req.method === 'POST' && path === '/health/canary') {
+      const r = await runCanary();
+      return send(res, r.status, r.body);
     }
+    if (req.method === 'GET' && (path === '/status' || path === '/')) return send(res, 200, statusBody());
     return false;
   },
 };
+
+function statusBody() {
+  return { nf: 'AMF', team: TEAM, nfInstanceId: NF_ID, nrf: { registered: nrf.registered, lastStatus: nrf.lastStatus },
+        smsf: smsfCache && smsfCache.base, ues: ues.size, registered: [...ues.values()].filter(x => x.state === 'REGISTERED').length,
+        // Every merge in the group restarts the board (spore frontend2-23): tell a warm-up from a fault.
+        startedAt: STARTED, uptimeS: Math.round((Date.now() - Date.parse(STARTED)) / 1000),
+        instances: amfView(),
+        warmup: { state: !nrf.registered ? 'nrf-pending' : toRestore.length ? 'restoring-ues' : 'ready', uesToRestore: toRestore.length } };
+}
+
+// ---------- end-to-end health (FLUX 5faaadcb): not logged, these are not 5G calls ----------
+
+const CANARY_MIN_S = 30;
+const HEALTH_CACHE_MS = 5000;
+let canary = null; let healthCache = null;
+
+async function getJson(url) {
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(4000) });
+    let body = null; try { body = await r.json(); } catch { /* not JSON */ }
+    return { status: r.status, body };
+  } catch { return { status: 0, body: null }; }
+}
+
+async function checkNfs() {
+  const now = Date.now();
+  if (healthCache && now - healthCache.at < HEALTH_CACHE_MS) return healthCache.nfs;
+  const answers = await Promise.all(health.NFS.map(nf => (nf.team === TEAM
+    ? { status: 200, body: statusBody() } : getJson(`${HOST}/t/${nf.team}/status`))));
+  const nrfAns = answers[health.NFS.findIndex(n => n.node === 'NRF')];
+  const list = nrfAns.status === 200 && nrfAns.body && Array.isArray(nrfAns.body.instances) ? nrfAns.body.instances : null;
+  const nfs = health.NFS.map((nf, i) => health.judgeNf(nf, answers[i].status, answers[i].body, list, now));
+  healthCache = { at: now, nfs };
+  return nfs;
+}
+
+async function healthView() {
+  const nfs = await checkNfs();
+  return { checkedAt: new Date().toISOString(), summary: health.summary(nfs, canary), nfs, canary, canaryMinS: CANARY_MIN_S };
+}
+
+async function runCanary() {
+  if (canary && Date.now() - Date.parse(canary.ts) < CANARY_MIN_S * 1000) return { status: 429, body: await healthView() };
+  const warming = (await checkNfs()).filter(n => n.verdict === 'warming').map(n => n.node);
+  if (warming.length) {
+    canary = { verdict: 'skip', ts: new Date().toISOString(), got: `not run: ${warming.join(', ')} warming up` };
+  } else {
+    rec('in', 'trigger', 'POST', '/health/canary', null, null);
+    try { canary = health.canaryFrom(await runner.run(1)); } catch (e) {
+      if (e.code !== 'BUSY') throw e;
+      canary = { verdict: 'skip', ts: new Date().toISOString(), got: 'not run: a scenario run is in progress' };
+    }
+  }
+  return { status: 200, body: await healthView() };
+}

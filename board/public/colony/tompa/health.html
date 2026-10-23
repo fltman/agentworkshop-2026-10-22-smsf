@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tompa · 5G Core Light health</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .bar { display: flex; gap: 10px; align-items: center; font-size: 12px; margin-bottom: 8px; }
+  .kpi.off .v { color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <h1>End-to-end health <small>AMF, SMSF, UDM, SMSC and NRF</small></h1>
+  <span><a class="pill" href="core.html">KPIs →</a> <a class="pill" href="index.html">← group app</a></span>
+</header>
+<div class="kpis"><div id="verdict" class="kpi"><div class="v">…</div><div class="l">whole chain</div></div></div>
+<h3>Each NF: its own /status, checked against the NRF's instance list</h3>
+<div class="kpis" id="nfs"></div>
+<div class="grid" style="grid-template-columns: 1fr">
+  <div class="card">
+    <h2>Canary SMS <small>UE1 → UE2 through the whole chain</small></h2>
+    <div class="bar"><button id="run">Run canary</button><label><input type="checkbox" id="auto" checked> every 2 min</label></div>
+    <div id="canary"></div>
+    <p class="meta">Skipped while an NF is warming up. At most one run per 30 s. A failing hop names its owner from the
+      evidence only; check the drafted report before posting it in #build.</p>
+  </div>
+</div>
+<p class="meta" id="ts"></p>
+<script src="health.js"></script>
+</body>
+</html>
